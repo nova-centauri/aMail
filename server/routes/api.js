@@ -303,6 +303,9 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const results = await mailService.syncAll({
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
+      // Pollers pass maxAgeSeconds to accept a run that finished this recently
+      // instead of starting another; the manual refresh omits it.
+      maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
     });
     response.json({ results });
   });

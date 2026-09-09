@@ -1,7 +1,15 @@
 import { useEffect, useRef } from 'react';
 
-export const FOCUSED_SYNC_INTERVAL_MS = 15_000;
+export const FOCUSED_SYNC_INTERVAL_MS = 30_000;
 export const BACKGROUND_SYNC_INTERVAL_MS = 5 * 60_000;
+export const MAX_FOCUSED_SYNC_INTERVAL_MS = 10 * 60_000;
+// A full sync runs every mailbox of every account over IMAP, so the pause after
+// one is scaled to how long it took: the server is never asked to spend more
+// than about a third of its time syncing for one open tab.
+export const SYNC_DUTY_FACTOR = 2;
+// A result the server produced this recently is good enough for a poll; it
+// lets a second tab or an agent share one run instead of starting another.
+export const LIVE_SYNC_MAX_AGE_SECONDS = 20;
 
 export function mailboxSessionIsActive(doc = globalThis.document) {
   if (!doc || doc.visibilityState !== 'visible') return false;
@@ -9,8 +17,11 @@ export function mailboxSessionIsActive(doc = globalThis.document) {
   return true;
 }
 
-export function nextLiveSyncDelayMs(active) {
-  return active ? FOCUSED_SYNC_INTERVAL_MS : BACKGROUND_SYNC_INTERVAL_MS;
+export function nextLiveSyncDelayMs(active, lastDurationMs = 0) {
+  const duration = Number.isFinite(lastDurationMs) && lastDurationMs > 0 ? lastDurationMs : 0;
+  const paced = duration * SYNC_DUTY_FACTOR;
+  if (active) return Math.min(Math.max(FOCUSED_SYNC_INTERVAL_MS, paced), MAX_FOCUSED_SYNC_INTERVAL_MS);
+  return Math.max(BACKGROUND_SYNC_INTERVAL_MS, paced);
 }
 
 export function createLiveMailboxSync({
@@ -18,10 +29,12 @@ export function createLiveMailboxSync({
   sync,
   setTimeoutFn = (fn, delay) => globalThis.setTimeout(fn, delay),
   clearTimeoutFn = (id) => globalThis.clearTimeout(id),
+  nowFn = () => Date.now(),
 } = {}) {
   let timer = 0;
   let stopped = true;
   let running = false;
+  let lastDurationMs = 0;
 
   const stopTimer = () => {
     if (!timer) return;
@@ -32,7 +45,7 @@ export function createLiveMailboxSync({
   const arm = () => {
     stopTimer();
     if (stopped) return;
-    const delay = nextLiveSyncDelayMs(Boolean(getActive?.()));
+    const delay = nextLiveSyncDelayMs(Boolean(getActive?.()), lastDurationMs);
     timer = setTimeoutFn(() => {
       timer = 0;
       void run();
@@ -43,9 +56,11 @@ export function createLiveMailboxSync({
     if (stopped || running) return;
     running = true;
     stopTimer();
+    const startedAt = nowFn();
     try {
       await sync?.({ immediate });
     } finally {
+      lastDurationMs = Math.max(0, nowFn() - startedAt);
       running = false;
       if (!stopped) arm();
     }
