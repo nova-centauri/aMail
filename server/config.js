@@ -62,6 +62,15 @@ export function loadConfig(env = process.env) {
   // Whole-database encryption is opt-in for self-hosted installs because an
   // existing plaintext file is migrated in place on the first keyed boot.
   const encryptDatabase = boolean(readEnv(env, 'ENCRYPT_DATABASE'));
+  // `env` (default) keys everything from AMAIL_ENCRYPTION_KEY and gates access
+  // with AMAIL_ACCESS_TOKEN. `keyslot` is the hosted model: the container boots
+  // locked and every key derives from a DEK that only a keyslot credential can
+  // unwrap. Both modes run from the same image.
+  const keyMode = String(readEnv(env, 'KEY_MODE') || 'env').trim().toLowerCase() === 'keyslot' ? 'keyslot' : 'env';
+  const keyslotMode = keyMode === 'keyslot';
+  const keyModeConflicts = keyslotMode
+    ? ['ENCRYPTION_KEY', 'ACCESS_TOKEN', 'REMOTE_TOKEN_KEY', 'ENCRYPT_DATABASE'].filter((name) => readEnv(env, name) !== undefined)
+    : [];
 
   return Object.freeze({
     appName: APP_NAME,
@@ -74,11 +83,21 @@ export function loadConfig(env = process.env) {
     dbPath: resolveDbPath(dataDir),
     staticDir: path.resolve(readEnv(env, 'STATIC_DIR') || path.join(process.cwd(), 'dist')),
     releaseSha: /^[0-9a-f]{40}$/i.test(releaseSha) ? releaseSha.toLowerCase() : null,
-    credentialKey,
-    remoteTokenKey,
-    encryptDatabase,
-    databaseKey: encryptDatabase && encryptionKey ? deriveSubkey(encryptionKey, DATABASE_KEY_INFO) : null,
-    accessToken: readEnv(env, 'ACCESS_TOKEN') || null,
+    credentialKey: keyslotMode ? null : credentialKey,
+    remoteTokenKey: keyslotMode ? null : remoteTokenKey,
+    encryptDatabase: keyslotMode ? true : encryptDatabase,
+    databaseKey: !keyslotMode && encryptDatabase && encryptionKey ? deriveSubkey(encryptionKey, DATABASE_KEY_INFO) : null,
+    accessToken: keyslotMode ? null : (readEnv(env, 'ACCESS_TOKEN') || null),
+    keyMode,
+    keyModeConflicts,
+    // Keyslot mode only. The provision secret authorizes the one-time
+    // /api/keyslots/init call; the escrow key is the operator KEK an opted-in
+    // tenant's DEK is wrapped under; the handoff socket passes the DEK between
+    // an old and a new process during a deploy.
+    provisionSecret: keyslotMode ? (readEnv(env, 'PROVISION_SECRET') || null) : null,
+    escrowKey: keyslotMode ? (readEnv(env, 'ESCROW_KEY') || null) : null,
+    handoffSocket: keyslotMode ? (readEnv(env, 'HANDOFF_SOCKET') || null) : null,
+    handoffSecret: keyslotMode ? (readEnv(env, 'HANDOFF_SECRET') || null) : null,
     // This intentionally stays false unless a reverse proxy has been selected by
     // the operator. Trusting arbitrary forwarded headers is unsafe by default.
     trustProxy: boolean(readEnv(env, 'TRUST_PROXY')),

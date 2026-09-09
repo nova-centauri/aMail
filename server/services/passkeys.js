@@ -9,6 +9,12 @@ import { ValidationError } from '../errors.js';
 
 const CHALLENGE_TTL_MS = 2 * 60_000;
 const USER_SETTING = 'webauthnUserId';
+/**
+ * Fixed PRF evaluation input. The authenticator derives a per-credential secret
+ * from it; in keyslot mode that secret wraps the DEK, so it must be the same
+ * bytes on every login.
+ */
+export const PASSKEY_PRF_SALT = crypto.createHash('sha256').update('amail/passkey-prf/v1', 'utf8').digest().toString('base64url');
 
 function publicPasskey(row) {
   if (!row) return null;
@@ -19,6 +25,8 @@ function publicPasskey(row) {
     backedUp: Boolean(row.backed_up),
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
+    // Keyslot mode only: whether this passkey's PRF secret wraps the DEK yet.
+    ...(row.canUnlock !== undefined ? { canUnlock: Boolean(row.canUnlock) } : {}),
   };
 }
 
@@ -35,24 +43,41 @@ export function webauthnContext(request, config) {
   return { rpID, rpName: config.webauthnRpName, origin: origins[0], origins };
 }
 
-function userHandle(repos) {
-  let stored = repos.settings.get(USER_SETTING);
-  if (typeof stored !== 'string' || stored.length < 16) {
-    stored = crypto.randomBytes(32).toString('base64url');
-    repos.settings.set(USER_SETTING, stored);
-  }
-  return Buffer.from(stored, 'base64url');
+/** Default credential store: the passkeys table plus a settings-backed user handle. */
+function repositoryStore(repos) {
+  return {
+    ...repos.passkeys,
+    userHandle() {
+      let stored = repos.settings.get(USER_SETTING);
+      if (typeof stored !== 'string' || stored.length < 16) {
+        stored = crypto.randomBytes(32).toString('base64url');
+        repos.settings.set(USER_SETTING, stored);
+      }
+      return Buffer.from(stored, 'base64url');
+    },
+  };
+}
+
+/** The PRF output an authenticator returned with an assertion, base64url or null. */
+export function prfOutputFrom(response) {
+  const first = response?.clientExtensionResults?.prf?.results?.first;
+  if (typeof first === 'string' && first.length >= 16) return first;
+  return null;
 }
 
 export function createPasskeyService({
   config,
   repos,
+  store = repos ? repositoryStore(repos) : null,
+  requestPrf = false,
   generateRegistration = generateRegistrationOptions,
   verifyRegistration = verifyRegistrationResponse,
   generateAuthentication = generateAuthenticationOptions,
   verifyAuthentication = verifyAuthenticationResponse,
 } = {}) {
+  if (!store) throw new Error('createPasskeyService needs a credential store');
   const challenges = new Map();
+  const prfExtension = requestPrf ? { prf: { eval: { first: PASSKEY_PRF_SALT } } } : undefined;
 
   function rememberChallenge(kind, challenge, extra = {}) {
     const id = crypto.randomUUID();
@@ -75,13 +100,13 @@ export function createPasskeyService({
 
   async function registrationOptions(request) {
     const { rpID, rpName } = webauthnContext(request, config);
-    const existing = repos.passkeys.listRaw();
+    const existing = store.listRaw();
     const options = await generateRegistration({
       rpName,
       rpID,
       userName: 'amail',
       userDisplayName: 'aMail',
-      userID: userHandle(repos),
+      userID: store.userHandle(),
       attestationType: 'none',
       excludeCredentials: existing.map((passkey) => ({
         id: passkey.id,
@@ -91,6 +116,7 @@ export function createPasskeyService({
         residentKey: 'required',
         userVerification: 'preferred',
       },
+      ...(prfExtension ? { extensions: prfExtension } : {}),
     });
     const challengeId = rememberChallenge('register', options.challenge);
     return { challengeId, options };
@@ -115,7 +141,7 @@ export function createPasskeyService({
       throw new ValidationError('Passkey registration could not be verified.');
     }
     const credential = verification.registrationInfo.credential;
-    const passkey = repos.passkeys.create({
+    const passkey = store.create({
       id: credential.id,
       public_key: Buffer.from(credential.publicKey),
       counter: Number(credential.counter) || 0,
@@ -124,7 +150,14 @@ export function createPasskeyService({
       transports_json: JSON.stringify(credential.transports || response?.response?.transports || []),
       name: String(name || 'Passkey').slice(0, 80),
     });
-    return { verified: true, passkey: publicPasskey(passkey) };
+    return {
+      verified: true,
+      passkey: publicPasskey(passkey),
+      // Some authenticators evaluate PRF during registration; most only on a
+      // later assertion. The caller links whichever arrives first.
+      prf: prfOutputFrom(response),
+      prfEnabled: Boolean(response?.clientExtensionResults?.prf?.enabled),
+    };
   }
 
   async function loginOptions(request) {
@@ -134,6 +167,7 @@ export function createPasskeyService({
       userVerification: 'preferred',
       // Empty allowCredentials lets the browser pick a discoverable passkey.
       allowCredentials: [],
+      ...(prfExtension ? { extensions: prfExtension } : {}),
     });
     const challengeId = rememberChallenge('login', options.challenge);
     return { challengeId, options };
@@ -143,7 +177,7 @@ export function createPasskeyService({
     const pending = takeChallenge(challengeId, 'login');
     const { rpID, origins } = webauthnContext(request, config);
     const credentialId = String(response?.id || '');
-    const stored = repos.passkeys.getRaw(credentialId);
+    const stored = store.getRaw(credentialId);
     if (!stored) throw new ValidationError('That passkey is not registered on this aMail server.');
     let verification;
     try {
@@ -167,8 +201,8 @@ export function createPasskeyService({
       throw new ValidationError('Passkey sign-in could not be verified.');
     }
     const nextCounter = Number(verification.authenticationInfo?.newCounter);
-    repos.passkeys.touch(stored.id, Number.isFinite(nextCounter) ? nextCounter : stored.counter);
-    return { verified: true, passkey: publicPasskey(repos.passkeys.getRaw(stored.id)) };
+    store.touch(stored.id, Number.isFinite(nextCounter) ? nextCounter : stored.counter);
+    return { verified: true, passkey: publicPasskey(store.getRaw(stored.id)), prf: prfOutputFrom(response) };
   }
 
   return {
@@ -176,8 +210,8 @@ export function createPasskeyService({
     register,
     loginOptions,
     login,
-    list: () => repos.passkeys.listRaw().map(publicPasskey),
-    remove: (id) => repos.passkeys.remove(id),
-    count: () => repos.passkeys.count(),
+    list: () => store.listRaw().map(publicPasskey),
+    remove: (id) => store.remove(id),
+    count: () => store.count(),
   };
 }

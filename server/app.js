@@ -6,9 +6,10 @@ import pinoHttp from 'pino-http';
 import { registerApi } from './routes/api.js';
 import { registerMcp } from './routes/mcp.js';
 import { errorHandler, notFound } from './middleware/errors.js';
+import { createAuthenticator } from './middleware/auth.js';
 import { logSerializers } from './logging.js';
 
-export function createApp({ config, repos, mailService, remoteContent, logger, passkeys }) {
+export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -42,8 +43,8 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB encoded.
   app.use(express.json({ limit: '12mb', type: ['application/json', 'application/*+json'] }));
 
-  registerApi(app, { config, repos, mailService, remoteContent, passkeys });
-  registerMcp(app, { config, repos, mailService, remoteContent });
+  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth, vault });
+  registerMcp(app, { config, repos, mailService, remoteContent, auth });
   app.use('/api', notFound);
 
   if (fs.existsSync(config.staticDir)) {
