@@ -166,8 +166,39 @@ docker compose exec amail node -e "
 "
 ```
 
+Backups accumulate: each one is a full copy of the database, so a week of
+pre-upgrade copies can outweigh the live data several times over. Keep the
+last two or three and delete the rest, for example:
+
+```sh
+docker compose exec amail sh -c 'ls -t /data/backup-*.sqlite | tail -n +3 | xargs -r rm --'
+```
+
+The volume also holds the SQLite write-ahead log (`*.sqlite-wal`). aMail caps
+it at 64 MiB and truncates it at startup, so a large one left by an earlier
+release shrinks on the next restart.
+
 Do not delete the `amail-data` volume unless intentionally discarding all
 accounts, cached mail metadata, and settings.
+
+### Sizing
+
+One instance's steady-state footprint is dominated by account count: a
+21-account, 15k-message mailbox measured about 1.1 GiB of RAM, a background
+pass over all its mailboxes took about a minute, and a two- or three-account
+mailbox is a small fraction of that. The Compose file caps the application
+container at `AMAIL_MEMORY_LIMIT` (default 1.5 GiB) and the Tor relay at
+`AMAIL_TOR_MEMORY_LIMIT` (default 256 MiB) so one runaway instance cannot
+starve a shared host; raise the first for very large mailboxes.
+
+CPU is spent almost entirely in IMAP passes. The web client asks for one on a
+timer only while its tab is focused, waits at least 30 seconds and at least
+twice the previous pass's duration between requests, and accepts a pass that
+finished within the last 20 seconds instead of starting another; the server
+runs one pass at a time and shares it between concurrent callers. Agents that
+poll should pass `maxAgeSeconds` to `sync_mail` (or `POST /api/sync`) for the
+same reason. `SYNC_INTERVAL_MINUTES` governs the pass that runs with no tab
+open.
 
 ## Continuous integration
 

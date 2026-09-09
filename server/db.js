@@ -441,6 +441,7 @@ function initSchema(db) {
 }
 
 const FTS_BACKFILL_BATCH = 100;
+const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 
 function prepareSqliteTempDir(dataDir) {
   const sqliteTmpDir = path.join(dataDir, 'tmp');
@@ -496,10 +497,15 @@ export function createDatabase(config) {
   const sqliteTmpDir = prepareSqliteTempDir(config.dataDir);
   const db = new Database(config.dbPath);
   db.pragma('journal_mode = WAL');
+  // SQLite reuses a WAL file but never shrinks it, so one large import leaves
+  // hundreds of megabytes on the volume for good. Truncate it back to this
+  // size after checkpoints, and reclaim any oversized WAL from earlier runs.
+  db.pragma(`journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.pragma(`temp_store_directory = '${sqliteTmpDir.replace(/'/g, "''")}'`);
   initSchema(db);
+  db.pragma('wal_checkpoint(TRUNCATE)');
   return db;
 }
 
