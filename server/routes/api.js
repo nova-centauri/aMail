@@ -103,6 +103,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       // endpoint answers unauthenticated for container health checks.
       authProtected: Boolean(config.accessToken),
       credentialsConfigured: Boolean(config.credentialKey),
+      databaseEncrypted: Boolean(config.databaseKey),
       remoteContentProxyConfigured: Boolean(config.remoteContentProxyUrl),
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,

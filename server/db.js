@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import {
   SMART_CATEGORY_SLUGS,
   SMART_FILTER_VERSION,
@@ -492,10 +492,114 @@ function backfillMessagesFts(db, { batchSize = FTS_BACKFILL_BATCH } = {}) {
   }
 }
 
-export function createDatabase(config) {
+const SQLITE_HEADER = 'SQLite format 3\0';
+const DATABASE_KEY_BYTES = 32;
+
+export class DatabaseKeyError extends Error {
+  constructor(message, code = 'DATABASE_KEY_INVALID') {
+    super(message);
+    this.name = 'DatabaseKeyError';
+    this.code = code;
+  }
+}
+
+function assertDatabaseKey(key) {
+  if (!Buffer.isBuffer(key) || key.length !== DATABASE_KEY_BYTES) {
+    throw new DatabaseKeyError(`Database key must be ${DATABASE_KEY_BYTES} raw bytes.`, 'DATABASE_KEY_MALFORMED');
+  }
+}
+
+/**
+ * Apply a raw SQLCipher-compatible key. The `x'…'` form hands SQLite the key
+ * bytes directly, so no passphrase KDF runs inside the database engine and the
+ * same 32 bytes always open the same file.
+ */
+function applyDatabaseKey(db, key) {
+  assertDatabaseKey(key);
+  db.pragma("cipher='sqlcipher'");
+  db.pragma(`key="x'${key.toString('hex')}'"`);
+}
+
+/**
+ * `true` for an existing plaintext SQLite file, `false` for an existing file
+ * whose header is not SQLite's (encrypted, or not a database), `null` when the
+ * file is missing or empty and will be created fresh.
+ */
+export function isPlaintextSqliteFile(filePath) {
+  let handle;
+  try {
+    handle = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(SQLITE_HEADER.length);
+    const read = fs.readSync(handle, header, 0, header.length, 0);
+    if (read < header.length) return null;
+    return header.toString('latin1') === SQLITE_HEADER;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
+/**
+ * Open a database, keyed when `key` is given, and fail fast with a clear error
+ * instead of at the first query if the key does not fit the file.
+ */
+export function openDatabase(dbPath, { key = null, readonly = false } = {}) {
+  const db = new Database(dbPath, { readonly });
+  try {
+    if (key) applyDatabaseKey(db, key);
+    db.prepare('SELECT count(*) AS count FROM sqlite_master').get();
+  } catch (error) {
+    db.close();
+    if (error?.code === 'SQLITE_NOTADB') {
+      throw new DatabaseKeyError(
+        key
+          ? 'The database could not be opened with the configured key. It was encrypted with a different key.'
+          : 'The database is encrypted but no database key is configured. Re-enable AMAIL_ENCRYPT_DATABASE with the original AMAIL_ENCRYPTION_KEY.',
+        key ? 'DATABASE_KEY_INVALID' : 'DATABASE_KEY_REQUIRED',
+      );
+    }
+    throw error;
+  }
+  return db;
+}
+
+/**
+ * Encrypt an existing plaintext database in place. SQLite3MC refuses to rekey a
+ * WAL-mode file, so the journal is switched to DELETE first (which also
+ * checkpoints and removes the -wal/-shm files); the caller restores WAL.
+ */
+export function encryptDatabaseInPlace(dbPath, key) {
+  assertDatabaseKey(key);
+  if (isPlaintextSqliteFile(dbPath) !== true) {
+    throw new DatabaseKeyError('Only a plaintext SQLite database can be encrypted in place.', 'DATABASE_NOT_PLAINTEXT');
+  }
+  const db = new Database(dbPath);
+  try {
+    db.pragma('journal_mode = DELETE');
+    db.pragma("cipher='sqlcipher'");
+    db.pragma(`rekey="x'${key.toString('hex')}'"`);
+  } finally {
+    db.close();
+  }
+}
+
+export function createDatabase(config, { key = config.databaseKey || null } = {}) {
   fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   const sqliteTmpDir = prepareSqliteTempDir(config.dataDir);
-  const db = new Database(config.dbPath);
+  const plaintext = isPlaintextSqliteFile(config.dbPath);
+  // Turning encryption on for an existing install migrates the file once, on
+  // the first boot with a key. Turning it back off is refused rather than
+  // silently starting with an empty database next to the encrypted one.
+  if (key && plaintext === true) encryptDatabaseInPlace(config.dbPath, key);
+  if (!key && plaintext === false) {
+    throw new DatabaseKeyError(
+      'The database is encrypted but no database key is configured. Re-enable AMAIL_ENCRYPT_DATABASE with the original AMAIL_ENCRYPTION_KEY.',
+      'DATABASE_KEY_REQUIRED',
+    );
+  }
+  const db = openDatabase(config.dbPath, { key });
   db.pragma('journal_mode = WAL');
   // SQLite reuses a WAL file but never shrinks it, so one large import leaves
   // hundreds of megabytes on the volume for good. Truncate it back to this
