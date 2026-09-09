@@ -19,6 +19,7 @@ import {
 import { NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { stringify } from '../db.js';
+import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
   mailerAttachments,
@@ -34,7 +35,7 @@ const asIso = (value) => {
   return date && !Number.isNaN(date.valueOf()) ? date.toISOString() : new Date().toISOString();
 };
 
-const cleanupError = (error) => String(error?.message || error || 'Unknown mail error').replace(/(?:pass(?:word)?|token)\s*[:=]\s*\S+/ig, '[redacted]').slice(0, 500);
+const cleanupError = (error) => scrubLogText(String(error?.message || error || 'Unknown mail error')).slice(0, 500);
 
 function setValues(value) {
   return value instanceof Set ? [...value] : Array.isArray(value) ? value : [];
@@ -342,6 +343,7 @@ export function createMailService({
   config,
   repos,
   logger,
+  metering = null,
   ImapClient = ImapFlow,
   createSmtpTransport = (options) => nodemailer.createTransport(options),
   compileMessage = compileRfc822Message,
@@ -1105,6 +1107,11 @@ export function createMailService({
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
     const updated = repos.messages.setState(id, state);
+    // Only the transition into "analyzed" is metered, so re-marking an already
+    // analyzed message (or toggling it back) never inflates the count.
+    if (state.isAnalyzed === true && !existing.isAnalyzed && updated?.isAnalyzed) {
+      metering?.recordAnalyzed?.(1);
+    }
     // Mail mutations are intentionally best-effort so offline local state stays
     // usable. The API response says whether IMAP accepted, skipped, or failed it.
     try {

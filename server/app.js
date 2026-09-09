@@ -6,33 +6,7 @@ import pinoHttp from 'pino-http';
 import { registerApi } from './routes/api.js';
 import { registerMcp } from './routes/mcp.js';
 import { errorHandler, notFound } from './middleware/errors.js';
-
-function safeRequestUrl(value) {
-  const raw = String(value || '');
-  try {
-    const url = new URL(raw, 'http://amail.invalid');
-    for (const name of ['token', 'access_token', 'signature', 'sig']) {
-      if (url.searchParams.has(name)) url.searchParams.set(name, '[redacted]');
-    }
-    return `${url.pathname}${url.search}`;
-  } catch {
-    // Keep logging useful even for a malformed request target without allowing a
-    // capability token to reach the log sink.
-    return raw.replace(/([?&](?:token|access_token|signature|sig)=)[^&]*/gi, '$1[redacted]');
-  }
-}
-
-function requestSerializer(request) {
-  // Do not log headers at all: besides remote tokens in URLs, this avoids
-  // bearer credentials, cookies, and mail-client metadata reaching Pino.
-  return {
-    id: request.id,
-    method: request.method,
-    url: safeRequestUrl(request.url),
-    remoteAddress: request.socket?.remoteAddress,
-    remotePort: request.socket?.remotePort,
-  };
-}
+import { logSerializers } from './logging.js';
 
 export function createApp({ config, repos, mailService, remoteContent, logger, passkeys }) {
   const app = express();
@@ -41,7 +15,10 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   app.use(pinoHttp({
     logger,
     autoLogging: config.env !== 'test',
-    serializers: { req: requestSerializer },
+    // Request logging stays at info: under the hosted LOG_LEVEL=error profile
+    // no per-request entry exists, and the error handler below is the single
+    // place a failure is recorded (route, status, request id, scrubbed error).
+    serializers: logSerializers,
   }));
   app.use(helmet({
     crossOriginEmbedderPolicy: false,

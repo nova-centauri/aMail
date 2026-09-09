@@ -16,7 +16,7 @@
     "build": "vite build",
     "start": "node server/index.js",
     "check": "npm run build && node --check server/index.js",
-    "test": "node --test server/**/*.test.js && vitest run"
+    "test": "node --test \"server/**/*.test.js\" && vitest run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",

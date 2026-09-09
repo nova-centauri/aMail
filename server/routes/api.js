@@ -99,7 +99,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       status: 'ok',
       version: '0.1.0',
       releaseSha: config.releaseSha || null,
-      accounts: repos.accounts.list().length,
+      // Deliberately no account count or other mailbox-derived data: this
+      // endpoint answers unauthenticated for container health checks.
       authProtected: Boolean(config.accessToken),
       credentialsConfigured: Boolean(config.credentialKey),
       remoteContentProxyConfigured: Boolean(config.remoteContentProxyUrl),

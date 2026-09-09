@@ -90,7 +90,10 @@ test('message API filters unified mail by smart category and account creation is
 
   const healthResponse = await fetch(`${origin}/api/health`);
   assert.equal(healthResponse.status, 200);
-  assert.equal((await healthResponse.json()).releaseSha, config.releaseSha);
+  const health = await healthResponse.json();
+  assert.equal(health.releaseSha, config.releaseSha);
+  // Health answers unauthenticated, so it must not describe the mailbox.
+  assert.equal(Object.hasOwn(health, 'accounts'), false);
 
   const account = repos.accounts.create({
     email: 'owner@example.test',
