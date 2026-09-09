@@ -89,6 +89,49 @@ jobs:
           legacy=$(curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3080/api/health)
           printf '%s\n' "$legacy" | grep -q '"authProtected":true'
           printf '%s\n' "$legacy" | grep -q '"credentialsConfigured":true'
+          docker compose --env-file .env --profile privacy down --timeout 15
+
+      - name: Boot the same image in hosted keyslot mode
+        run: |
+          # No AMAIL_ENCRYPTION_KEY or AMAIL_ACCESS_TOKEN: the container starts
+          # locked, is provisioned once, and the returned token unlocks it.
+          docker volume create amail-keyslot-ci >/dev/null
+          docker run --detach --name amail-keyslot-ci --read-only --user 10001:10001 \
+            --tmpfs /tmp --volume amail-keyslot-ci:/data --publish 127.0.0.1:3081:3000 \
+            --env AMAIL_KEY_MODE=keyslot --env AMAIL_PROVISION_SECRET=ci-provision-secret-0123456789 \
+            --env HOST=0.0.0.0 --env PORT=3000 --env LOG_LEVEL=error \
+            amail:local
+          for _ in $(seq 1 30); do
+            curl --silent --fail --max-time 5 http://127.0.0.1:3081/api/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          locked=$(curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3081/api/health)
+          printf '%s\n' "$locked" | grep -q '"keyMode":"keyslot"'
+          printf '%s\n' "$locked" | grep -q '"locked":true'
+          printf '%s\n' "$locked" | grep -q '"initialized":false'
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 -X POST http://127.0.0.1:3081/api/keyslots/init)
+          test "$status" = "401"
+          init=$(curl --fail --silent --show-error --max-time 10 -X POST \
+            -H 'Authorization: Bearer ci-provision-secret-0123456789' http://127.0.0.1:3081/api/keyslots/init)
+          token=$(printf '%s' "$init" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).token))')
+          unlocked=$(curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3081/api/health)
+          printf '%s\n' "$unlocked" | grep -q '"locked":false'
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 http://127.0.0.1:3081/api/accounts)
+          test "$status" = "401"
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
+            -H "Authorization: Bearer $token" http://127.0.0.1:3081/api/accounts)
+          test "$status" = "200"
+          # A restart without escrow comes back locked, and the token unlocks it again.
+          docker restart amail-keyslot-ci >/dev/null
+          for _ in $(seq 1 30); do
+            curl --silent --fail --max-time 5 http://127.0.0.1:3081/api/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3081/api/health | grep -q '"locked":true'
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
+            -H "Authorization: Bearer $token" http://127.0.0.1:3081/api/accounts)
+          test "$status" = "200"
+          curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3081/api/health | grep -q '"locked":false'
 
       - name: Remove ephemeral CI containers and volumes
         if: always()
@@ -96,3 +139,5 @@ jobs:
           if [ -f .env ]; then
             docker compose --env-file .env --profile privacy down --volumes --timeout 15
           fi
+          docker rm --force --volumes amail-keyslot-ci >/dev/null 2>&1 || true
+          docker volume rm amail-keyslot-ci >/dev/null 2>&1 || true

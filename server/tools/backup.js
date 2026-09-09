@@ -16,6 +16,10 @@ import { loadConfig } from '../config.js';
 import { openDatabase } from '../db.js';
 
 const config = loadConfig();
+if (config.keyMode === 'keyslot') {
+  console.error('In keyslot mode no tooling can obtain the database key. Back up the data volume itself; it is ciphertext plus keyslots.json.');
+  process.exit(2);
+}
 const destination = path.resolve(
   process.argv[2] || path.join(config.dataDir, `backup-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`),
 );
