@@ -83,6 +83,7 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_ENCRYPT_DATABASE` | Opt in to encrypting the whole SQLite file (SQLCipher format) with a key derived from `AMAIL_ENCRYPTION_KEY`; migrates an existing database in place |
 | `AMAIL_ACCESS_TOKEN` | **Required.** Gates the UI, REST API, and MCP endpoint |
 | `AMAIL_BIND_ADDRESS`, `AMAIL_PORT` | Where Compose publishes the app (default `127.0.0.1:3080`) |
+| `AMAIL_MEMORY_LIMIT`, `AMAIL_TOR_MEMORY_LIMIT` | Container memory caps (default `1536m` and `256m`) |
 | `AMAIL_RP_ID`, `AMAIL_ORIGIN` | Public hostname/origin for passkeys behind a reverse proxy |
 | `AMAIL_OPS_SOURCES` | Comma-separated keywords for your infrastructure digests (default `proxmox,watchtower`; empty disables) |
 | `AMAIL_TRUST_PROXY`, `AMAIL_COOKIE_SECURE` | Reverse-proxy and cookie hardening |
