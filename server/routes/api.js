@@ -1,6 +1,6 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
-import { readSignedToken, timingSafeMatch } from '../services/crypto.js';
+import { readSignedToken } from '../services/crypto.js';
 import { hydrateCidImages, hydrateRemoteContent } from '../services/message-html.js';
 import {
   accountTestInput,
@@ -18,8 +18,8 @@ import {
 import { normalizeComposeAttachments } from '../services/compose-attachments.js';
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
-import { accessGate, requestHasAccess, sessionCookieClearOptions, sessionCookieOptions } from '../middleware/auth.js';
-import { LEGACY_SESSION_COOKIE, SESSION_COOKIE } from '../config.js';
+import { accessGate, createAuthenticator } from '../middleware/auth.js';
+import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
 
 function initials(value) {
   return String(value || '?').split(/[\s@._-]+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '?';
@@ -93,17 +93,25 @@ function updateTargets(repos, mailService, id, state) {
   return Promise.all(repos.messages.forThread(thread.id).map((item) => mailService.updateMessageState(item.id, state)));
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys }) {
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null }) {
+  // In keyslot mode `config` is a proxy whose key material throws while the
+  // harness is locked, so health reads only static settings plus vault status.
+  const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
+
   app.get('/api/health', (_request, response) => {
+    const status = keyStatus();
     response.json({
       status: 'ok',
       version: '0.1.0',
       releaseSha: config.releaseSha || null,
       // Deliberately no account count or other mailbox-derived data: this
       // endpoint answers unauthenticated for container health checks.
-      authProtected: Boolean(config.accessToken),
-      credentialsConfigured: Boolean(config.credentialKey),
-      databaseEncrypted: Boolean(config.databaseKey),
+      authProtected: auth.protected,
+      credentialsConfigured: vault ? true : Boolean(config.credentialKey),
+      databaseEncrypted: vault ? true : Boolean(config.databaseKey),
+      keyMode: status.keyMode,
+      locked: status.locked,
+      initialized: status.initialized,
       remoteContentProxyConfigured: Boolean(config.remoteContentProxyUrl),
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,
@@ -112,25 +120,30 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   app.get('/api/session', (request, response) => {
+    const status = keyStatus();
     response.json({
-      protected: Boolean(config.accessToken),
-      authenticated: requestHasAccess(request, config),
+      protected: auth.protected,
+      authenticated: auth.requestHasAccess(request),
       passkeys: passkeys?.count?.() || 0,
+      keyMode: status.keyMode,
+      locked: status.locked,
+      initialized: status.initialized,
     });
   });
 
   app.post('/api/session', rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }), (request, response) => {
-    if (!config.accessToken) return response.status(204).end();
-    if (!timingSafeMatch(request.body?.accessToken, config.accessToken)) {
-      return response.status(401).json({ error: { code: 'AUTH_FAILED', message: 'Invalid access token.' } });
-    }
-    response.cookie(SESSION_COOKIE, config.accessToken, sessionCookieOptions(config));
+    if (!auth.protected) return response.status(204).end();
+    const body = request.body || {};
+    // `accessToken` is the historical field; in keyslot mode any keyslot
+    // credential (token, passphrase, recovery code) is accepted under any name.
+    const secret = body.accessToken ?? body.credential ?? body.passphrase ?? body.recoveryCode;
+    const { slot } = auth.credentialLogin(secret);
+    auth.beginSession(response, { slotId: slot?.id || null });
     return response.status(204).end();
   });
 
-  app.delete('/api/session', (_request, response) => {
-    response.clearCookie(SESSION_COOKIE, sessionCookieClearOptions(config));
-    response.clearCookie(LEGACY_SESSION_COOKIE, sessionCookieClearOptions(config));
+  app.delete('/api/session', (request, response) => {
+    auth.endSession(request, response);
     response.status(204).end();
   });
 
@@ -142,19 +155,34 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   app.post('/api/session/passkey/login/options', passkeyLimiter, async (request, response) => {
-    if (!config.accessToken || !passkeys) {
+    if (!auth.protected || !passkeys) {
       throw new ServiceUnavailableError('Passkeys are unavailable on this server.');
     }
     response.json(await passkeys.loginOptions(request));
   });
   app.post('/api/session/passkey/login', passkeyLimiter, async (request, response) => {
-    if (!config.accessToken || !passkeys) {
+    if (!auth.protected || !passkeys) {
       throw new ServiceUnavailableError('Passkeys are unavailable on this server.');
     }
-    await passkeys.login(request, request.body || {});
-    response.cookie(SESSION_COOKIE, config.accessToken, sessionCookieOptions(config));
+    const result = await passkeys.login(request, request.body || {});
+    if (vault) {
+      const passkey = passkeys.list().find((item) => item.id === result.passkey.id);
+      if (passkey && !passkey.canUnlock && vault.isUnlocked() && auth.requestHasAccess(request)) {
+        // Second half of registration: an already-authenticated session links
+        // the passkey's PRF secret to the DEK so it can unlock from now on.
+        if (!result.prf) throw new AppError('This passkey did not return a PRF secret, so it cannot unlock the harness.', { status: 400, code: 'PASSKEY_PRF_REQUIRED', expose: true });
+        vault.completePasskeySlot(result.passkey.id, result.prf);
+      } else {
+        // Verified assertion, but the DEK is only reachable through the PRF.
+        if (!result.prf) throw new AppError('This passkey did not return a PRF secret, so it cannot unlock the harness.', { status: 401, code: 'PASSKEY_PRF_REQUIRED', expose: true });
+        vault.unlockWithPasskey(result.passkey.id, result.prf);
+      }
+    }
+    auth.beginSession(response, { slotId: null });
     return response.status(204).end();
   });
+
+  if (vault) registerKeyslotProvisioning(app, { config, vault });
 
   // Account ids are random UUIDs and avatar bytes contain no mailbox data. This
   // is public solely so native <img> rendering works when the rest of the API
@@ -208,7 +236,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   const router = express.Router();
-  router.use(accessGate(config));
+  router.use(accessGate(auth));
 
   router.post('/session/passkey/register/options', async (request, response) => {
     if (!passkeys) throw new ServiceUnavailableError('Passkeys are unavailable on this server.');
@@ -216,8 +244,17 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
   router.post('/session/passkey/register', async (request, response) => {
     if (!passkeys) throw new ServiceUnavailableError('Passkeys are unavailable on this server.');
-    response.status(201).json(await passkeys.register(request, request.body || {}));
+    const result = await passkeys.register(request, request.body || {});
+    if (vault && result.prf) {
+      // The authenticator evaluated PRF during registration: link immediately.
+      vault.completePasskeySlot(result.passkey.id, result.prf);
+      result.passkey = passkeys.list().find((item) => item.id === result.passkey.id) || result.passkey;
+    }
+    const { prf: _prf, ...publicResult } = result;
+    response.status(201).json(publicResult);
   });
+
+  if (vault) registerKeyslotManagement(router, { vault, auth });
   router.get('/session/passkeys', (_request, response) => {
     if (!passkeys) return response.json({ passkeys: [] });
     response.json({ passkeys: passkeys.list() });

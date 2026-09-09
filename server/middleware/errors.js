@@ -10,7 +10,9 @@ export function errorHandler(logger) {
     const status = appError?.status || 500;
     // `request.path` deliberately excludes the query string; route params are
     // opaque ids. Together with the request id that is all a bug report needs.
-    if (status >= 500) logger.error({ err: error, path: request.path, status, reqId: request.id }, 'Request failed');
+    // A locked harness answering 503 is expected state, not a failure.
+    const expectedState = ['HARNESS_LOCKED', 'HARNESS_UNINITIALIZED'].includes(appError?.code);
+    if (status >= 500 && !expectedState) logger.error({ err: error, path: request.path, status, reqId: request.id }, 'Request failed');
     response.status(status).json({
       error: {
         code: appError?.code || 'INTERNAL_ERROR',

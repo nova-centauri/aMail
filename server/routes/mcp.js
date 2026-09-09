@@ -6,7 +6,8 @@ import { createAmailMcpServer } from '../mcp/server.js';
  * Mount a Cursor-compatible Streamable HTTP MCP endpoint at /mcp.
  * Auth reuses the same Bearer token / session cookie gate as /api.
  */
-export function registerMcp(app, { config, repos, mailService, remoteContent }) {
+export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config }) {
+  const gate = accessGate(auth);
   const handleMcp = async (request, response) => {
     const server = createAmailMcpServer({ config, repos, mailService, remoteContent });
     try {
@@ -33,15 +34,15 @@ export function registerMcp(app, { config, repos, mailService, remoteContent }) 
 
   // Stateless Streamable HTTP: each POST is a self-contained MCP request.
   // GET/DELETE are unused without sessions; return protocol-shaped 405s.
-  app.post('/mcp', accessGate(config), handleMcp);
-  app.get('/mcp', accessGate(config), (_request, response) => {
+  app.post('/mcp', gate, handleMcp);
+  app.get('/mcp', gate, (_request, response) => {
     response.status(405).json({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Method not allowed. Use POST for Streamable HTTP.' },
       id: null,
     });
   });
-  app.delete('/mcp', accessGate(config), (_request, response) => {
+  app.delete('/mcp', gate, (_request, response) => {
     response.status(405).json({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Method not allowed. Stateless MCP has no sessions to delete.' },

@@ -202,6 +202,115 @@ create an empty database next to the encrypted one; turn it back on with the
 original key. `/api/health` reports `databaseEncrypted` so you can confirm the
 state after the restart.
 
+## Keyslot mode (hosted tenants)
+
+`AMAIL_KEY_MODE=keyslot` runs the same image with **no key material in the
+environment**. It is the model hosted aMail uses for each tenant container and
+is available to self-hosters who want the operator (or a stolen volume) to be
+unable to read the cache. Everything in this section is inert for a plain
+`.env`.
+
+**How it works.** At provisioning the container generates a random 32-byte
+data key (DEK) in memory. The DEK keys the whole SQLite file (SQLCipher
+format) and, through HKDF, the credential and remote-content token keys. It is
+never written anywhere. Instead every credential the tenant holds *wraps* the
+DEK (AES-256-GCM) into a keyslot in `/data/keyslots.json`, which contains only
+ciphertext, salts, and labels:
+
+| Slot | Credential | Notes |
+| --- | --- | --- |
+| `token` | MCP/REST bearer token (`amk1_…`) | Verifying the token *is* unwrapping the DEK; there is no separate token hash. One per agent; mint and revoke freely |
+| `passphrase` | Human UI passphrase (≥ 12 chars) | scrypt-stretched before wrapping |
+| `passkey` | WebAuthn credential with the PRF extension | The PRF secret wraps the DEK; the credential is stored in the keyslot file so it can be verified while locked |
+| `recovery` | Recovery code shown once | Forgiving about case, separators, and O/0, I/1/L look-alikes |
+| `escrow` | Operator key from `AMAIL_ESCROW_KEY` | **Opt-in per harness.** Lets the container unlock itself after a restart. Not offered when the variable is unset |
+
+The container boots **locked**. `/api/health` reports
+`{"keyMode":"keyslot","locked":true,"initialized":…}` and stays reachable so
+edge health checks work; anything that needs the database answers
+`503 HARNESS_LOCKED`. Presenting any keyslot credential unlocks:
+
+- a bearer token on any `/api` or `/mcp` request (an agent's first MCP call is
+  the unlock; no separate login step),
+- a token, passphrase, or recovery code through `POST /api/session`
+  (`{"accessToken": …}`, the field the web client already sends), which also
+  starts an opaque in-memory browser session,
+- a passkey through the normal passkey login.
+
+Unlocked, the harness behaves exactly like env mode until the process exits,
+`POST /api/keyslots/lock` is called, or a restart happens. Browser sessions
+live in RAM and end with the process, so a restart always needs a credential
+again unless the tenant enabled escrow or the deploy used the handoff below.
+
+**Provisioning.**
+
+```sh
+# .env — no AMAIL_ENCRYPTION_KEY, no AMAIL_ACCESS_TOKEN
+AMAIL_KEY_MODE=keyslot
+AMAIL_PROVISION_SECRET=<random, ≥ 32 chars>
+```
+
+```sh
+curl -X POST -H "Authorization: Bearer $AMAIL_PROVISION_SECRET" \
+  http://127.0.0.1:3080/api/keyslots/init
+# → {"token":"amk1_…","recoveryCode":"XXXXX-XXXXX-…","keyslots":[…],"status":{…}}
+```
+
+The call works exactly once, returns the first bearer token and the recovery
+code, and unlocks the harness. Nothing keeps a copy: show both to the tenant
+immediately. Without `AMAIL_PROVISION_SECRET` the endpoint is disabled rather
+than first-come-first-served. Setting `AMAIL_ENCRYPTION_KEY`,
+`AMAIL_ACCESS_TOKEN`, `AMAIL_REMOTE_TOKEN_KEY`, or `AMAIL_ENCRYPT_DATABASE`
+alongside keyslot mode refuses to start, so a copy-pasted env-mode `.env`
+cannot silently downgrade a tenant.
+
+**Managing keyslots** (authenticated, harness unlocked):
+
+| Call | Effect |
+| --- | --- |
+| `GET /api/keyslots` | List slots (ids, types, labels, timestamps; never key material) |
+| `POST /api/keyslots/tokens {"label"}` | Mint a bearer token for another agent; returned once |
+| `POST /api/keyslots/recovery` | Add a recovery code; returned once |
+| `POST /api/keyslots/passphrase {"passphrase"}` | Add a UI passphrase |
+| `POST /api/keyslots/escrow` | Opt in to operator escrow (`503` when the server offers none) |
+| `DELETE /api/keyslots/:id` | Revoke. The last credential able to unlock cannot be deleted; escrow never counts |
+| `POST /api/keyslots/lock` | Drop the DEK now and end browser sessions |
+
+Rotating a token is mint-then-revoke, in-container; the DEK itself never
+changes. Adding a passkey from the web UI links it to the DEK automatically:
+the browser requests the PRF extension, and if the authenticator only
+evaluates PRF on assertions the client runs one immediately after
+registration. Authenticators without PRF support register but are reported
+with `canUnlock: false` and cannot unlock.
+
+**Restarts and deploys.** Three ways a tenant comes back unlocked:
+
+1. **Handoff (recommended for upgrades).** Set `AMAIL_HANDOFF_SOCKET`
+   (a path inside `/data`, e.g. `/data/handoff.sock`) and a shared
+   `AMAIL_HANDOFF_SECRET` on both the old and the new container. An unlocked
+   process listens on the socket; a starting process asks it for the DEK,
+   proving it holds the secret with an HMAC over a server nonce. Start the new
+   container while the old one is still running, wait until its `/api/health`
+   reports `"locked":false`, then stop the old one. The DEK crosses a local
+   socket once, in memory; nothing is written. Plain `docker compose up`
+   recreation stops the old container first and therefore cannot hand off.
+2. **Escrow.** If the tenant enabled it and `AMAIL_ESCROW_KEY` is present,
+   the container unlocks itself at boot (`"unlockedVia":"escrow"`). The same
+   volume on a node without that key stays locked.
+3. **A credential.** Otherwise the harness waits; the next agent call with a
+   valid token unlocks it.
+
+**Backups, moves, deletion.** The volume is ciphertext plus `keyslots.json`;
+snapshot it as-is. `server/tools/backup.js` refuses to run in keyslot mode
+because no tooling can obtain the key. Moving a tenant is stop, copy the
+volume, start elsewhere. Deleting a tenant is deleting the volume: without the
+keyslots the cache is unrecoverable, and the tenant's mail still lives on
+their IMAP servers.
+
+**Logging.** Run hosted tenants at `LOG_LEVEL=error`. The logging policy
+(path only, no headers, scrubbed error text) applies at every level; a locked
+harness answering `503` is not logged as an error.
+
 ## Sizing
 
 One instance's steady-state footprint is dominated by account count: a
@@ -226,7 +335,9 @@ open.
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: the Node
 tests, production build, dependency audit, Compose validation, both Docker
 builds, a live health check of the started image, an unauthenticated API
-check, and a boot with a GigaMail-era `.env` to prove the compatibility
-fallbacks. It deploys nothing; how a tested `main` reaches your server is up
+check, a boot with a GigaMail-era `.env` to prove the compatibility
+fallbacks, and a boot of the same image in keyslot mode (locked, provisioned,
+unlocked by the returned token, locked again after a restart). It deploys
+nothing; how a tested `main` reaches your server is up
 to you (a self-hosted runner, a cron `git pull && sh deploy/launch.sh`, or
 Watchtower against your own registry all work).

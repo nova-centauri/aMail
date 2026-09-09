@@ -17,7 +17,7 @@ aMail is the open-source continuation of GigaMail and upgrades existing GigaMail
 - **Flagged people.** Turn any set of addresses into a sidebar folder. Edit in Settings, or let an agent manage the list with `list_flags`/`set_flags`.
 - **First-run wizard.** Connect inboxes, get agent config snippets, and learn the analyzed flow in four steps.
 - **Private by default.** Remote content is blocked until you ask; when loaded, it is fetched server-side through an optional Tor/Privoxy relay, never by the browser. Known tracking pixels stay blocked. HTML is sanitized; SSRF targets are rejected.
-- **Secure by default.** Credentials encrypted at rest (AES-256-GCM), optional whole-database encryption (SQLCipher-compatible), access-token gate, passkey (WebAuthn) unlock, read-only non-root container bound to loopback.
+- **Secure by default.** Credentials encrypted at rest (AES-256-GCM), optional whole-database encryption (SQLCipher-compatible), access-token gate, passkey (WebAuthn) unlock, read-only non-root container bound to loopback. An optional keyslot mode boots locked with no secrets in the environment at all.
 - **A real mail client.** Compose with a visual HTML editor, recipient chips, attachments, per-account signatures and identities, Gmail-style shortcuts, right-click context menus on conversations, messages, drafts, and accounts, FTS5 search with operators, snooze, star, archive.
 
 ## Quick start (Docker)
@@ -90,8 +90,16 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, background polling |
 | `REMOTE_CONTENT_PROXY_URL` | Set by `deploy/launch.sh` to route remote images via Tor/Privoxy |
 | `AMAIL_METERING_URL`, `AMAIL_METERING_TOKEN`, `AMAIL_TENANT_ID` | Hosted only: POST analyzed-mark counts to a metering endpoint. Inert when unset |
+| `AMAIL_KEY_MODE` | `env` (default) or `keyslot`; see [Keyslot mode](#keyslot-mode-hosted-tenants) |
+| `AMAIL_PROVISION_SECRET`, `AMAIL_ESCROW_KEY`, `AMAIL_HANDOFF_SOCKET`, `AMAIL_HANDOFF_SECRET` | Keyslot mode only: provisioning, opt-in escrow, and deploy-time key handoff |
 
 Person flags are stored in the database, not the environment: manage them in **Settings → Flagged people** or via `PUT /api/flags`.
+
+### Keyslot mode (hosted tenants)
+
+The same image can run without any secret in its environment. With `AMAIL_KEY_MODE=keyslot` (and no `AMAIL_ENCRYPTION_KEY` / `AMAIL_ACCESS_TOKEN`), the container boots **locked**: the whole SQLite file is encrypted under a random data key that exists only in RAM while unlocked and is never stored bare. Every credential the tenant holds wraps that key into a *keyslot* next to the database — MCP bearer tokens, a passphrase, passkeys (via the WebAuthn PRF extension), a recovery code, and optionally an operator escrow slot the tenant can turn on to stay unlocked across restarts. Presenting any of them is the unlock; an agent's first MCP call with its token is enough. Locked or not, the operator never learns the key, and deleting the keyslots is a crypto-shred of the local cache.
+
+This is the model behind hosted aMail. Self-hosters can use it too; the operating procedure is in [`deploy/README.md`](deploy/README.md#keyslot-mode-hosted-tenants).
 
 ## Upgrading from GigaMail
 
