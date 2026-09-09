@@ -671,7 +671,7 @@ export function createMailService({
     }
   }
 
-  async function syncAll({ mailbox = null, limit } = {}) {
+  async function runSyncAll({ mailbox = null, limit } = {}) {
     const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
     const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
     const results = [];
@@ -683,6 +683,38 @@ export function createMailService({
       }
     }
     return results;
+  }
+
+  // A full sync walks every mailbox of every account over IMAP and is the most
+  // expensive thing this process does. Callers that only poll (the web client
+  // tick, an agent checking for mail) are coalesced: a request identical to one
+  // already running joins it, and `maxAgeMs` lets a caller accept the result of
+  // a run that finished recently instead of starting another.
+  let inFlightSync = null;
+  let lastFullSync = null;
+  const syncKey = ({ mailbox, limit }) => {
+    const target = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : 'INBOX';
+    return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
+  };
+
+  async function syncAll({ mailbox = null, limit, maxAgeMs = 0 } = {}) {
+    const key = syncKey({ mailbox, limit });
+    while (inFlightSync) {
+      if (inFlightSync.key === key) return inFlightSync.promise;
+      await inFlightSync.promise.catch(() => {});
+    }
+    if (maxAgeMs > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < maxAgeMs) {
+      return lastFullSync.results;
+    }
+    const promise = runSyncAll({ mailbox, limit });
+    inFlightSync = { key, promise };
+    try {
+      const results = await promise;
+      lastFullSync = { key, finishedAt: Date.now(), results };
+      return results;
+    } finally {
+      inFlightSync = null;
+    }
   }
 
   async function fetchAttachment(messageId, index) {
