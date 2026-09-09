@@ -137,7 +137,7 @@ npm test         # node:test server suite + vitest client suite
 npm run check    # production build + syntax check
 ```
 
-CI (`.github/workflows/ci.yml`) runs tests, the build, a dependency audit, Compose validation, both Docker builds, a live health check, and a boot with a GigaMail-era `.env`. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+CI (`.github/workflows/ci.yml`) runs tests, the build, a dependency audit, Compose validation, both Docker builds, a live health check, a boot with a GigaMail-era `.env`, and a boot in keyslot mode; when everything passes on `main` it fast-forwards the `release` branch. Servers follow `release` with `deploy/autoupdate.sh` on a timer (see [`deploy/README.md`](deploy/README.md#continuous-delivery-unattended-updates)). See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Status and license
 

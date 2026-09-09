@@ -141,3 +141,23 @@ jobs:
           fi
           docker rm --force --volumes amail-keyslot-ci >/dev/null 2>&1 || true
           docker volume rm amail-keyslot-ci >/dev/null 2>&1 || true
+
+  # Deployments watch the `release` branch, not `main`: it only ever moves to a
+  # commit the job above has fully verified. The push is fast-forward only, so
+  # a slower run for an older commit can never move it backwards.
+  promote:
+    name: Promote the tested commit to release
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tested commit with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward release to this commit
+        run: git push origin "HEAD:refs/heads/release"

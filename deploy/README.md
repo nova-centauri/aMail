@@ -337,7 +337,49 @@ tests, production build, dependency audit, Compose validation, both Docker
 builds, a live health check of the started image, an unauthenticated API
 check, a boot with a GigaMail-era `.env` to prove the compatibility
 fallbacks, and a boot of the same image in keyslot mode (locked, provisioned,
-unlocked by the returned token, locked again after a restart). It deploys
-nothing; how a tested `main` reaches your server is up
-to you (a self-hosted runner, a cron `git pull && sh deploy/launch.sh`, or
-Watchtower against your own registry all work).
+unlocked by the returned token, locked again after a restart).
+
+When all of that passes for a push to `main`, a final job fast-forwards the
+**`release`** branch to that commit. `release` therefore only ever points at
+a fully verified revision, and it is the branch deployments should follow;
+`main` may be ahead of it while a run is in progress or after a failure.
+
+## Continuous delivery (unattended updates)
+
+Nothing on GitHub reaches your server. Instead the server pulls: a timer runs
+`deploy/autoupdate.sh`, which fetches `release`, and when it has moved
+redeploys with the same `deploy/launch.sh` you used the first time, waits for
+`/api/health` to report the new `releaseSha`, and rolls back to the previous
+revision if it does not.
+
+```sh
+# One-time setup on the server, from the checkout you deploy from.
+sudo cp deploy/systemd/amail-autoupdate.service deploy/systemd/amail-autoupdate.timer /etc/systemd/system/
+sudo systemctl edit amail-autoupdate.service   # set WorkingDirectory, User, ExecStart path and mode
+sudo systemctl daemon-reload
+sudo systemctl enable --now amail-autoupdate.timer
+
+systemctl list-timers amail-autoupdate.timer   # next run
+journalctl -u amail-autoupdate.service         # what it did
+```
+
+Details worth knowing:
+
+- The script is idempotent and cheap when nothing changed (one `git fetch`),
+  so a five-minute cadence is fine. Overlapping runs are prevented with a lock.
+- It refuses to run over local modifications to tracked files; `.env` is
+  untracked and never touched.
+- After a rollback it records the failed revision and will not retry it. The
+  next `release` movement clears that. `journalctl` has the reason.
+- `launch.sh` now stamps every deploy with the checked-out commit, so
+  `curl -s http://127.0.0.1:3080/api/health | grep -o '"releaseSha":"[0-9a-f]*"'`
+  tells you what is serving even when you deploy by hand.
+- Prefer `cron`? `*/5 * * * * cd /opt/amail && sh deploy/autoupdate.sh privacy`
+  does the same job, just without `journalctl`.
+- To pin a server, stop the timer. To follow a different branch (a staging
+  server following `main`, say), set `AMAIL_RELEASE_BRANCH` in the unit's
+  `Environment=`.
+
+Each deploy still rebuilds the image on the server, exactly as a manual
+`launch.sh` does, so nothing about the trust model changes: the server only
+ever runs what it built from the commit it checked out.

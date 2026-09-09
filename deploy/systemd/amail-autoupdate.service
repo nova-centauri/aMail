@@ -1,0 +1,14 @@
+[Unit]
+Description=Deploy the latest verified aMail release
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust both paths to the checkout that deploy/launch.sh was run from, and
+# the user to the one that owns it (it needs to be in the docker group).
+WorkingDirectory=/opt/amail
+User=amail
+ExecStart=/bin/sh /opt/amail/deploy/autoupdate.sh privacy
+# Building the image and waiting for health can take a few minutes.
+TimeoutStartSec=15min
