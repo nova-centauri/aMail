@@ -19,6 +19,7 @@ import {
 import { NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { stringify } from '../db.js';
+import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
   mailerAttachments,
@@ -34,7 +35,7 @@ const asIso = (value) => {
   return date && !Number.isNaN(date.valueOf()) ? date.toISOString() : new Date().toISOString();
 };
 
-const cleanupError = (error) => String(error?.message || error || 'Unknown mail error').replace(/(?:pass(?:word)?|token)\s*[:=]\s*\S+/ig, '[redacted]').slice(0, 500);
+const cleanupError = (error) => scrubLogText(String(error?.message || error || 'Unknown mail error')).slice(0, 500);
 
 function setValues(value) {
   return value instanceof Set ? [...value] : Array.isArray(value) ? value : [];

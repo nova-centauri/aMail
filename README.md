@@ -87,6 +87,7 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_TRUST_PROXY`, `AMAIL_COOKIE_SECURE` | Reverse-proxy and cookie hardening |
 | `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, background polling |
 | `REMOTE_CONTENT_PROXY_URL` | Set by `deploy/launch.sh` to route remote images via Tor/Privoxy |
+| `AMAIL_METERING_URL`, `AMAIL_METERING_TOKEN`, `AMAIL_TENANT_ID` | Hosted only: POST analyzed-mark counts to a metering endpoint. Inert when unset |
 
 Person flags are stored in the database, not the environment: manage them in **Settings → Flagged people** or via `PUT /api/flags`.
 

@@ -1,6 +1,6 @@
 import 'dotenv/config';
-import pino from 'pino';
 import { loadConfig } from './config.js';
+import { createLogger } from './logging.js';
 import { createDatabase, createRepositories } from './db.js';
 import { createMailService } from './services/mail-service.js';
 import { createRemoteContentService } from './services/remote-content.js';
@@ -11,7 +11,7 @@ import { configureSmartFilter } from './services/smart-filter.js';
 
 const config = loadConfig();
 configureSmartFilter({ opsSources: config.opsSources });
-const logger = pino({ level: config.logLevel, redact: ['req.headers.authorization', 'req.headers.cookie'] });
+const logger = createLogger(config);
 let database;
 try {
   database = createDatabase(config);

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { normalizeLogLevel } from './logging.js';
 
 export const APP_NAME = 'aMail';
 export const SESSION_COOKIE = 'amail_session';
@@ -108,7 +109,8 @@ export function loadConfig(env = process.env) {
     // as an explicit non-production development escape hatch.
     allowDirectRemoteContent: (env.NODE_ENV || 'development') !== 'production'
       && boolean(readEnv(env, 'ALLOW_DIRECT_REMOTE_CONTENT')),
-    logLevel: env.LOG_LEVEL || 'info',
+    // `error` is the hosted profile: failures only, no per-request entries.
+    logLevel: normalizeLogLevel(env.LOG_LEVEL),
     // Hosted-only usage metering. Unset means no-op: nothing is buffered or
     // sent. The endpoint receives analyzed counts and timestamps, nothing else.
     meteringUrl: parseHttpUrl(readEnv(env, 'METERING_URL')),
