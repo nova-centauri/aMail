@@ -469,6 +469,7 @@ export function createMailService({
     let imported = 0;
     let skippedTooLarge = 0;
     let skippedUnavailable = 0;
+    let skippedFailed = 0;
     const previousSync = repos.sync.get(account.id, mailbox);
     let lastUid = previousSync?.last_uid || 0;
     let uidValidity = null;
@@ -535,25 +536,37 @@ export function createMailService({
             continue;
           }
 
-          const saved = await ingestImapMessage({
-            account,
-            mailbox,
-            role,
-            allMailMirror,
-            message: { ...message, source },
-          });
-          if (saved) imported += 1;
+          try {
+            const saved = await ingestImapMessage({
+              account,
+              mailbox,
+              role,
+              allMailMirror,
+              message: { ...message, source },
+            });
+            if (saved) imported += 1;
+          } catch (error) {
+            // A message the parser or the database rejects must not pin the
+            // window: retrying it on every cycle costs the full fetch and parse
+            // each time and blocks everything newer in the mailbox. It stays on
+            // the IMAP server, and the report names the count.
+            skippedFailed += 1;
+            if (skippedFailed === 1) {
+              logger.warn({ accountId: account.id, mailbox, err: cleanupError(error) }, 'IMAP message could not be imported; skipping it');
+            }
+          }
           lastUid = Math.max(lastUid, uid);
         }
       }
-      const skipped = skippedTooLarge + skippedUnavailable;
+      const skipped = skippedTooLarge + skippedUnavailable + skippedFailed;
       const skipReasons = [
         skippedTooLarge && { code: 'IMAP_MESSAGE_TOO_LARGE', count: skippedTooLarge, maxBytes: maxMessageBytes },
         skippedUnavailable && { code: 'IMAP_MESSAGE_SOURCE_UNAVAILABLE', count: skippedUnavailable },
+        skippedFailed && { code: 'IMAP_MESSAGE_IMPORT_FAILED', count: skippedFailed },
       ].filter(Boolean);
       if (skipped) {
         logger.info(
-          { accountId: account.id, mailbox, skipped, skippedTooLarge, skippedUnavailable, maxMessageBytes },
+          { accountId: account.id, mailbox, skipped, skippedTooLarge, skippedUnavailable, skippedFailed, maxMessageBytes },
           'IMAP messages skipped without importing source content',
         );
       }
@@ -658,7 +671,7 @@ export function createMailService({
     }
   }
 
-  async function syncAll({ mailbox = null, limit } = {}) {
+  async function runSyncAll({ mailbox = null, limit } = {}) {
     const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
     const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
     const results = [];
@@ -670,6 +683,38 @@ export function createMailService({
       }
     }
     return results;
+  }
+
+  // A full sync walks every mailbox of every account over IMAP and is the most
+  // expensive thing this process does. Callers that only poll (the web client
+  // tick, an agent checking for mail) are coalesced: a request identical to one
+  // already running joins it, and `maxAgeMs` lets a caller accept the result of
+  // a run that finished recently instead of starting another.
+  let inFlightSync = null;
+  let lastFullSync = null;
+  const syncKey = ({ mailbox, limit }) => {
+    const target = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : 'INBOX';
+    return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
+  };
+
+  async function syncAll({ mailbox = null, limit, maxAgeMs = 0 } = {}) {
+    const key = syncKey({ mailbox, limit });
+    while (inFlightSync) {
+      if (inFlightSync.key === key) return inFlightSync.promise;
+      await inFlightSync.promise.catch(() => {});
+    }
+    if (maxAgeMs > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < maxAgeMs) {
+      return lastFullSync.results;
+    }
+    const promise = runSyncAll({ mailbox, limit });
+    inFlightSync = { key, promise };
+    try {
+      const results = await promise;
+      lastFullSync = { key, finishedAt: Date.now(), results };
+      return results;
+    } finally {
+      inFlightSync = null;
+    }
   }
 
   async function fetchAttachment(messageId, index) {

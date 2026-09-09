@@ -17,7 +17,7 @@ import { DEMO_PERSON_FLAGS, EMPTY_FOLDER_COUNTS, SMART_CATEGORIES, UNIFIED_ACCOU
 import { demoAccounts, demoDraftThreads, demoMailboxThreads } from './mail/demo.js';
 import { normalizeFreshDraft, pruneDismissedFreshDrafts, visibleFreshDrafts } from './mail/fresh-drafts.js';
 import { countSmartCategories, filterVisibleThreads, findPersonFlag } from './mail/filter.js';
-import { useLiveMailboxSync } from './mail/live-sync.js';
+import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.js';
 import { quotedComposeHtml } from './mail/html.js';
 import { formatMessageDate, getArray, normalizeAccount, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
 import { collectKnownPeople } from './mail/people.js';
@@ -311,7 +311,7 @@ export default function App() {
     if (syncInFlightRef.current) return;
     syncInFlightRef.current = true;
     try {
-      await api('/sync', { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX' }) });
+      await api('/sync', { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', maxAgeSeconds: LIVE_SYNC_MAX_AGE_SECONDS }) });
     } catch {
       // Keep the current mailbox. A later tick or a manual refresh will retry.
     } finally {
