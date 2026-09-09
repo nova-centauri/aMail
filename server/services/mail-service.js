@@ -342,6 +342,7 @@ export function createMailService({
   config,
   repos,
   logger,
+  metering = null,
   ImapClient = ImapFlow,
   createSmtpTransport = (options) => nodemailer.createTransport(options),
   compileMessage = compileRfc822Message,
@@ -1060,6 +1061,11 @@ export function createMailService({
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
     const updated = repos.messages.setState(id, state);
+    // Only the transition into "analyzed" is metered, so re-marking an already
+    // analyzed message (or toggling it back) never inflates the count.
+    if (state.isAnalyzed === true && !existing.isAnalyzed && updated?.isAnalyzed) {
+      metering?.recordAnalyzed?.(1);
+    }
     // Mail mutations are intentionally best-effort so offline local state stays
     // usable. The API response says whether IMAP accepted, skipped, or failed it.
     try {

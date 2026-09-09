@@ -109,6 +109,12 @@ export function loadConfig(env = process.env) {
     allowDirectRemoteContent: (env.NODE_ENV || 'development') !== 'production'
       && boolean(readEnv(env, 'ALLOW_DIRECT_REMOTE_CONTENT')),
     logLevel: env.LOG_LEVEL || 'info',
+    // Hosted-only usage metering. Unset means no-op: nothing is buffered or
+    // sent. The endpoint receives analyzed counts and timestamps, nothing else.
+    meteringUrl: parseHttpUrl(readEnv(env, 'METERING_URL')),
+    meteringToken: readEnv(env, 'METERING_TOKEN') || null,
+    // Opaque identifier the metering endpoint uses to attribute events.
+    tenantId: String(readEnv(env, 'TENANT_ID') || '').trim().slice(0, 128) || null,
     webauthnRpName: readEnv(env, 'RP_NAME') || APP_NAME,
     // Passkeys must match the public HTTPS origin. Behind a reverse proxy the
     // container usually sees an internal Host, so operators pin these explicitly;
@@ -123,6 +129,18 @@ export function loadConfig(env = process.env) {
     // reports a failure, which surfaces under "Ops errors".
     opsSources: parseOpsSources(env.AMAIL_OPS_SOURCES ?? env.GIGAMAIL_OPS_SOURCES),
   });
+}
+
+/** Accept only absolute http(s) URLs; anything else disables the feature. */
+export function parseHttpUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 export const DEFAULT_OPS_SOURCES = Object.freeze(['proxmox', 'watchtower']);
