@@ -35,6 +35,10 @@ services:
       - amail-data:/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
+    # A 21-account mailbox measured about 1.1 GiB at steady state. The cap
+    # keeps one runaway instance from starving the host; raise it in .env for
+    # very large mailboxes.
+    mem_limit: ${AMAIL_MEMORY_LIMIT:-1536m}
     read_only: true
     user: "10001:10001"
     cap_drop:
@@ -80,6 +84,7 @@ services:
       - tor-state:/var/lib/tor
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m
+    mem_limit: ${AMAIL_TOR_MEMORY_LIMIT:-256m}
     networks:
       privacy-net:
       # Tor must use the egress bridge as its default route. Without an

@@ -426,14 +426,22 @@ function initSchema(db) {
       text_body,
       tokenize = 'unicode61 remove_diacritics 2'
     );
-    CREATE TRIGGER IF NOT EXISTS messages_ad_fts AFTER DELETE ON messages BEGIN
-      INSERT INTO messages_fts(messages_fts, rowid) VALUES('delete', old.rowid);
+  `);
+  // messages_fts is a regular (content-bearing) FTS5 table, so the
+  // INSERT ... VALUES('delete', rowid) command is invalid for it: earlier
+  // builds installed a trigger using it, which made every DELETE FROM messages
+  // fail with "SQL logic error". Replace it with a plain DELETE.
+  db.exec(`
+    DROP TRIGGER IF EXISTS messages_ad_fts;
+    CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
+      DELETE FROM messages_fts WHERE rowid = old.rowid;
     END;
   `);
   backfillMessagesFts(db);
 }
 
 const FTS_BACKFILL_BATCH = 100;
+const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 
 function prepareSqliteTempDir(dataDir) {
   const sqliteTmpDir = path.join(dataDir, 'tmp');
@@ -593,10 +601,15 @@ export function createDatabase(config, { key = config.databaseKey || null } = {}
   }
   const db = openDatabase(config.dbPath, { key });
   db.pragma('journal_mode = WAL');
+  // SQLite reuses a WAL file but never shrinks it, so one large import leaves
+  // hundreds of megabytes on the volume for good. Truncate it back to this
+  // size after checkpoints, and reclaim any oversized WAL from earlier runs.
+  db.pragma(`journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.pragma(`temp_store_directory = '${sqliteTmpDir.replace(/'/g, "''")}'`);
   initSchema(db);
+  db.pragma('wal_checkpoint(TRUNCATE)');
   return db;
 }
 
@@ -818,7 +831,7 @@ export function createRepositories(db) {
     ftsInsert: db.prepare(`INSERT INTO messages_fts(
       rowid, subject, snippet, from_name, from_email, recipients, text_body
     ) VALUES (@rowid, @subject, @snippet, @from_name, @from_email, @recipients, @text_body)`),
-    ftsDelete: db.prepare("INSERT INTO messages_fts(messages_fts, rowid) VALUES('delete', ?)"),
+    ftsDelete: db.prepare('DELETE FROM messages_fts WHERE rowid = ?'),
     searchThreadIds: db.prepare(`SELECT m.thread_id AS threadId
       FROM messages m
       JOIN messages_fts fts ON fts.rowid = m.rowid
@@ -854,11 +867,7 @@ export function createRepositories(db) {
   const syncFts = (id) => {
     const row = queries.messageRow.get(id);
     if (!row) return;
-    try {
-      queries.ftsDelete.run(row.rowid);
-    } catch {
-      // First insert has no FTS row yet; FTS5 errors on deleting a missing rowid.
-    }
+    queries.ftsDelete.run(row.rowid);
     queries.ftsInsert.run(ftsDocument(row, json));
   };
 
@@ -959,7 +968,7 @@ export function createRepositories(db) {
       },
       forThread: (threadId) => queries.messagesByThread.all(threadId).map(publicMessage),
       findByRfcId: (accountId, messageId) => publicMessage(queries.messageByRfcId.get(accountId, messageId)),
-      upsert(input) {
+      upsert: db.transaction((input) => {
         const classification = classifyMessage(input);
         const classifiedInput = {
           ...input,
@@ -993,7 +1002,7 @@ export function createRepositories(db) {
         recomputeThread(row.thread_id);
         syncFts(row.id);
         return publicMessage(queries.messageById.get(row.id));
-      },
+      }),
       setState(id, state) {
         const row = queries.messageById.get(id);
         if (!row) return null;

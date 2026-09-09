@@ -98,3 +98,128 @@ test('reopening a pre-FTS mailbox indexes search in batches and keeps SQLite tem
     db.prepare(`SELECT COUNT(*) AS count FROM messages_fts WHERE messages_fts MATCH '"unique-token-42"'`).get().count >= 1,
   );
 });
+
+function seedAccount(repos) {
+  return repos.accounts.create({
+    email: 'owner@example.test',
+    display_name: 'Owner',
+    avatar_blob: null,
+    avatar_mime: null,
+    color: '#1a73e8',
+    provider: 'custom',
+    imap_host: 'imap.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    smtp_host: 'smtp.example.test',
+    smtp_port: 465,
+    smtp_secure: 1,
+    credential_ciphertext: 'test-only',
+    signature: '',
+    sync_enabled: 1,
+  });
+}
+
+function ftsHits(db, term) {
+  return db.prepare(`SELECT COUNT(*) AS count FROM messages_fts WHERE messages_fts MATCH ?`).get(`"${term}"`).count;
+}
+
+test('re-importing an indexed message updates the search index instead of failing', (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-fts-upsert-'));
+  const db = createDatabase({ dataDir, dbPath: path.join(dataDir, 'amail.sqlite') });
+  const repos = createRepositories(db);
+  t.after(() => {
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Quarterly numbers',
+    normalized_subject: 'quarterly numbers',
+    latest_at: '2026-08-01T00:00:00.000Z',
+  });
+  const timestamp = '2026-08-01T00:00:00.000Z';
+
+  // The local copy of a sent message has no UID yet; the next Sent sync finds
+  // it by Message-ID and re-imports it with the UID the server assigned.
+  const local = repos.messages.upsert({
+    ...messageInput({ accountId: account.id, threadId: thread.id, uid: null, subject: 'Quarterly numbers', textBody: 'draft-token', timestamp }),
+    mailbox: 'Sent',
+    is_sent: 1,
+  });
+  const synced = repos.messages.upsert({
+    ...messageInput({ accountId: account.id, threadId: thread.id, uid: 77, subject: 'Quarterly numbers', textBody: 'server-token', timestamp }),
+    mailbox: 'Sent',
+    rfc_message_id: '<fts-null@example.test>',
+    is_sent: 1,
+  });
+
+  assert.equal(synced.id, local.id);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 1);
+  assert.equal(ftsHits(db, 'server-token'), 1);
+  assert.equal(ftsHits(db, 'draft-token'), 0);
+});
+
+test('deleting messages and removing accounts drop their search rows', (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-fts-delete-'));
+  const db = createDatabase({ dataDir, dbPath: path.join(dataDir, 'amail.sqlite') });
+  const repos = createRepositories(db);
+  t.after(() => {
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Hello',
+    normalized_subject: 'hello',
+    latest_at: '2026-08-01T00:00:00.000Z',
+  });
+  const timestamp = '2026-08-01T00:00:00.000Z';
+  const first = repos.messages.upsert(messageInput({ accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello', textBody: 'first-token', timestamp }));
+  repos.messages.upsert(messageInput({ accountId: account.id, threadId: thread.id, uid: 2, subject: 'Hello', textBody: 'second-token', timestamp }));
+
+  db.prepare('DELETE FROM messages WHERE id = ?').run(first.id);
+  assert.equal(ftsHits(db, 'first-token'), 0);
+  assert.equal(ftsHits(db, 'second-token'), 1);
+
+  assert.equal(repos.accounts.remove(account.id), true);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 0);
+});
+
+test('reopening a database with the earlier FTS delete trigger repairs it', (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-fts-trigger-'));
+  const config = { dataDir, dbPath: path.join(dataDir, 'amail.sqlite') };
+  const seed = createDatabase(config);
+  const seedRepos = createRepositories(seed);
+  const account = seedAccount(seedRepos);
+  const thread = seedRepos.threads.create({
+    account_id: account.id,
+    subject: 'Hello',
+    normalized_subject: 'hello',
+    latest_at: '2026-08-01T00:00:00.000Z',
+  });
+  const message = seedRepos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello', textBody: 'legacy-token', timestamp: '2026-08-01T00:00:00.000Z',
+  }));
+  // The trigger shipped before this fix used the FTS5 'delete' command, which a
+  // content-bearing table rejects, so no message row could ever be deleted.
+  seed.exec(`
+    DROP TRIGGER IF EXISTS messages_ad_fts;
+    CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid) VALUES('delete', old.rowid);
+    END;
+  `);
+  assert.throws(() => seed.prepare('DELETE FROM messages WHERE id = ?').run(message.id));
+  seedRepos.close();
+
+  const db = createDatabase(config);
+  t.after(() => {
+    db.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  db.prepare('DELETE FROM messages WHERE id = ?').run(message.id);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 0);
+});

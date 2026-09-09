@@ -304,8 +304,9 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       accountId: z.string().optional().describe('Account to sync; omit to sync all'),
       mailbox: z.string().optional(),
       limit: z.number().int().optional().describe('Max messages to fetch this pass'),
+      maxAgeSeconds: z.number().int().optional().describe('When syncing all accounts, accept the result of a sync that finished within this many seconds instead of starting another. Use when polling for new mail.'),
     },
-  }, async ({ accountId, mailbox, limit }) => runTool(async () => {
+  }, async ({ accountId, mailbox, limit, maxAgeSeconds }) => runTool(async () => {
     const options = {
       mailbox: mailbox ? String(mailbox) : undefined,
       limit: parseNumber(limit, config.syncBatchSize, 1, 1000),
@@ -313,7 +314,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     if (accountId) {
       return { result: await mailService.syncAccount(accountId, options) };
     }
-    return { results: await mailService.syncAll(options) };
+    return { results: await mailService.syncAll({ ...options, maxAgeMs: parseNumber(maxAgeSeconds, 0, 0, 3600) * 1000 }) };
   }));
 
   server.registerTool('test_account', {
