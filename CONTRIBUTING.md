@@ -17,7 +17,7 @@ cp .env.example .env      # set AMAIL_ENCRYPTION_KEY and AMAIL_ACCESS_TOKEN; AMA
 npm run dev               # Vite on http://127.0.0.1:5173, API on :3000
 ```
 
-Node 22 or newer is required (`better-sqlite3`, `node:test`).
+Node 22 or newer is required (`better-sqlite3-multiple-ciphers`, `node:test`).
 
 ## Tests and checks
 

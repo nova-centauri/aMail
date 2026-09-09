@@ -12,6 +12,9 @@ import { configureSmartFilter } from './services/smart-filter.js';
 const config = loadConfig();
 configureSmartFilter({ opsSources: config.opsSources });
 const logger = createLogger(config);
+if (config.encryptDatabase && !config.databaseKey) {
+  logger.warn('AMAIL_ENCRYPT_DATABASE is set but AMAIL_ENCRYPTION_KEY is missing; the database stays unencrypted');
+}
 let database;
 try {
   database = createDatabase(config);

@@ -158,16 +158,37 @@ Database migrations are backward-compatible and run automatically at startup.
 Before upgrading, take an online SQLite backup from inside the volume:
 
 ```sh
-docker compose exec amail node -e "
-  const Database = require('better-sqlite3');
-  const fs = require('node:fs');
-  const src = fs.existsSync('/data/amail.sqlite') ? '/data/amail.sqlite' : '/data/gigamail.sqlite';
-  new Database(src, { readonly: true }).backup('/data/backup-' + Date.now() + '.sqlite').then(() => console.log('ok'));
-"
+docker compose exec amail node server/tools/backup.js
 ```
+
+The tool reads the container's environment, so an encrypted database (see
+below) is opened with its key and the copy stays encrypted under that same
+key. Pass a path as the first argument to choose the destination; the default
+is `/data/backup-<timestamp>.sqlite`.
 
 Do not delete the `amail-data` volume unless intentionally discarding all
 accounts, cached mail metadata, and settings.
+
+## Whole-database encryption
+
+Saved mail credentials are always encrypted with `AMAIL_ENCRYPTION_KEY`. The
+cached mail itself (bodies, the search index, settings) is stored in plaintext
+unless you opt in:
+
+```sh
+# .env
+AMAIL_ENCRYPT_DATABASE=true
+```
+
+On the next start aMail derives a separate database key from
+`AMAIL_ENCRYPTION_KEY` and encrypts the existing SQLite file in place (SQLCipher
+format via `better-sqlite3-multiple-ciphers`). This is a one-time migration:
+take a backup first, expect the start to take a little longer on a large
+mailbox, and note that from then on the file is unreadable without the key.
+Setting the flag back to `false` makes the server refuse to start rather than
+create an empty database next to the encrypted one; turn it back on with the
+original key. `/api/health` reports `databaseEncrypted` so you can confirm the
+state after the restart.
 
 ## Continuous integration
 

@@ -42,6 +42,19 @@ export function decryptJson(payload, key) {
   }
 }
 
+const HKDF_SALT = Buffer.from('aMail', 'utf8');
+
+/**
+ * Derive an independent 32-byte subkey from a secret for one named purpose.
+ * Different `info` strings give unrelated keys, so the database key, credential
+ * key, and token key can all descend from one root without sharing material.
+ */
+export function deriveSubkey(secret, info, length = 32) {
+  const ikm = Buffer.isBuffer(secret) ? secret : Buffer.from(String(secret), 'utf8');
+  if (!ikm.length) throw new ValidationError('A secret is required to derive a key.');
+  return Buffer.from(crypto.hkdfSync('sha256', ikm, HKDF_SALT, Buffer.from(String(info), 'utf8'), length));
+}
+
 export function timingSafeMatch(received, expected) {
   if (!received || !expected) return false;
   const left = Buffer.from(String(received));

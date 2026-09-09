@@ -2,8 +2,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { normalizeLogLevel } from './logging.js';
+import { deriveSubkey } from './services/crypto.js';
 
 export const APP_NAME = 'aMail';
+export const DATABASE_KEY_INFO = 'amail/database-key/v1';
 export const SESSION_COOKIE = 'amail_session';
 /** Cookie name used by GigaMail-era deployments; still accepted for auth. */
 export const LEGACY_SESSION_COOKIE = 'gigamail_session';
@@ -57,6 +59,9 @@ export function loadConfig(env = process.env) {
   const credentialKey = deriveKey(encryptionKey);
   const remoteTokenKey = deriveKey(readEnv(env, 'REMOTE_TOKEN_KEY') || encryptionKey);
   const releaseSha = String(readEnv(env, 'RELEASE_SHA') || '');
+  // Whole-database encryption is opt-in for self-hosted installs because an
+  // existing plaintext file is migrated in place on the first keyed boot.
+  const encryptDatabase = boolean(readEnv(env, 'ENCRYPT_DATABASE'));
 
   return Object.freeze({
     appName: APP_NAME,
@@ -71,6 +76,8 @@ export function loadConfig(env = process.env) {
     releaseSha: /^[0-9a-f]{40}$/i.test(releaseSha) ? releaseSha.toLowerCase() : null,
     credentialKey,
     remoteTokenKey,
+    encryptDatabase,
+    databaseKey: encryptDatabase && encryptionKey ? deriveSubkey(encryptionKey, DATABASE_KEY_INFO) : null,
     accessToken: readEnv(env, 'ACCESS_TOKEN') || null,
     // This intentionally stays false unless a reverse proxy has been selected by
     // the operator. Trusting arbitrary forwarded headers is unsafe by default.

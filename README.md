@@ -17,7 +17,7 @@ aMail is the open-source continuation of GigaMail and upgrades existing GigaMail
 - **Flagged people.** Turn any set of addresses into a sidebar folder. Edit in Settings, or let an agent manage the list with `list_flags`/`set_flags`.
 - **First-run wizard.** Connect inboxes, get agent config snippets, and learn the analyzed flow in four steps.
 - **Private by default.** Remote content is blocked until you ask; when loaded, it is fetched server-side through an optional Tor/Privoxy relay, never by the browser. Known tracking pixels stay blocked. HTML is sanitized; SSRF targets are rejected.
-- **Secure by default.** Credentials encrypted at rest (AES-256-GCM), access-token gate, passkey (WebAuthn) unlock, read-only non-root container bound to loopback.
+- **Secure by default.** Credentials encrypted at rest (AES-256-GCM), optional whole-database encryption (SQLCipher-compatible), access-token gate, passkey (WebAuthn) unlock, read-only non-root container bound to loopback.
 - **A real mail client.** Compose with a visual HTML editor, recipient chips, attachments, per-account signatures and identities, Gmail-style shortcuts, right-click context menus on conversations, messages, drafts, and accounts, FTS5 search with operators, snooze, star, archive.
 
 ## Quick start (Docker)
@@ -80,6 +80,7 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | Variable | Purpose |
 | --- | --- |
 | `AMAIL_ENCRYPTION_KEY` | **Required.** Encrypts stored IMAP/SMTP credentials |
+| `AMAIL_ENCRYPT_DATABASE` | Opt in to encrypting the whole SQLite file (SQLCipher format) with a key derived from `AMAIL_ENCRYPTION_KEY`; migrates an existing database in place |
 | `AMAIL_ACCESS_TOKEN` | **Required.** Gates the UI, REST API, and MCP endpoint |
 | `AMAIL_BIND_ADDRESS`, `AMAIL_PORT` | Where Compose publishes the app (default `127.0.0.1:3080`) |
 | `AMAIL_RP_ID`, `AMAIL_ORIGIN` | Public hostname/origin for passkeys behind a reverse proxy |

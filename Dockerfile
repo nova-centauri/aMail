@@ -4,8 +4,9 @@ FROM node:${NODE_VERSION}-bookworm-slim AS build
 
 WORKDIR /app
 
-# better-sqlite3 has a prebuilt binary for most platforms, but these build
-# dependencies make the image reliable when npm needs to compile it instead.
+# better-sqlite3-multiple-ciphers (SQLite with SQLCipher-compatible encryption)
+# ships prebuilt binaries for common platforms; these build dependencies make
+# the image reliable when npm has to compile the addon instead.
 COPY package.json package-lock.json ./
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
