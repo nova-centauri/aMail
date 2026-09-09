@@ -6,6 +6,7 @@ import { createMeteringService } from './services/metering.js';
 import { createKeyslotStore, passkeyStoreFromKeyslots } from './services/keyslots.js';
 import { createAuthenticator } from './middleware/auth.js';
 import { createVault } from './vault.js';
+import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
 
 /**
@@ -15,7 +16,7 @@ import { createApp } from './app.js';
  *   env      keys derive from AMAIL_ENCRYPTION_KEY, the database opens at boot,
  *            AMAIL_ACCESS_TOKEN gates access (a plain self-hosted .env).
  *   keyslot  the process boots locked; the database opens when a keyslot
- *            credential (or an escrow slot) unwraps the DEK.
+ *            credential (or an escrow slot / DEK handoff) unwraps the DEK.
  */
 export function createHarness({ config, logger }) {
   const metering = createMeteringService({ config, logger });
@@ -74,6 +75,7 @@ export function createHarness({ config, logger }) {
   }
 
   const keyslots = createKeyslotStore({ dataDir: config.dataDir });
+  let handoff = null;
 
   const vault = createVault({
     config,
@@ -82,11 +84,26 @@ export function createHarness({ config, logger }) {
     buildRuntime: (keys) => buildRuntime({ ...config, ...keys }),
     onUnlock(runtime) {
       startPolling(runtime.mailService);
+      handoff?.start().catch((error) => logger.error({ err: error }, 'DEK handoff listener failed to start'));
     },
     onLock() {
       stopPolling();
+      handoff?.stop().catch(() => {});
     },
   });
+
+  if (config.handoffSocket) {
+    if (config.handoffSecret) {
+      handoff = createHandoffServer({
+        socketPath: config.handoffSocket,
+        secret: config.handoffSecret,
+        logger,
+        getDek: () => (vault.isUnlocked() ? vault.exportDek() : null),
+      });
+    } else {
+      logger.warn('AMAIL_HANDOFF_SOCKET is set without AMAIL_HANDOFF_SECRET; DEK handoff is disabled');
+    }
+  }
 
   const passkeys = createPasskeyService({ config, store: passkeyStoreFromKeyslots(keyslots), requestPrf: true });
   const auth = createAuthenticator({ config, vault });
@@ -99,8 +116,21 @@ export function createHarness({ config, logger }) {
     vault,
     keyslots,
     async start() {
-      // Resume without tenant interaction only when the tenant opted into escrow.
-      if (vault.unlockFromEscrow()) logger.info('Harness unlocked from the escrow keyslot');
+      // Resume without tenant interaction when allowed: a running predecessor
+      // hands the DEK over during a deploy, or the tenant opted into escrow.
+      if (handoff && !vault.isUnlocked()) {
+        const dek = await requestHandoff({ socketPath: config.handoffSocket, secret: config.handoffSecret, logger });
+        if (dek) {
+          try {
+            vault.unlockWithDek(dek, { via: 'handoff' });
+          } catch (error) {
+            logger.error({ err: error }, 'Handed-off DEK was rejected');
+          } finally {
+            dek.fill(0);
+          }
+        }
+      }
+      if (!vault.isUnlocked() && vault.unlockFromEscrow()) logger.info('Harness unlocked from the escrow keyslot');
       if (!vault.isUnlocked()) {
         logger.info({ initialized: vault.isInitialized() }, vault.isInitialized() ? 'Harness is locked; waiting for a keyslot credential' : 'Harness is not provisioned; waiting for /api/keyslots/init');
       }
@@ -108,6 +138,7 @@ export function createHarness({ config, logger }) {
     async stop() {
       stopPolling();
       await metering.close().catch(() => {});
+      await handoff?.stop().catch(() => {});
       vault.lock({ reason: 'shutdown' });
     },
   };

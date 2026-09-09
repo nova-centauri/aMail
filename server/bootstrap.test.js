@@ -179,3 +179,43 @@ test('escrow lets a restarted container unlock itself only when the tenant opted
   assert.equal(elsewhere.harness.vault.isUnlocked(), false);
   await elsewhere.stop();
 });
+
+test('a new process takes the DEK from the running one over the handoff socket', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-harness-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const socketPath = path.join(dataDir, 'handoff.sock');
+  const env = {
+    AMAIL_DATA_DIR: dataDir,
+    AMAIL_KEY_MODE: 'keyslot',
+    AMAIL_PROVISION_SECRET: 'p'.repeat(32),
+    AMAIL_HANDOFF_SOCKET: socketPath,
+    AMAIL_HANDOFF_SECRET: 'shared-handoff-secret-value',
+  };
+
+  const old = await boot(t, env);
+  assert.equal(fs.existsSync(socketPath), false, 'nothing to serve while locked');
+  await fetch(`${old.origin}/api/keyslots/init`, { method: 'POST', headers: { authorization: `Bearer ${env.AMAIL_PROVISION_SECRET}` } });
+  assert.equal(fs.existsSync(socketPath), true, 'unlocked process listens for a successor');
+  assert.equal((fs.statSync(socketPath).mode & 0o777), 0o600);
+
+  // Wrong secret: refused, old process stays unaffected.
+  const intruder = await boot(t, { ...env, AMAIL_HANDOFF_SECRET: 'not-the-secret' });
+  assert.equal(intruder.harness.vault.isUnlocked(), false);
+  await intruder.stop();
+  assert.equal(old.harness.vault.isUnlocked(), true);
+
+  // Right secret: the new process is unlocked before the old one goes away.
+  const fresh = await boot(t, env);
+  assert.equal(fresh.harness.vault.isUnlocked(), true);
+  assert.equal(fresh.harness.vault.status().unlockedVia, 'handoff');
+  assert.equal((await (await fetch(`${fresh.origin}/api/health`)).json()).locked, false);
+  await old.stop();
+  assert.equal(fs.existsSync(socketPath), true, 'the successor now owns the socket path');
+  await fresh.stop();
+  assert.equal(fs.existsSync(socketPath), false);
+
+  // Nobody listening: the next boot is simply locked.
+  const later = await boot(t, env);
+  assert.equal(later.harness.vault.isUnlocked(), false);
+  await later.stop();
+});
