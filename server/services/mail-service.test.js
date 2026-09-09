@@ -141,7 +141,7 @@ test('TLS failures point to certificate hostnames without returning raw errors',
   });
 });
 
-function syncHarness({ maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41 }) {
+function syncHarness({ maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false }) {
   const account = {
     id: 'sync-account',
     email: 'sync@example.test',
@@ -200,6 +200,7 @@ function syncHarness({ maxMessageBytes = 512, messages, sources, previousSync = 
     messages: {
       findByRfcId: () => null,
       upsert(value) {
+        if (rejectUpsert(value)) throw new Error('constraint failed');
         state.savedMessages.push(value);
         return { id: `message-${state.savedMessages.length}` };
       },
@@ -268,6 +269,42 @@ test('IMAP sync skips oversized sources without unrestricted body downloads', as
   }
   assert.equal(state.savedSync.last_uid, 3);
   assert.doesNotMatch(JSON.stringify(state.logs), /TOP SECRET OVERSIZED CONTENT/);
+});
+
+test('a message the database rejects is skipped and reported instead of pinning the mailbox', async () => {
+  const source = (id, body) => Buffer.from([
+    'From: Sender <sender@example.test>',
+    'To: Sync Account <sync@example.test>',
+    `Subject: ${id}`,
+    `Message-ID: <${id}@example.test>`,
+    'Date: Sat, 18 Jul 2026 12:00:00 +0000',
+    '',
+    body,
+  ].join('\r\n'));
+  const sources = new Map([[1, source('first', 'ok')], [2, source('poison', 'PRIVATE POISON BODY')], [3, source('third', 'ok')]]);
+  const { service, state } = syncHarness({
+    maxMessageBytes: 4096,
+    messages: [1, 2, 3].map((uid) => ({ uid, size: sources.get(uid).length })),
+    sources,
+    rejectUpsert: (value) => value.rfc_message_id === '<poison@example.test>',
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.status, 'partial');
+  assert.equal(result.imported, 2);
+  assert.equal(result.skipped, 1);
+  assert.deepEqual(result.mailboxes[0].skipReasons, [{ code: 'IMAP_MESSAGE_IMPORT_FAILED', count: 1 }]);
+  // The window moves past the rejected message so the next cycle does not
+  // fetch, parse, and reject it again.
+  assert.equal(result.mailboxes[0].lastUid, 3);
+  assert.equal(state.savedSync.last_uid, 3);
+  assert.equal(state.savedSync.last_error, null);
+  assert.deepEqual(state.savedMessages.map((message) => message.rfc_message_id), ['<first@example.test>', '<third@example.test>']);
+  const warnings = state.logs.filter((entry) => entry.level === 'warn');
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].fields.mailbox, 'INBOX');
+  assert.doesNotMatch(JSON.stringify(state.logs), /PRIVATE POISON BODY/);
 });
 
 test('UIDVALIDITY changes reset the incremental window and are reported', async () => {

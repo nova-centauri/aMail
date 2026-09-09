@@ -469,6 +469,7 @@ export function createMailService({
     let imported = 0;
     let skippedTooLarge = 0;
     let skippedUnavailable = 0;
+    let skippedFailed = 0;
     const previousSync = repos.sync.get(account.id, mailbox);
     let lastUid = previousSync?.last_uid || 0;
     let uidValidity = null;
@@ -535,25 +536,37 @@ export function createMailService({
             continue;
           }
 
-          const saved = await ingestImapMessage({
-            account,
-            mailbox,
-            role,
-            allMailMirror,
-            message: { ...message, source },
-          });
-          if (saved) imported += 1;
+          try {
+            const saved = await ingestImapMessage({
+              account,
+              mailbox,
+              role,
+              allMailMirror,
+              message: { ...message, source },
+            });
+            if (saved) imported += 1;
+          } catch (error) {
+            // A message the parser or the database rejects must not pin the
+            // window: retrying it on every cycle costs the full fetch and parse
+            // each time and blocks everything newer in the mailbox. It stays on
+            // the IMAP server, and the report names the count.
+            skippedFailed += 1;
+            if (skippedFailed === 1) {
+              logger.warn({ accountId: account.id, mailbox, err: cleanupError(error) }, 'IMAP message could not be imported; skipping it');
+            }
+          }
           lastUid = Math.max(lastUid, uid);
         }
       }
-      const skipped = skippedTooLarge + skippedUnavailable;
+      const skipped = skippedTooLarge + skippedUnavailable + skippedFailed;
       const skipReasons = [
         skippedTooLarge && { code: 'IMAP_MESSAGE_TOO_LARGE', count: skippedTooLarge, maxBytes: maxMessageBytes },
         skippedUnavailable && { code: 'IMAP_MESSAGE_SOURCE_UNAVAILABLE', count: skippedUnavailable },
+        skippedFailed && { code: 'IMAP_MESSAGE_IMPORT_FAILED', count: skippedFailed },
       ].filter(Boolean);
       if (skipped) {
         logger.info(
-          { accountId: account.id, mailbox, skipped, skippedTooLarge, skippedUnavailable, maxMessageBytes },
+          { accountId: account.id, mailbox, skipped, skippedTooLarge, skippedUnavailable, skippedFailed, maxMessageBytes },
           'IMAP messages skipped without importing source content',
         );
       }
