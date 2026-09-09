@@ -63,6 +63,13 @@ require_secret() {
 require_secret ENCRYPTION_KEY
 require_secret ACCESS_TOKEN
 
+# /api/health reports this so tooling (deploy/autoupdate.sh, a human with curl)
+# can see which revision is serving. Deploy tooling may set it explicitly.
+if [ -z "${AMAIL_RELEASE_SHA:-}" ]; then
+  AMAIL_RELEASE_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+fi
+export AMAIL_RELEASE_SHA
+
 # `config --quiet` renders the exact project first. It does not create,
 # remove, or restart containers, volumes, networks, or images.
 docker compose --env-file .env config --quiet
