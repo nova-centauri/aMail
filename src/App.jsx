@@ -65,6 +65,7 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [addAccountOpen, setAddAccountOpen] = useState(false);
   const [passkeyCount, setPasskeyCount] = useState(0);
+  const [keyMode, setKeyMode] = useState('env');
   const [passkeys, setPasskeys] = useState([]);
   const [sessionStamp, setSessionStamp] = useState(0);
   const [demoIdentities, setDemoIdentities] = useState(() => demoAccounts.map((item) => ({ ...item })));
@@ -189,6 +190,7 @@ export default function App() {
       } catch (sessionError) {
         if (sessionError.status === 401 || sessionError.status === 403) throw sessionError;
       }
+      if (session?.keyMode) setKeyMode(session.keyMode);
       if (session?.protected && !session.authenticated) {
         setOffline(false);
         setAuthRequired(true);
@@ -831,8 +833,12 @@ export default function App() {
   };
 
   const unlockServer = async (token) => {
-    persistAccessToken(token);
-    setAccessToken(token);
+    // In keyslot mode a passphrase or recovery code also unlocks, but only a
+    // real bearer token is worth keeping for the Authorization header; the
+    // session cookie carries the rest.
+    const keepAsBearer = keyMode !== 'keyslot' || /^amk1_/.test(token);
+    persistAccessToken(keepAsBearer ? token : '');
+    setAccessToken(keepAsBearer ? token : '');
     if (!token) {
       setAuthRequired(false);
       setAccessOpen(false);
@@ -1069,6 +1075,7 @@ export default function App() {
         onPasskeyLogin={loginWithPasskey}
         authenticated={authenticated}
         onRegisterPasskey={authenticated ? addPasskey : undefined}
+        keyMode={keyMode}
       />
       <ShortcutCheatsheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
       <Toast notice={notice} onClose={() => setNotice('')} />

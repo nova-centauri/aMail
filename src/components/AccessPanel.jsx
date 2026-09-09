@@ -12,7 +12,11 @@ export function AccessPanel({
   onPasskeyLogin,
   authenticated = false,
   onRegisterPasskey,
+  keyMode = 'env',
 }) {
+  // Keyslot mode (hosted): any keyslot credential unlocks, not one fixed token.
+  const keyslot = keyMode === 'keyslot';
+  const credentialLabel = keyslot ? 'Access token, passphrase, or recovery code' : 'Access token';
   const [token, setToken] = useState(currentToken || '');
   const [saving, setSaving] = useState(false);
   const [passkeyBusy, setPasskeyBusy] = useState(false);
@@ -73,13 +77,17 @@ export function AccessPanel({
       {!required && <button type="button" className="modal-scrim" onClick={onClose} aria-label="Close unlock dialog" />}
       <form className="access-modal" onSubmit={submit}>
         <div className="access-mark">{passkeyPrimary ? <Icon name="key" size={26} /> : <BrandMark size={48} />}</div>
-        <h2>{required ? 'Unlock aMail' : 'Server access token'}</h2>
+        <h2>{required ? 'Unlock aMail' : (keyslot ? 'Unlock credential' : 'Server access token')}</h2>
         <p>
           {required
             ? (passkeyPrimary
-              ? 'Use your passkey to open the inbox. The access token is still available as a fallback.'
-              : 'This aMail server is protected. Enter its access token to open your mail.')
-            : 'If this server has AMAIL_ACCESS_TOKEN set, paste the matching token here.'}
+              ? `Use your passkey to open the inbox. ${keyslot ? 'A token, passphrase, or recovery code' : 'The access token'} is still available as a fallback.`
+              : (keyslot
+                ? 'This inbox is locked and its data is encrypted. Enter an access token, your passphrase, or a recovery code to unlock it.'
+                : 'This aMail server is protected. Enter its access token to open your mail.'))
+            : (keyslot
+              ? 'Enter any credential that unlocks this inbox: an access token, your passphrase, or a recovery code.'
+              : 'If this server has AMAIL_ACCESS_TOKEN set, paste the matching token here.')}
         </p>
         {passkeyPrimary && (
           <button type="button" className="primary-button passkey-button" onClick={usePasskey} disabled={passkeyBusy}>
@@ -101,19 +109,21 @@ export function AccessPanel({
         )}
         {passkeyPrimary && !showToken && (
           <button type="button" className="text-button token-fallback" onClick={() => setShowToken(true)}>
-            Use access token instead
+            {keyslot ? 'Use another credential instead' : 'Use access token instead'}
           </button>
         )}
         {(!passkeyPrimary || showToken) && (
           <>
             <label className="form-field">
-              <span>Access token</span>
-              <input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder="aMail access token" autoFocus={!passkeyPrimary} autoComplete="off" />
+              <span>{credentialLabel}</span>
+              <input type="password" value={token} onChange={(event) => setToken(event.target.value)} placeholder={keyslot ? 'Token, passphrase, or recovery code' : 'aMail access token'} autoFocus={!passkeyPrimary} autoComplete="off" />
             </label>
             <small className="access-note">
               {passkeyPrimary
                 ? 'The token is a fallback. After unlock, a session cookie keeps this browser signed in.'
-                : 'Stored only in this browser session and sent as a Bearer token to this aMail server.'}
+                : (keyslot
+                  ? 'Unlocking decrypts your inbox for this session only. Passphrases and recovery codes are never stored in the browser.'
+                  : 'Stored only in this browser session and sent as a Bearer token to this aMail server.')}
             </small>
           </>
         )}
