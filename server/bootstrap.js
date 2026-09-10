@@ -24,7 +24,7 @@ export function createHarness({ config, logger }) {
 
   function startPolling(mailService) {
     if (pollTimer || config.syncIntervalMinutes <= 0) return;
-    const poll = () => mailService.syncAll().catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
+    const poll = () => mailService.syncAll({ maxAgeMs: config.syncMinIntervalMs || 0 }).catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
     pollTimer = setInterval(poll, config.syncIntervalMinutes * 60_000);
     pollTimer.unref();
     logger.info({ intervalMinutes: config.syncIntervalMinutes }, 'Background IMAP polling enabled');
@@ -46,7 +46,8 @@ export function createHarness({ config, logger }) {
       repos,
       remoteContent,
       mailService,
-      close() {
+      async close() {
+        await mailService.close?.().catch(() => {});
         remoteContent.close().catch(() => {});
         repos.close();
       },
@@ -69,7 +70,7 @@ export function createHarness({ config, logger }) {
       async stop() {
         stopPolling();
         await metering.close().catch(() => {});
-        runtime.close();
+        await runtime.close();
       },
     };
   }

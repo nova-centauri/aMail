@@ -87,7 +87,8 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_RP_ID`, `AMAIL_ORIGIN` | Public hostname/origin for passkeys behind a reverse proxy |
 | `AMAIL_OPS_SOURCES` | Comma-separated keywords for your infrastructure digests (default `proxmox,watchtower`; empty disables) |
 | `AMAIL_TRUST_PROXY`, `AMAIL_COOKIE_SECURE` | Reverse-proxy and cookie hardening |
-| `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, background polling |
+| `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, 60s minimum interval, IMAP pool idle, background polling |
+| `AMAIL_RETAIN_DAYS` | Drop stored bodies of mail older than N days (0 keeps them forever) |
 | `REMOTE_CONTENT_PROXY_URL` | Set by `deploy/launch.sh` to route remote images via Tor/Privoxy |
 | `AMAIL_METERING_URL`, `AMAIL_METERING_TOKEN`, `AMAIL_TENANT_ID` | Hosted only: POST analyzed-mark counts to a metering endpoint. Inert when unset |
 | `AMAIL_KEY_MODE` | `env` (default) or `keyslot`; see [Keyslot mode](#keyslot-mode-hosted-tenants) |

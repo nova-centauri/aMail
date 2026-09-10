@@ -95,6 +95,12 @@ test('message API filters unified mail by smart category and account creation is
   // Health answers unauthenticated, so it must not describe the mailbox.
   assert.equal(Object.hasOwn(health, 'accounts'), false);
 
+  const emptyChanges = await fetch(`${origin}/api/changes`);
+  assert.equal(emptyChanges.status, 200);
+  const emptyStamp = await emptyChanges.json();
+  assert.equal(emptyStamp.changedAt, null);
+  assert.equal(emptyStamp.changed, true);
+
   const account = repos.accounts.create({
     email: 'owner@example.test',
     display_name: 'Owner',
@@ -161,6 +167,12 @@ test('message API filters unified mail by smart category and account creation is
     fromEmail: 'notifications@github.com',
     timestamp: '2026-01-07T00:00:00.000Z',
   }));
+
+  const stamped = await (await fetch(`${origin}/api/changes`)).json();
+  assert.ok(stamped.changedAt);
+  assert.equal(stamped.changed, true);
+  const unchanged = await (await fetch(`${origin}/api/changes?since=${encodeURIComponent(stamped.changedAt)}`)).json();
+  assert.equal(unchanged.changed, false);
 
   const filteredResponse = await fetch(`${origin}/api/messages?folder=inbox&category=github_ci`);
   assert.equal(filteredResponse.status, 200);

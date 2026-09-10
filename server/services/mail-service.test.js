@@ -6,6 +6,7 @@ import {
   classifyMailConnectionError,
   compileRfc822Message,
   createMailService,
+  sqliteConstraintReason,
 } from './mail-service.js';
 import { encryptJson } from './crypto.js';
 
@@ -32,6 +33,7 @@ test('non-implicit TLS ports require STARTTLS before authentication', () => {
   assert.equal(imap.secure, false);
   assert.equal(imap.doSTARTTLS, true);
   assert.equal(imap.tls.rejectUnauthorized, true);
+  assert.equal(imap.disableAutoIdle, true);
   assert.equal(smtp.secure, false);
   assert.equal(smtp.requireTLS, true);
   assert.equal(smtp.tls.rejectUnauthorized, true);
@@ -143,6 +145,7 @@ test('TLS failures point to certificate hostnames without returning raw errors',
 
 function syncHarness({
   maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false, connectDelayMs = 0,
+  imapPoolIdleMs, syncMinIntervalMs,
 }) {
   const account = {
     id: 'sync-account',
@@ -163,10 +166,13 @@ function syncHarness({
     connects: 0,
     openSessions: 0,
     maxOpenSessions: 0,
+    listCalls: 0,
     fetchCalls: [],
     fetchOneCalls: [],
     savedMessages: [],
     savedSync: null,
+    skips: [],
+    checkpoints: 0,
     logs: [],
   };
   const latestUid = Math.max(0, ...messages.map((message) => message.uid));
@@ -177,7 +183,11 @@ function syncHarness({
       state.maxOpenSessions = Math.max(state.maxOpenSessions, state.openSessions);
       if (connectDelayMs) await new Promise((resolve) => setTimeout(resolve, connectDelayMs));
     }
-    async list() { return [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }]; }
+    async list() {
+      state.listCalls += 1;
+      return [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }];
+    }
+    async mailboxOpen() {}
     async getMailboxLock() {
       this.mailbox = { uidValidity, uidNext: latestUid + 1 };
       return { release() {} };
@@ -202,6 +212,8 @@ function syncHarness({
     sync: {
       get: () => previousSync,
       save(value) { state.savedSync = value; },
+      recordSkip(value) { state.skips.push(value); },
+      clearSkips() { state.skips.length = 0; },
     },
     threads: {
       get: () => null,
@@ -211,18 +223,25 @@ function syncHarness({
     messages: {
       findByRfcId: () => null,
       upsert(value) {
-        if (rejectUpsert(value)) throw new Error('constraint failed');
+        if (rejectUpsert(value)) throw new Error('UNIQUE constraint failed: messages.account_id, mailbox, uid');
         state.savedMessages.push(value);
         return { id: `message-${state.savedMessages.length}` };
       },
     },
+    checkpointWal() { state.checkpoints += 1; },
   };
   const logger = {
     info(fields, message) { state.logs.push({ level: 'info', fields, message }); },
     warn(fields, message) { state.logs.push({ level: 'warn', fields, message }); },
   };
   const service = createMailService({
-    config: { ...config, syncBatchSize: 20, syncMaxMessageBytes: maxMessageBytes },
+    config: {
+      ...config,
+      syncBatchSize: 20,
+      syncMaxMessageBytes: maxMessageBytes,
+      imapPoolIdleMs: imapPoolIdleMs ?? 60_000,
+      syncMinIntervalMs: syncMinIntervalMs ?? 0,
+    },
     repos,
     logger,
     ImapClient: FakeImapClient,
@@ -280,6 +299,7 @@ test('IMAP sync skips oversized sources without unrestricted body downloads', as
   }
   assert.equal(state.savedSync.last_uid, 3);
   assert.doesNotMatch(JSON.stringify(state.logs), /TOP SECRET OVERSIZED CONTENT/);
+  await service.close();
 });
 
 test('a message the database rejects is skipped and reported instead of pinning the mailbox', async () => {
@@ -315,7 +335,13 @@ test('a message the database rejects is skipped and reported instead of pinning 
   const warnings = state.logs.filter((entry) => entry.level === 'warn');
   assert.equal(warnings.length, 1);
   assert.equal(warnings[0].fields.mailbox, 'INBOX');
+  assert.equal(warnings[0].fields.uid, 2);
+  assert.equal(warnings[0].fields.err, 'UNIQUE messages.account_id, mailbox, uid');
+  assert.equal(state.skips.length, 1);
+  assert.equal(state.skips[0].uid, 2);
+  assert.equal(state.skips[0].reason, 'UNIQUE messages.account_id, mailbox, uid');
   assert.doesNotMatch(JSON.stringify(state.logs), /PRIVATE POISON BODY/);
+  await service.close();
 });
 
 test('concurrent and recent full syncs share one IMAP pass', async () => {
@@ -338,19 +364,45 @@ test('concurrent and recent full syncs share one IMAP pass', async () => {
   assert.equal(recent, a);
   assert.equal(state.connects, 1);
 
-  // A manual refresh (no maxAge) always runs, as does a different request.
-  await service.syncAll({ mailbox: 'INBOX' });
-  assert.equal(state.connects, 2);
-  await service.syncAll({ mailbox: 'Archive', maxAgeMs: 20_000 });
-  assert.equal(state.connects, 3);
+  // A manual refresh reuses the pooled IMAP session instead of reconnecting.
+  await service.syncAll({ mailbox: 'INBOX', force: true });
+  assert.equal(state.connects, 1);
+  assert.equal(state.listCalls, 1);
+  await service.syncAll({ mailbox: 'Archive', force: true });
+  assert.equal(state.connects, 1);
+  assert.equal(state.listCalls, 1);
 
   // A request with a different target waits for the running one instead of
-  // opening a second session to the same server, then runs.
-  const first = service.syncAll({ mailbox: 'INBOX' });
-  const second = service.syncAll({ mailbox: 'Archive' });
+  // opening a second session to the same server, then runs on the same pool.
+  const first = service.syncAll({ mailbox: 'INBOX', force: true });
+  const second = service.syncAll({ mailbox: 'Archive', force: true });
   await Promise.all([first, second]);
-  assert.equal(state.connects, 5);
+  assert.equal(state.connects, 1);
   assert.equal(state.maxOpenSessions, 1);
+  assert.ok(state.checkpoints >= 1);
+  await service.close();
+  assert.equal(state.openSessions, 0);
+});
+
+test('the server enforces a minimum sync interval unless force is set', async () => {
+  const { service, state } = syncHarness({ messages: [], sources: new Map(), syncMinIntervalMs: 60_000 });
+  await service.syncAll({ mailbox: 'INBOX' });
+  const checkpoints = state.checkpoints;
+  await service.syncAll({ mailbox: 'INBOX' });
+  assert.equal(state.checkpoints, checkpoints);
+  await service.syncAll({ mailbox: 'INBOX', force: true });
+  assert.ok(state.checkpoints > checkpoints);
+  await service.close();
+});
+
+test('sqlite constraint messages are named without retrying the fetch', () => {
+  assert.equal(
+    sqliteConstraintReason(new Error('UNIQUE constraint failed: messages.account_id, mailbox, uid')),
+    'UNIQUE messages.account_id, mailbox, uid',
+  );
+  assert.equal(sqliteConstraintReason(new Error('FOREIGN KEY constraint failed')), 'FOREIGN KEY');
+  assert.equal(sqliteConstraintReason(new Error('CHECK constraint failed: smart_category')), 'CHECK smart_category');
+  assert.equal(sqliteConstraintReason(new Error('no such table: messages')), null);
 });
 
 test('UIDVALIDITY changes reset the incremental window and are reported', async () => {
@@ -377,6 +429,7 @@ test('UIDVALIDITY changes reset the incremental window and are reported', async 
   assert.equal(state.savedSync.uid_validity, 41);
   assert.equal(state.savedSync.last_uid, 5);
   assert.ok(state.logs.some((entry) => entry.message === 'IMAP UIDVALIDITY changed; resynchronizing mailbox window'));
+  await service.close();
 });
 
 test('RFC822 compilation preserves the chosen Message-ID and keeps Bcc envelope-only', async () => {

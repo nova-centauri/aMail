@@ -29,6 +29,9 @@ import {
 } from './compose-attachments.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
+const SYNC_WRITE_CHUNK = 50;
+const IMAP_LIST_TTL_MS = 10 * 60 * 1000;
+const DEFAULT_IMAP_POOL_IDLE_MS = 8 * 60_000;
 
 const asIso = (value) => {
   const date = value ? new Date(value) : null;
@@ -36,6 +39,24 @@ const asIso = (value) => {
 };
 
 const cleanupError = (error) => scrubLogText(String(error?.message || error || 'Unknown mail error')).slice(0, 500);
+
+/** Name the SQLite constraint so a skip log is enough to diagnose without a retry. */
+export function sqliteConstraintReason(error) {
+  const message = String(error?.message || '');
+  if (/UNIQUE constraint failed: messages\.account_id, mailbox, uid/i.test(message)) {
+    return 'UNIQUE messages.account_id, mailbox, uid';
+  }
+  if (/FOREIGN KEY constraint failed/i.test(message)) return 'FOREIGN KEY';
+  if (/CHECK constraint failed: smart_category|CHECK constraint failed: messages/i.test(message)) {
+    return 'CHECK smart_category';
+  }
+  if (/constraint failed/i.test(message)) return cleanupError(error);
+  return null;
+}
+
+function skipReason(error) {
+  return sqliteConstraintReason(error) || cleanupError(error);
+}
 
 function setValues(value) {
   return value instanceof Set ? [...value] : Array.isArray(value) ? value : [];
@@ -77,8 +98,9 @@ function pickParsedAttachment(parsedAttachments, index, meta) {
   return null;
 }
 
-export function buildImapOptions(account, credentials, config) {
+export function buildImapOptions(account, credentials, config, { pooled = false } = {}) {
   const secure = Boolean(account.imap_secure);
+  const poolIdleMs = Number.isSafeInteger(config.imapPoolIdleMs) ? config.imapPoolIdleMs : DEFAULT_IMAP_POOL_IDLE_MS;
   return {
     host: account.imap_host,
     port: account.imap_port,
@@ -88,8 +110,11 @@ export function buildImapOptions(account, credentials, config) {
     doSTARTTLS: secure ? undefined : true,
     auth: buildAuth(credentials, account.email, 'imap'),
     logger: false,
-    socketTimeout: config.syncTimeoutMs,
+    socketTimeout: pooled ? Math.max(config.syncTimeoutMs, poolIdleMs + 60_000) : config.syncTimeoutMs,
     tls: { rejectUnauthorized: !config.allowInsecureTls },
+    // One-shot connections log out immediately; pooled ones keep INBOX selected
+    // so ImapFlow's auto-IDLE can push new mail without a reconnect.
+    disableAutoIdle: !pooled,
   };
 }
 
@@ -349,9 +374,98 @@ export function createMailService({
   compileMessage = compileRfc822Message,
   createMessageId = () => `<${randomUUID()}@amail.local>`,
 }) {
-  const newImapClient = (account, credentials) => new ImapClient(buildImapOptions(account, credentials, config));
+  const newImapClient = (account, credentials, { pooled = false } = {}) => (
+    new ImapClient(buildImapOptions(account, credentials, config, { pooled }))
+  );
   const newSmtpTransport = (account, credentials) => createSmtpTransport(buildSmtpOptions(account, credentials, config));
   const attachmentCache = new Map();
+  const imapPool = new Map();
+  const poolIdleMs = Number.isSafeInteger(config.imapPoolIdleMs) ? config.imapPoolIdleMs : DEFAULT_IMAP_POOL_IDLE_MS;
+
+  function clearPoolTimer(entry) {
+    if (entry?.closeTimer) {
+      clearTimeout(entry.closeTimer);
+      entry.closeTimer = null;
+    }
+  }
+
+  async function evictPoolEntry(accountId) {
+    const entry = imapPool.get(accountId);
+    if (!entry) return;
+    imapPool.delete(accountId);
+    clearPoolTimer(entry);
+    entry.usable = false;
+    try {
+      entry.client.off?.('exists', entry.onExists);
+    } catch {
+      // EventEmitter.off is best-effort on fakes.
+    }
+    await entry.client.logout().catch(() => {});
+  }
+
+  async function acquirePooledClient(account, credentials) {
+    const existing = imapPool.get(account.id);
+    if (existing?.usable) {
+      existing.refs += 1;
+      existing.lastUsed = Date.now();
+      clearPoolTimer(existing);
+      return existing;
+    }
+    if (existing) await evictPoolEntry(account.id);
+    const client = newImapClient(account, credentials, { pooled: true });
+    await client.connect();
+    const entry = {
+      client,
+      account,
+      credentials,
+      refs: 1,
+      usable: true,
+      folders: null,
+      foldersAt: 0,
+      lastUsed: Date.now(),
+      closeTimer: null,
+      onExists: null,
+    };
+    entry.onExists = () => {
+      if (!entry.usable || entry.refs > 0) return;
+      void syncAccount(account.id, { maxAgeMs: config.syncMinIntervalMs || 0 }).catch((error) => {
+        logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP IDLE wake could not synchronize');
+      });
+    };
+    client.on?.('exists', entry.onExists);
+    imapPool.set(account.id, entry);
+    return entry;
+  }
+
+  function releasePooledClient(accountId) {
+    const entry = imapPool.get(accountId);
+    if (!entry) return;
+    entry.refs = Math.max(0, entry.refs - 1);
+    if (entry.refs > 0) return;
+    entry.lastUsed = Date.now();
+    if (poolIdleMs <= 0) {
+      void evictPoolEntry(accountId);
+      return;
+    }
+    const inbox = entry.folders?.find((folder) => String(folder.specialUse || '') === '\\Inbox')?.path
+      || entry.folders?.find((folder) => String(folder.path || '').toLowerCase() === 'inbox')?.path
+      || 'INBOX';
+    if (typeof entry.client.mailboxOpen === 'function') {
+      entry.client.mailboxOpen(inbox).catch(() => {});
+    }
+    clearPoolTimer(entry);
+    entry.closeTimer = setTimeout(() => {
+      void evictPoolEntry(accountId);
+    }, poolIdleMs);
+    entry.closeTimer.unref?.();
+  }
+
+  async function pooledList(entry) {
+    if (entry.folders && Date.now() - entry.foldersAt < IMAP_LIST_TTL_MS) return entry.folders;
+    entry.folders = await entry.client.list();
+    entry.foldersAt = Date.now();
+    return entry.folders;
+  }
 
   function cachedAttachment(key) {
     const entry = attachmentCache.get(key);
@@ -425,12 +539,12 @@ export function createMailService({
     // of turning those copies into duplicate archived conversations.
     if (allMailMirror && messageId) {
       const existing = repos.messages.findByRfcId(account.id, messageId);
-      if (existing && existing.mailbox !== mailbox) return existing;
+      if (existing && existing.mailbox !== mailbox) return null;
     }
     const thread = resolveThread({ accountId: account.id, subject, inReplyTo, references });
     const receivedAt = asIso(message.internalDate || parsed.date || envelope.date);
 
-    return repos.messages.upsert({
+    return {
       account_id: account.id,
       thread_id: thread.id,
       mailbox,
@@ -459,7 +573,7 @@ export function createMailService({
       is_spam: mailboxRole === 'spam' ? 1 : 0,
       snoozed_until: null,
       is_sent: isSent ? 1 : 0,
-    });
+    };
   }
 
   async function syncMailbox({ account, client, descriptor, limit }) {
@@ -476,6 +590,41 @@ export function createMailService({
     let lastUid = previousSync?.last_uid || 0;
     let uidValidity = null;
     let uidValidityChanged = false;
+    const pendingWrites = [];
+
+    const persistPayloads = (payloads) => {
+      if (!payloads.length) return;
+      const write = () => {
+        for (const payload of payloads) {
+          try {
+            const saved = repos.messages.upsert(payload);
+            if (saved) imported += 1;
+          } catch (error) {
+            skippedFailed += 1;
+            const uid = Number(payload.uid || 0);
+            const reason = skipReason(error);
+            repos.sync.recordSkip?.({
+              account_id: account.id,
+              mailbox,
+              uid,
+              reason,
+            });
+            logger.warn(
+              { accountId: account.id, mailbox, uid, err: reason },
+              'IMAP message could not be imported; skipping it',
+            );
+          }
+        }
+      };
+      if (typeof repos.runWriteBatch === 'function') repos.runWriteBatch(write);
+      else write();
+    };
+
+    const flushWrites = () => {
+      if (!pendingWrites.length) return;
+      persistPayloads(pendingWrites.splice(0, pendingWrites.length));
+    };
+
     try {
       lock = await client.getMailboxLock(mailbox);
       uidValidity = Number(client.mailbox?.uidValidity) || null;
@@ -484,15 +633,17 @@ export function createMailService({
         uidValidityChanged = true;
         logger.info({ accountId: account.id, mailbox }, 'IMAP UIDVALIDITY changed; resynchronizing mailbox window');
         lastUid = 0;
+        repos.sync.clearSkips?.(account.id, mailbox);
       }
       const uidNext = Number(client.mailbox?.uidNext || 0);
       const latestUid = Math.max(0, uidNext - 1);
       if (latestUid > lastUid) {
         const firstUid = Math.max(lastUid + 1, latestUid - limit + 1, 1);
-        const pending = [];
         // Do not ask IMAP for RFC822 source in this pass. A message's reported
         // size lets us reject oversized mail without transferring any body or
         // attachment data, and this metadata window is capped by `limit`.
+        // Process each envelope as it arrives so peak memory stays one
+        // metadata record plus one bounded source, not the whole window.
         for await (const message of client.fetch(`${firstUid}:${latestUid}`, {
           uid: true,
           envelope: true,
@@ -501,13 +652,6 @@ export function createMailService({
           internalDate: true,
           size: true,
         }, { uid: true })) {
-          pending.push(message);
-        }
-
-        // Fetch and parse one source at a time. `maxLength + 1` is a sentinel:
-        // it detects an oversized source even when a server omits or misreports
-        // RFC822.SIZE, while still keeping the response buffer strictly bounded.
-        for (const message of pending) {
           const uid = Number(message.uid || 0);
           const reportedSize = Number(message.size);
           const hasReportedSize = Number.isSafeInteger(reportedSize) && reportedSize >= 0;
@@ -539,26 +683,37 @@ export function createMailService({
           }
 
           try {
-            const saved = await ingestImapMessage({
+            const payload = await ingestImapMessage({
               account,
               mailbox,
               role,
               allMailMirror,
               message: { ...message, source },
             });
-            if (saved) imported += 1;
+            if (payload) {
+              pendingWrites.push(payload);
+              if (pendingWrites.length >= SYNC_WRITE_CHUNK) flushWrites();
+            }
           } catch (error) {
             // A message the parser or the database rejects must not pin the
             // window: retrying it on every cycle costs the full fetch and parse
-            // each time and blocks everything newer in the mailbox. It stays on
-            // the IMAP server, and the report names the count.
+            // each time and blocks everything newer in the mailbox.
             skippedFailed += 1;
-            if (skippedFailed === 1) {
-              logger.warn({ accountId: account.id, mailbox, err: cleanupError(error) }, 'IMAP message could not be imported; skipping it');
-            }
+            const reason = skipReason(error);
+            repos.sync.recordSkip?.({
+              account_id: account.id,
+              mailbox,
+              uid,
+              reason,
+            });
+            logger.warn(
+              { accountId: account.id, mailbox, uid, err: reason },
+              'IMAP message could not be imported; skipping it',
+            );
           }
           lastUid = Math.max(lastUid, uid);
         }
+        flushWrites();
       }
       const skipped = skippedTooLarge + skippedUnavailable + skippedFailed;
       const skipReasons = [
@@ -592,6 +747,7 @@ export function createMailService({
         uidValidityChanged,
       };
     } catch (error) {
+      flushWrites();
       repos.sync.save({
         account_id: account.id,
         mailbox,
@@ -607,7 +763,7 @@ export function createMailService({
     }
   }
 
-  async function syncAccount(accountId, { mailbox, limit = config.syncBatchSize } = {}) {
+  async function runSyncAccount(accountId, { mailbox, limit = config.syncBatchSize } = {}) {
     const { account, credentials } = accountAndCredentials(accountId);
     const explicitMailbox = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : null;
     // Existing UI clients ask to sync "INBOX". Treat that as the normal account
@@ -623,19 +779,21 @@ export function createMailService({
         mailboxes: [],
       };
     }
-    const client = newImapClient(account, credentials);
+
+    let entry;
     try {
-      await client.connect();
+      entry = await acquirePooledClient(account, credentials);
     } catch (error) {
       logger.warn({ accountId, err: cleanupError(error) }, 'IMAP connection for synchronization failed');
-      await client.logout().catch(() => {});
       throw new ServiceUnavailableError('Could not synchronize this account. Check its IMAP settings and app password.', 'IMAP_SYNC_FAILED');
     }
+    const client = entry.client;
 
     try {
+      const folders = singleMailbox ? null : await pooledList(entry);
       const descriptors = singleMailbox
         ? [{ mailbox: explicitMailbox, role: folderForMailbox(explicitMailbox), allMailMirror: false }]
-        : discoverSyncMailboxes(await client.list());
+        : discoverSyncMailboxes(folders);
       const mailboxes = [];
       for (const descriptor of descriptors) {
         try {
@@ -668,23 +826,73 @@ export function createMailService({
         };
       }
       return { accountId, imported, skipped, status, mailboxes };
+    } catch (error) {
+      await evictPoolEntry(account.id);
+      throw error;
     } finally {
-      await client.logout().catch(() => {});
+      releasePooledClient(account.id);
     }
   }
 
-  async function runSyncAll({ mailbox = null, limit } = {}) {
+  const accountInFlight = new Map();
+  const accountLastSync = new Map();
+  const accountSyncKey = (accountId, { mailbox, limit }) => `${accountId}\u0000${syncKey({ mailbox, limit })}`;
+
+  async function syncAccount(accountId, { mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false } = {}) {
+    const key = accountSyncKey(accountId, { mailbox, limit });
+    const pending = accountInFlight.get(key);
+    if (pending) return pending;
+    const floor = force ? 0 : (Number(config.syncMinIntervalMs) || 0);
+    const age = Math.max(Number(maxAgeMs) || 0, floor);
+    const last = accountLastSync.get(key);
+    if (age > 0 && last && Date.now() - last.finishedAt < age) return last.result;
+    const promise = runSyncAccount(accountId, { mailbox, limit });
+    accountInFlight.set(key, promise);
+    try {
+      const result = await promise;
+      accountLastSync.set(key, { finishedAt: Date.now(), result });
+      return result;
+    } finally {
+      accountInFlight.delete(key);
+    }
+  }
+
+  async function runSyncAll({ mailbox = null, limit, force = false } = {}) {
     const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
     const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
     const results = [];
     for (const account of accounts) {
       try {
-        results.push(await syncAccount(account.id, { mailbox, limit }));
+        results.push(await syncAccount(account.id, { mailbox, limit, force }));
       } catch (error) {
         results.push({ accountId: account.id, ...(singleMailbox ? { mailbox } : {}), status: 'failed', mailboxes: [], error: error.code || 'IMAP_SYNC_FAILED' });
       }
     }
     return results;
+  }
+
+  function afterSyncMaintenance() {
+    try {
+      const days = Number(config.retainDays) || 0;
+      if (days > 0 && typeof repos.retention?.pruneBodies === 'function') {
+        const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+        const pruned = repos.retention.pruneBodies(cutoff);
+        if (pruned > 0) {
+          logger.info({ pruned, retainDays: days }, 'Pruned bodies of mail older than the retention window');
+          const later = setTimeout(() => {
+            try { repos.vacuumIfDue?.(); } catch { /* VACUUM is best-effort while idle */ }
+          }, 15_000);
+          later.unref?.();
+        }
+      }
+    } catch (error) {
+      logger.warn({ err: cleanupError(error) }, 'Mail body retention prune failed');
+    }
+    try {
+      repos.checkpointWal?.();
+    } catch (error) {
+      logger.warn({ err: cleanupError(error) }, 'WAL checkpoint failed');
+    }
   }
 
   // A full sync walks every mailbox of every account over IMAP and is the most
@@ -699,16 +907,18 @@ export function createMailService({
     return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
   };
 
-  async function syncAll({ mailbox = null, limit, maxAgeMs = 0 } = {}) {
+  async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false } = {}) {
     const key = syncKey({ mailbox, limit });
     while (inFlightSync) {
       if (inFlightSync.key === key) return inFlightSync.promise;
       await inFlightSync.promise.catch(() => {});
     }
-    if (maxAgeMs > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < maxAgeMs) {
+    const floor = force ? 0 : (Number(config.syncMinIntervalMs) || 0);
+    const age = Math.max(Number(maxAgeMs) || 0, floor);
+    if (age > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < age) {
       return lastFullSync.results;
     }
-    const promise = runSyncAll({ mailbox, limit });
+    const promise = runSyncAll({ mailbox, limit, force }).finally(() => afterSyncMaintenance());
     inFlightSync = { key, promise };
     try {
       const results = await promise;
@@ -717,6 +927,11 @@ export function createMailService({
     } finally {
       inFlightSync = null;
     }
+  }
+
+  async function close() {
+    const ids = [...imapPool.keys()];
+    await Promise.all(ids.map((id) => evictPoolEntry(id)));
   }
 
   async function fetchAttachment(messageId, index) {
@@ -1126,5 +1341,5 @@ export function createMailService({
     }
   }
 
-  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment };
+  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, close };
 }

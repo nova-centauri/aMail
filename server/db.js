@@ -273,6 +273,15 @@ function initSchema(db) {
       synced_at TEXT,
       PRIMARY KEY (account_id, mailbox)
     );
+
+    CREATE TABLE IF NOT EXISTS sync_skips (
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      mailbox TEXT NOT NULL,
+      uid INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      seen_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, mailbox, uid)
+    );
   `);
   const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
   if (!messageColumns.has('is_spam')) db.exec('ALTER TABLE messages ADD COLUMN is_spam INTEGER NOT NULL DEFAULT 0');
@@ -442,6 +451,14 @@ function initSchema(db) {
 
 const FTS_BACKFILL_BATCH = 100;
 const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
+const WAL_AUTOCHECKPOINT_PAGES = 1000;
+const SQLITE_CACHE_KIB = -16000;
+const SQLITE_MMAP_BYTES = 268435456;
+const LAST_VACUUM_SETTING = 'lastVacuumAt';
+
+function isUniqueMailboxUidConstraint(error) {
+  return /UNIQUE constraint failed: messages\.account_id, mailbox, uid/i.test(String(error?.message || ''));
+}
 
 function prepareSqliteTempDir(dataDir) {
   const sqliteTmpDir = path.join(dataDir, 'tmp');
@@ -601,10 +618,17 @@ export function createDatabase(config, { key = config.databaseKey || null } = {}
   }
   const db = openDatabase(config.dbPath, { key });
   db.pragma('journal_mode = WAL');
+  // NORMAL is safe with WAL: a crash loses at most the last transaction, and
+  // IMAP is the source of truth. FULL was fsyncing every autocommit.
+  db.pragma('synchronous = NORMAL');
+  db.pragma(`cache_size = ${SQLITE_CACHE_KIB}`);
+  db.pragma(`wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
   // SQLite reuses a WAL file but never shrinks it, so one large import leaves
   // hundreds of megabytes on the volume for good. Truncate it back to this
   // size after checkpoints, and reclaim any oversized WAL from earlier runs.
   db.pragma(`journal_size_limit = ${WAL_SIZE_LIMIT_BYTES}`);
+  // mmap is incompatible with SQLCipher-style encryption; skip it when keyed.
+  if (!key) db.pragma(`mmap_size = ${SQLITE_MMAP_BYTES}`);
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.pragma(`temp_store_directory = '${sqliteTmpDir.replace(/'/g, "''")}'`);
@@ -656,6 +680,7 @@ export function createRepositories(db) {
       is_starred = @is_starred, labels_json = @labels_json, updated_at = @updated_at
       WHERE id = @id`),
     messageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
+    messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
     messageList: db.prepare(`SELECT m.* FROM messages m
@@ -809,6 +834,17 @@ export function createRepositories(db) {
       ON CONFLICT(account_id, mailbox) DO UPDATE SET
         last_uid = excluded.last_uid, uid_validity = excluded.uid_validity,
         last_error = excluded.last_error, synced_at = excluded.synced_at`),
+    syncSkipUpsert: db.prepare(`INSERT INTO sync_skips (account_id, mailbox, uid, reason, seen_at)
+      VALUES (@account_id, @mailbox, @uid, @reason, @seen_at)
+      ON CONFLICT(account_id, mailbox, uid) DO UPDATE SET
+        reason = excluded.reason, seen_at = excluded.seen_at`),
+    syncSkipClear: db.prepare('DELETE FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
+    maxMessageUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM messages'),
+    maxSyncSynced: db.prepare('SELECT MAX(synced_at) AS t FROM sync_state'),
+    maxAccountUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM accounts'),
+    pruneBodies: db.prepare(`UPDATE messages SET html_body = '', text_body = '', updated_at = @updated_at
+      WHERE COALESCE(received_at, sent_at, created_at) < @cutoff
+        AND (html_body != '' OR text_body != '')`),
     draftById: db.prepare('SELECT * FROM drafts WHERE id = ?'),
     draftList: db.prepare('SELECT * FROM drafts WHERE account_id = ? ORDER BY updated_at DESC'),
     draftListAll: db.prepare('SELECT * FROM drafts ORDER BY updated_at DESC'),
@@ -898,7 +934,71 @@ export function createRepositories(db) {
     return queries.threadById.get(threadId);
   });
 
+  let writeBatchDepth = 0;
+  const pendingThreadIds = new Set();
+  const pendingFtsIds = new Set();
+
+  const finishMessageWrite = (threadIds, messageId) => {
+    if (writeBatchDepth > 0) {
+      for (const threadId of threadIds) {
+        if (threadId) pendingThreadIds.add(threadId);
+      }
+      if (messageId) pendingFtsIds.add(messageId);
+      return;
+    }
+    for (const threadId of threadIds) {
+      if (threadId) recomputeThread(threadId);
+    }
+    if (messageId) syncFts(messageId);
+  };
+
+  const insertMessageRow = (row) => {
+    queries.messageInsert.run(row);
+    finishMessageWrite([row.thread_id], row.id);
+    return publicMessage(queries.messageById.get(row.id));
+  };
+
+  const updateMessageRow = (existing, row) => {
+    queries.messageUpdate.run(row);
+    const threads = existing.thread_id === row.thread_id
+      ? [existing.thread_id]
+      : [existing.thread_id, row.thread_id];
+    finishMessageWrite(threads, existing.id);
+    return publicMessage(queries.messageById.get(existing.id));
+  };
+
   return {
+    runWriteBatch(fn) {
+      return db.transaction(() => {
+        writeBatchDepth += 1;
+        try {
+          const result = fn();
+          if (writeBatchDepth === 1) {
+            for (const threadId of pendingThreadIds) recomputeThread(threadId);
+            for (const id of pendingFtsIds) syncFts(id);
+            pendingThreadIds.clear();
+            pendingFtsIds.clear();
+          }
+          return result;
+        } finally {
+          writeBatchDepth -= 1;
+        }
+      })();
+    },
+    checkpointWal() {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    },
+    vacuum() {
+      db.exec('VACUUM');
+      queries.settingUpsert.run(LAST_VACUUM_SETTING, JSON.stringify(now()), now());
+    },
+    vacuumIfDue({ minIntervalMs = 24 * 60 * 60 * 1000 } = {}) {
+      const last = json(queries.settingByKey.get(LAST_VACUUM_SETTING)?.value_json, null);
+      const lastMs = last ? Date.parse(last) : 0;
+      if (Number.isFinite(lastMs) && Date.now() - lastMs < minIntervalMs) return false;
+      this.vacuum();
+      return true;
+    },
     accounts: {
       list: () => queries.accountList.all().map(publicAccount),
       get: (id) => publicAccount(queries.accountById.get(id)),
@@ -977,31 +1077,46 @@ export function createRepositories(db) {
           smart_category_rule: classification.rule,
           smart_category_version: classification.version,
         };
-        const byUid = classifiedInput.uid === null || classifiedInput.uid === undefined
+        const uid = classifiedInput.uid === null || classifiedInput.uid === undefined
           ? null
-          : db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?')
-            .get(classifiedInput.account_id, classifiedInput.mailbox, classifiedInput.uid);
-        // A MOVE without UIDPLUS cannot tell us the destination UID. Reusing an
-        // RFC Message-ID here prevents a later mailbox sync from duplicating it.
-        const existing = byUid || (classifiedInput.rfc_message_id
+          : Number(classifiedInput.uid);
+        const byUid = uid === null || !Number.isInteger(uid)
+          ? null
+          : queries.messageByUid.get(classifiedInput.account_id, classifiedInput.mailbox, uid);
+        const byRfc = !byUid && classifiedInput.rfc_message_id
           ? queries.messageByRfcId.get(classifiedInput.account_id, classifiedInput.rfc_message_id)
-          : null);
+          : null;
         const timestamp = now();
-        const row = { ...classifiedInput, updated_at: timestamp };
-        if (existing) {
-          row.id = existing.id;
-          queries.messageUpdate.run(row);
-          recomputeThread(existing.thread_id);
-          if (existing.thread_id !== row.thread_id) recomputeThread(row.thread_id);
-          syncFts(existing.id);
-          return publicMessage(queries.messageById.get(existing.id));
+        const row = { ...classifiedInput, uid, updated_at: timestamp };
+
+        if (byUid) {
+          row.id = byUid.id;
+          return updateMessageRow(byUid, row);
         }
+
+        // A local Sent copy has no UID yet; the next Sent sync finds it by
+        // Message-ID in the same mailbox and fills the server-assigned UID in.
+        if (byRfc && byRfc.mailbox === classifiedInput.mailbox) {
+          row.id = byRfc.id;
+          return updateMessageRow(byRfc, row);
+        }
+
+        // Same RFC Message-ID in a different mailbox is a copy, not a move.
+        // Rewriting the other row's (mailbox, uid) collides with UNIQUE when
+        // that key is already occupied and silently relocates the original.
         row.id ||= randomUUID();
         row.created_at ||= timestamp;
-        queries.messageInsert.run(row);
-        recomputeThread(row.thread_id);
-        syncFts(row.id);
-        return publicMessage(queries.messageById.get(row.id));
+        try {
+          return insertMessageRow(row);
+        } catch (error) {
+          if (!isUniqueMailboxUidConstraint(error)) throw error;
+          const occupant = uid === null ? null : queries.messageByUid.get(
+            classifiedInput.account_id,
+            classifiedInput.mailbox,
+            uid,
+          );
+          return publicMessage(occupant || byRfc);
+        }
       }),
       setState(id, state) {
         const row = queries.messageById.get(id);
@@ -1091,6 +1206,31 @@ export function createRepositories(db) {
     sync: {
       get: (accountId, mailbox) => queries.syncState.get(accountId, mailbox) || null,
       save: (state) => queries.syncStateUpsert.run(state),
+      recordSkip(state) {
+        queries.syncSkipUpsert.run({
+          account_id: state.account_id,
+          mailbox: state.mailbox,
+          uid: Number(state.uid),
+          reason: String(state.reason || 'import-failed').slice(0, 500),
+          seen_at: state.seen_at || now(),
+        });
+      },
+      clearSkips: (accountId, mailbox) => queries.syncSkipClear.run(accountId, mailbox),
+    },
+    changes: {
+      stamp() {
+        const times = [
+          queries.maxMessageUpdated.get()?.t,
+          queries.maxSyncSynced.get()?.t,
+          queries.maxAccountUpdated.get()?.t,
+        ].filter(Boolean).sort();
+        return { changedAt: times.at(-1) || null };
+      },
+    },
+    retention: {
+      pruneBodies(cutoffIso) {
+        return queries.pruneBodies.run({ cutoff: cutoffIso, updated_at: now() }).changes;
+      },
     },
     drafts: {
       get: (id) => publicDraft(queries.draftById.get(id), { includeContent: true }),
@@ -1137,8 +1277,15 @@ export function createRepositories(db) {
       },
       remove: (id) => queries.passkeyDelete.run(id).changes > 0,
     },
-    close: () => db.close(),
+    close() {
+      try {
+        db.pragma('wal_checkpoint(TRUNCATE)');
+      } catch {
+        // A leftover reader must not block shutdown.
+      }
+      db.close();
+    },
   };
 }
 
-export { json, stringify, now, publicAccount, publicMessage, publicThread, publicDraft };
+export { json, stringify, now, publicAccount, publicMessage, publicThread, publicDraft, isUniqueMailboxUidConstraint };

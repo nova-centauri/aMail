@@ -41,11 +41,13 @@ Open `http://127.0.0.1:3080`, sign in with the access token, and the first-run
 wizard walks you through connecting mailboxes and pointing an agent at the MCP
 endpoint.
 
-The supplied `.env.example` polls enabled accounts every five minutes without
-keeping long-lived IMAP IDLE sockets open. That interval is the unattended
-fallback: a focused mailbox tab checks every inbox immediately when it becomes
-visible and then about every 15 seconds while it stays in use. Set
-`SYNC_INTERVAL_MINUTES=0` only if you want no server-side fallback.
+The supplied `.env.example` polls enabled accounts every five minutes and keeps
+one IMAP connection per account pooled (with ImapFlow auto-IDLE on INBOX)
+instead of reconnecting on every pass. A focused mailbox tab checks every inbox
+immediately when it becomes visible, then polls `GET /api/changes` about every
+60 seconds. Set `SYNC_INTERVAL_MINUTES=0` only if you want no server-side
+fallback. `AMAIL_RETAIN_DAYS` (default 0) can drop stored bodies of old mail
+while keeping headers and flags.
 
 On its first pass, aMail imports the newest `AMAIL_SYNC_BATCH_SIZE` messages
 from each supported folder (200 by default). This is a recent-mail client

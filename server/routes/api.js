@@ -334,6 +334,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const result = await mailService.syncAccount(request.params.id, {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
+      maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
+      force: Boolean(request.body?.force),
     });
     response.json({ result });
   });
@@ -342,10 +344,20 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
       // Pollers pass maxAgeSeconds to accept a run that finished this recently
-      // instead of starting another; the manual refresh omits it.
+      // instead of starting another; the manual refresh sends force.
       maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
+      force: Boolean(request.body?.force),
     });
     response.json({ results });
+  });
+  router.get('/changes', (request, response) => {
+    const since = String(request.query.since || '');
+    const stamp = repos.changes.stamp();
+    const changedAt = stamp.changedAt;
+    response.json({
+      changedAt,
+      changed: !since || !changedAt || changedAt > since,
+    });
   });
 
   const flagsPayload = (flags) => ({

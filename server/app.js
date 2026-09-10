@@ -15,10 +15,11 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   app.set('trust proxy', config.trustProxy);
   app.use(pinoHttp({
     logger,
-    autoLogging: config.env !== 'test',
+    autoLogging: config.env !== 'test' && !['error', 'fatal', 'silent'].includes(config.logLevel),
     // Request logging stays at info: under the hosted LOG_LEVEL=error profile
-    // no per-request entry exists, and the error handler below is the single
-    // place a failure is recorded (route, status, request id, scrubbed error).
+    // no per-request entry exists (autoLogging is off, and the level would drop
+    // it anyway). The error handler below is the single place a failure is
+    // recorded (route, status, request id, scrubbed error).
     serializers: logSerializers,
   }));
   app.use(helmet({

@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 
-export const FOCUSED_SYNC_INTERVAL_MS = 30_000;
+export const FOCUSED_SYNC_INTERVAL_MS = 60_000;
 export const BACKGROUND_SYNC_INTERVAL_MS = 5 * 60_000;
 export const MAX_FOCUSED_SYNC_INTERVAL_MS = 10 * 60_000;
 // A full sync runs every mailbox of every account over IMAP, so the pause after
@@ -9,7 +9,7 @@ export const MAX_FOCUSED_SYNC_INTERVAL_MS = 10 * 60_000;
 export const SYNC_DUTY_FACTOR = 2;
 // A result the server produced this recently is good enough for a poll; it
 // lets a second tab or an agent share one run instead of starting another.
-export const LIVE_SYNC_MAX_AGE_SECONDS = 20;
+export const LIVE_SYNC_MAX_AGE_SECONDS = 60;
 
 export function mailboxSessionIsActive(doc = globalThis.document) {
   if (!doc || doc.visibilityState !== 'visible') return false;

@@ -67,3 +67,12 @@ test('ops-digest sources default to common homelab tools and can be replaced or 
   assert.deepEqual(loadConfig({ AMAIL_OPS_SOURCES: '' }).opsSources, []);
   assert.deepEqual(loadConfig({ AMAIL_OPS_SOURCES: 'uptime kuma' }).opsSources, ['uptime kuma']);
 });
+
+test('density controls default to a 60s sync floor, an 8-minute IMAP pool, and no body retention', () => {
+  assert.equal(loadConfig({}).syncMinIntervalMs, 60_000);
+  assert.equal(loadConfig({}).imapPoolIdleMs, 8 * 60_000);
+  assert.equal(loadConfig({}).retainDays, 0);
+  assert.equal(loadConfig({ AMAIL_SYNC_MIN_INTERVAL_MS: '0' }).syncMinIntervalMs, 0);
+  assert.equal(loadConfig({ AMAIL_IMAP_POOL_IDLE_MS: '120000' }).imapPoolIdleMs, 120_000);
+  assert.equal(loadConfig({ AMAIL_RETAIN_DAYS: '30' }).retainDays, 30);
+});

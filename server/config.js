@@ -111,9 +111,20 @@ export function loadConfig(env = process.env) {
       min: 64 * 1024,
       max: 50 * 1024 * 1024,
     }),
-    // 0 disables background polling. Sync calls open short-lived connections;
-    // aMail intentionally does not maintain an IDLE socket per account.
+    // Floor applied to every syncAll/syncAccount (including old clients and
+    // MCP). Inside this window the previous result is returned. 0 disables.
+    // Manual refresh passes force=true to bypass it.
+    syncMinIntervalMs: integer(readEnv(env, 'SYNC_MIN_INTERVAL_MS'), 60_000, { min: 0, max: 3_600_000 }),
+    // Keep one IMAP TCP session per account this long after the last use so
+    // the next pass skips the TLS handshake. 0 logs out immediately (tests).
+    imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),
+    // 0 disables background polling. Hosted sets 15. A focused tab polls
+    // GET /api/changes; IMAP IDLE on the pooled INBOX connection is the push
+    // path for new mail between polls.
     syncIntervalMinutes: integer(readEnv(env, 'SYNC_INTERVAL_MINUTES', env.SYNC_INTERVAL_MINUTES), 0, { min: 0, max: 1440 }),
+    // 0 keeps bodies forever. Hosted sets a day count so html_body/text_body
+    // older than this are dropped (headers, snippet, flags stay).
+    retainDays: integer(readEnv(env, 'RETAIN_DAYS'), 0, { min: 0, max: 3650 }),
     remoteContentMaxBytes: integer(readEnv(env, 'REMOTE_CONTENT_MAX_BYTES'), 5 * 1024 * 1024, {
       min: 16 * 1024,
       max: 25 * 1024 * 1024,

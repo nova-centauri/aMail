@@ -152,3 +152,113 @@ test('a missing or empty file is treated as a fresh database', (t) => {
   repos.close();
   assert.equal(isPlaintextSqliteFile(config.dbPath), false);
 });
+
+function messageFields(accountId, threadId, extra = {}) {
+  return {
+    account_id: accountId,
+    thread_id: threadId,
+    mailbox: 'INBOX',
+    uid: 1,
+    rfc_message_id: '<density@example.test>',
+    in_reply_to: null,
+    references_json: '[]',
+    subject: 'Keep headers',
+    from_name: '',
+    from_email: 'friend@example.test',
+    to_json: '[]',
+    cc_json: '[]',
+    bcc_json: '[]',
+    reply_to_json: null,
+    sent_at: '2020-01-01T00:00:00.000Z',
+    received_at: '2020-01-01T00:00:00.000Z',
+    html_body: '<p>old body</p>',
+    text_body: 'old body',
+    snippet: 'old body',
+    attachments_json: '[]',
+    labels_json: '[]',
+    is_read: 0,
+    is_starred: 0,
+    is_archived: 0,
+    is_trashed: 0,
+    is_spam: 0,
+    snoozed_until: null,
+    is_sent: 0,
+    ...extra,
+  };
+}
+
+test('WAL uses NORMAL synchronous, a bounded cache, and an explicit autocheckpoint', (t) => {
+  const config = tempConfig(t);
+  const database = createDatabase(config);
+  t.after(() => database.close());
+  assert.equal(database.pragma('journal_mode', { simple: true }), 'wal');
+  assert.equal(database.pragma('synchronous', { simple: true }), 1);
+  assert.equal(database.pragma('cache_size', { simple: true }), -16000);
+  assert.equal(database.pragma('wal_autocheckpoint', { simple: true }), 1000);
+  assert.equal(database.pragma('journal_size_limit', { simple: true }), 64 * 1024 * 1024);
+  assert.equal(database.pragma('mmap_size', { simple: true }), 268435456);
+});
+
+test('a keyed database does not enable mmap', (t) => {
+  const config = tempConfig(t, { databaseKey: Buffer.alloc(32, 5) });
+  const database = createDatabase(config);
+  t.after(() => database.close());
+  assert.equal(database.pragma('mmap_size', { simple: true }), 0);
+});
+
+test('the same RFC Message-ID in another mailbox is stored as a copy instead of rewriting UNIQUE keys', (t) => {
+  const config = tempConfig(t);
+  const db = createDatabase(config);
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Copied',
+    normalized_subject: 'copied',
+    latest_at: '2026-01-01T00:00:00.000Z',
+  });
+  const inbox = repos.messages.upsert(messageFields(account.id, thread.id, {
+    mailbox: 'INBOX',
+    uid: 5,
+    rfc_message_id: '<copy@example.test>',
+  }));
+  const archive = repos.messages.upsert(messageFields(account.id, thread.id, {
+    mailbox: 'Archive',
+    uid: 50,
+    rfc_message_id: '<copy@example.test>',
+    is_archived: 1,
+  }));
+  assert.notEqual(archive.id, inbox.id);
+  assert.equal(inbox.mailbox, 'INBOX');
+  assert.equal(repos.messages.get(inbox.id).mailbox, 'INBOX');
+  assert.equal(repos.messages.get(archive.id).mailbox, 'Archive');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 2);
+});
+
+test('retention prune clears old bodies and keeps headers, and a change stamp moves with writes', (t) => {
+  const config = tempConfig(t);
+  const repos = createRepositories(createDatabase(config));
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Keep headers',
+    normalized_subject: 'keep headers',
+    latest_at: '2020-01-01T00:00:00.000Z',
+  });
+  const message = repos.messages.upsert(messageFields(account.id, thread.id));
+  const before = repos.changes.stamp();
+  assert.ok(before.changedAt);
+  const pruned = repos.retention.pruneBodies('2024-01-01T00:00:00.000Z');
+  assert.equal(pruned, 1);
+  const kept = repos.messages.get(message.id);
+  assert.equal(kept.htmlBody, '');
+  assert.equal(kept.textBody, '');
+  assert.equal(kept.snippet, 'old body');
+  assert.equal(kept.subject, 'Keep headers');
+  const after = repos.changes.stamp();
+  assert.ok(after.changedAt >= before.changedAt);
+  repos.sync.recordSkip({ account_id: account.id, mailbox: 'INBOX', uid: 5, reason: 'UNIQUE messages.account_id, mailbox, uid' });
+  repos.checkpointWal();
+});

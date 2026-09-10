@@ -308,17 +308,31 @@ export default function App() {
     }
   }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, debouncedQuery, onboardingDismissed, selectedThread]);
 
-  const liveSyncInboxes = useCallback(async () => {
+  const lastChangeRef = useRef('');
+  const liveSyncInboxes = useCallback(async ({ immediate } = {}) => {
     if (isDemo || authRequired || !authenticated) return;
     if (syncInFlightRef.current) return;
     syncInFlightRef.current = true;
+    let reload = Boolean(immediate);
     try {
-      await api('/sync', { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', maxAgeSeconds: LIVE_SYNC_MAX_AGE_SECONDS }) });
+      if (immediate) {
+        await api('/sync', { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', maxAgeSeconds: LIVE_SYNC_MAX_AGE_SECONDS }) });
+        const stamp = await api('/changes').catch(() => null);
+        if (stamp?.changedAt) lastChangeRef.current = stamp.changedAt;
+        reload = true;
+      } else {
+        const since = lastChangeRef.current;
+        const query = since ? `?since=${encodeURIComponent(since)}` : '';
+        const payload = await api(`/changes${query}`);
+        if (payload?.changedAt) lastChangeRef.current = payload.changedAt;
+        reload = Boolean(payload?.changed);
+      }
     } catch {
       // Keep the current mailbox. A later tick or a manual refresh will retry.
+      reload = false;
     } finally {
       try {
-        await loadMailbox({ keepSelection: true, silent: true });
+        if (reload) await loadMailbox({ keepSelection: true, silent: true });
       } finally {
         syncInFlightRef.current = false;
       }
@@ -400,7 +414,7 @@ export default function App() {
     setNotice(account ? `Syncing ${account.email}…` : 'Syncing all connected accounts…');
     try {
       const syncPath = account?.id ? `/accounts/${encodeURIComponent(account.id)}/sync` : '/sync';
-      const response = await api(syncPath, { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX' }) });
+      const response = await api(syncPath, { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', force: true }) });
       const status = syncResultStatus(response);
       const skippedMessages = syncSkippedMessageCount(response);
       if (status === 'failed') setNotice('Mailbox sync failed. Showing the latest stored mail.');
