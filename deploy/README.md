@@ -45,9 +45,11 @@ The supplied `.env.example` polls enabled accounts every five minutes and keeps
 one IMAP connection per account pooled (with ImapFlow auto-IDLE on INBOX)
 instead of reconnecting on every pass. A focused mailbox tab checks every inbox
 immediately when it becomes visible, then polls `GET /api/changes` about every
-60 seconds. Set `SYNC_INTERVAL_MINUTES=0` only if you want no server-side
-fallback. `AMAIL_RETAIN_DAYS` (default 0) can drop stored bodies of old mail
-while keeping headers and flags.
+60 seconds. Hosted keyslot tenants default to a 15-minute unattended poll
+instead; copy `deploy/hosted.env.example` rather than this file. Set
+`SYNC_INTERVAL_MINUTES=0` only if you want no server-side fallback.
+`AMAIL_RETAIN_DAYS` (default 0) can drop stored bodies of old mail while keeping
+headers and flags.
 
 On its first pass, aMail imports the newest `AMAIL_SYNC_BATCH_SIZE` messages
 from each supported folder (200 by default). This is a recent-mail client
@@ -309,9 +311,29 @@ volume, start elsewhere. Deleting a tenant is deleting the volume: without the
 keyslots the cache is unrecoverable, and the tenant's mail still lives on
 their IMAP servers.
 
-**Logging.** Run hosted tenants at `LOG_LEVEL=error`. The logging policy
+**Logging.** Keyslot mode defaults to `LOG_LEVEL=error`. The logging policy
 (path only, no headers, scrubbed error text) applies at every level; a locked
 harness answering `503` is not logged as an error.
+
+**Hosted density profile.** Keyslot containers apply these when the variable is
+unset (see `deploy/hosted.env.example` for the tenant-node copy). The image
+entrypoint also sets `NODE_OPTIONS=--max-old-space-size=384` and
+`UV_THREADPOOL_SIZE=2` in keyslot mode unless they are already present. Explicit
+environment always wins, so a compose file that still pins
+`SYNC_INTERVAL_MINUTES=5` or `LOG_LEVEL=info` from the OSS `.env.example` keeps
+those OSS values — drop those pins or use `hosted.env.example`.
+
+| Setting | Keyslot default | OSS `.env.example` |
+| --- | --- | --- |
+| `LOG_LEVEL` | `error` | `info` |
+| `SYNC_INTERVAL_MINUTES` | `15` | `5` |
+| `AMAIL_SYNC_BATCH_SIZE` | `100` | `200` |
+| `AMAIL_SYNC_MAX_MESSAGE_BYTES` | `5 MiB` | `10 MiB` |
+| `AMAIL_SYNC_MIN_INTERVAL_MS` | `60000` | `60000` |
+| `AMAIL_IMAP_POOL_IDLE_MS` | `480000` | `480000` |
+| `AMAIL_RETAIN_DAYS` | `0` (off) | `0` (off) |
+| `NODE_OPTIONS` | `--max-old-space-size=384` | unset |
+| `UV_THREADPOOL_SIZE` | `2` | unset |
 
 ## Sizing
 
@@ -323,14 +345,14 @@ container at `AMAIL_MEMORY_LIMIT` (default 1.5 GiB) and the Tor relay at
 `AMAIL_TOR_MEMORY_LIMIT` (default 256 MiB) so one runaway instance cannot
 starve a shared host; raise the first for very large mailboxes.
 
-CPU is spent almost entirely in IMAP passes. The web client asks for one on a
-timer only while its tab is focused, waits at least 30 seconds and at least
-twice the previous pass's duration between requests, and accepts a pass that
-finished within the last 20 seconds instead of starting another; the server
-runs one pass at a time and shares it between concurrent callers. Agents that
-poll should pass `maxAgeSeconds` to `sync_mail` (or `POST /api/sync`) for the
-same reason. `SYNC_INTERVAL_MINUTES` governs the pass that runs with no tab
-open.
+CPU is spent almost entirely in IMAP passes. The web client asks for a focused
+refresh immediately, then polls `GET /api/changes` about every 60 seconds. The
+server coalesces concurrent syncs, enforces a 60-second minimum interval
+(`AMAIL_SYNC_MIN_INTERVAL_MS`), and returns a pass that finished inside that
+window. Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
+`POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES` governs the pass
+that runs with no tab open (15 minutes in keyslot mode, 5 in the supplied
+`.env.example`).
 
 ## Continuous integration
 

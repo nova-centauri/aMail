@@ -29,6 +29,9 @@ test('LOG_LEVEL falls back to info and accepts the hosted error-only profile', (
   assert.equal(loadConfig({}).logLevel, 'info');
   assert.equal(loadConfig({ LOG_LEVEL: 'error' }).logLevel, 'error');
   assert.equal(loadConfig({ LOG_LEVEL: 'nonsense' }).logLevel, 'info');
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot' }).logLevel, 'error');
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', LOG_LEVEL: 'info' }).logLevel, 'info');
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', LOG_LEVEL: 'nonsense' }).logLevel, 'error');
 });
 
 test('log text scrubbing removes addresses, credentials, and query strings but keeps prose', () => {

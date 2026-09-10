@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { normalizeLogLevel } from './logging.js';
+import { DEFAULT_LOG_LEVEL, normalizeLogLevel } from './logging.js';
 import { deriveSubkey } from './services/crypto.js';
 
 export const APP_NAME = 'aMail';
@@ -71,6 +71,7 @@ export function loadConfig(env = process.env) {
   const keyModeConflicts = keyslotMode
     ? ['ENCRYPTION_KEY', 'ACCESS_TOKEN', 'REMOTE_TOKEN_KEY', 'ENCRYPT_DATABASE'].filter((name) => readEnv(env, name) !== undefined)
     : [];
+  const mib = 1024 * 1024;
 
   return Object.freeze({
     appName: APP_NAME,
@@ -103,11 +104,15 @@ export function loadConfig(env = process.env) {
     trustProxy: boolean(readEnv(env, 'TRUST_PROXY')),
     allowInsecureTls: boolean(readEnv(env, 'ALLOW_INSECURE_TLS')),
     cookieSecure: boolean(readEnv(env, 'COOKIE_SECURE'), true),
-    syncBatchSize: integer(readEnv(env, 'SYNC_BATCH_SIZE'), 200, { min: 1, max: 1000 }),
+    // Hosted (keyslot) defaults are the density profile: a smaller first-sync
+    // window, a 5 MiB parse cap, a 15-minute unattended poll, and error-only
+    // logs. Explicit env still wins. Self-hosted `env` mode keeps the OSS
+    // defaults so an existing .env is unchanged.
+    syncBatchSize: integer(readEnv(env, 'SYNC_BATCH_SIZE'), keyslotMode ? 100 : 200, { min: 1, max: 1000 }),
     syncTimeoutMs: integer(readEnv(env, 'SYNC_TIMEOUT_MS'), 60_000, { min: 5_000, max: 300_000 }),
     // The raw RFC822 source includes attachments. Keep each parse bounded so a
     // single unexpectedly large message cannot consume unrestricted memory.
-    syncMaxMessageBytes: integer(readEnv(env, 'SYNC_MAX_MESSAGE_BYTES'), 10 * 1024 * 1024, {
+    syncMaxMessageBytes: integer(readEnv(env, 'SYNC_MAX_MESSAGE_BYTES'), keyslotMode ? 5 * mib : 10 * mib, {
       min: 64 * 1024,
       max: 50 * 1024 * 1024,
     }),
@@ -118,12 +123,16 @@ export function loadConfig(env = process.env) {
     // Keep one IMAP TCP session per account this long after the last use so
     // the next pass skips the TLS handshake. 0 logs out immediately (tests).
     imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),
-    // 0 disables background polling. Hosted sets 15. A focused tab polls
-    // GET /api/changes; IMAP IDLE on the pooled INBOX connection is the push
-    // path for new mail between polls.
-    syncIntervalMinutes: integer(readEnv(env, 'SYNC_INTERVAL_MINUTES', env.SYNC_INTERVAL_MINUTES), 0, { min: 0, max: 1440 }),
-    // 0 keeps bodies forever. Hosted sets a day count so html_body/text_body
-    // older than this are dropped (headers, snippet, flags stay).
+    // 0 disables background polling. Hosted defaults to 15. A focused tab
+    // polls GET /api/changes; IMAP IDLE on the pooled INBOX connection is the
+    // push path for new mail between polls.
+    syncIntervalMinutes: integer(
+      readEnv(env, 'SYNC_INTERVAL_MINUTES', env.SYNC_INTERVAL_MINUTES),
+      keyslotMode ? 15 : 0,
+      { min: 0, max: 1440 },
+    ),
+    // 0 keeps bodies forever. Operators may set AMAIL_RETAIN_DAYS to drop
+    // html_body/text_body older than that (headers, snippet, flags stay).
     retainDays: integer(readEnv(env, 'RETAIN_DAYS'), 0, { min: 0, max: 3650 }),
     remoteContentMaxBytes: integer(readEnv(env, 'REMOTE_CONTENT_MAX_BYTES'), 5 * 1024 * 1024, {
       min: 16 * 1024,
@@ -147,7 +156,7 @@ export function loadConfig(env = process.env) {
     allowDirectRemoteContent: (env.NODE_ENV || 'development') !== 'production'
       && boolean(readEnv(env, 'ALLOW_DIRECT_REMOTE_CONTENT')),
     // `error` is the hosted profile: failures only, no per-request entries.
-    logLevel: normalizeLogLevel(env.LOG_LEVEL),
+    logLevel: normalizeLogLevel(env.LOG_LEVEL, keyslotMode ? 'error' : DEFAULT_LOG_LEVEL),
     // Hosted-only usage metering. Unset means no-op: nothing is buffered or
     // sent. The endpoint receives analyzed counts and timestamps, nothing else.
     meteringUrl: parseHttpUrl(readEnv(env, 'METERING_URL')),

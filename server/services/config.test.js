@@ -72,7 +72,25 @@ test('density controls default to a 60s sync floor, an 8-minute IMAP pool, and n
   assert.equal(loadConfig({}).syncMinIntervalMs, 60_000);
   assert.equal(loadConfig({}).imapPoolIdleMs, 8 * 60_000);
   assert.equal(loadConfig({}).retainDays, 0);
+  assert.equal(loadConfig({}).syncBatchSize, 200);
+  assert.equal(loadConfig({}).syncMaxMessageBytes, 10 * MIB);
+  assert.equal(loadConfig({}).syncIntervalMinutes, 0);
   assert.equal(loadConfig({ AMAIL_SYNC_MIN_INTERVAL_MS: '0' }).syncMinIntervalMs, 0);
   assert.equal(loadConfig({ AMAIL_IMAP_POOL_IDLE_MS: '120000' }).imapPoolIdleMs, 120_000);
   assert.equal(loadConfig({ AMAIL_RETAIN_DAYS: '30' }).retainDays, 30);
+});
+
+test('keyslot mode uses the hosted density profile unless explicit env overrides it', () => {
+  const hosted = loadConfig({ AMAIL_KEY_MODE: 'keyslot' });
+  assert.equal(hosted.syncBatchSize, 100);
+  assert.equal(hosted.syncMaxMessageBytes, 5 * MIB);
+  assert.equal(hosted.syncIntervalMinutes, 15);
+  assert.equal(hosted.logLevel, 'error');
+  assert.equal(hosted.syncMinIntervalMs, 60_000);
+  assert.equal(hosted.imapPoolIdleMs, 8 * 60_000);
+  assert.equal(hosted.retainDays, 0);
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', AMAIL_SYNC_BATCH_SIZE: '200' }).syncBatchSize, 200);
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', AMAIL_SYNC_MAX_MESSAGE_BYTES: String(10 * MIB) }).syncMaxMessageBytes, 10 * MIB);
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', SYNC_INTERVAL_MINUTES: '5' }).syncIntervalMinutes, 5);
+  assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', LOG_LEVEL: 'info' }).logLevel, 'info');
 });

@@ -50,6 +50,7 @@ jobs:
         run: |
           cp .env.example .env
           sh -n deploy/launch.sh
+          sh -n deploy/docker-entrypoint.sh
           docker compose --env-file .env --profile privacy config --quiet
           docker compose --env-file .env --profile privacy config --format json | node -e '
             let input = "";
@@ -95,11 +96,13 @@ jobs:
         run: |
           # No AMAIL_ENCRYPTION_KEY or AMAIL_ACCESS_TOKEN: the container starts
           # locked, is provisioned once, and the returned token unlocks it.
+          # Density flags (LOG_LEVEL, heap, threadpool, poll) are image defaults
+          # in keyslot mode, so this boot must not pass them.
           docker volume create amail-keyslot-ci >/dev/null
           docker run --detach --name amail-keyslot-ci --read-only --user 10001:10001 \
             --tmpfs /tmp --volume amail-keyslot-ci:/data --publish 127.0.0.1:3081:3000 \
             --env AMAIL_KEY_MODE=keyslot --env AMAIL_PROVISION_SECRET=ci-provision-secret-0123456789 \
-            --env HOST=0.0.0.0 --env PORT=3000 --env LOG_LEVEL=error \
+            --env HOST=0.0.0.0 --env PORT=3000 \
             "${COMPOSE_PROJECT_NAME}:local"
           for _ in $(seq 1 30); do
             curl --silent --fail --max-time 5 http://127.0.0.1:3081/api/health >/dev/null 2>&1 && break
@@ -132,6 +135,13 @@ jobs:
             -H "Authorization: Bearer $token" http://127.0.0.1:3081/api/accounts)
           test "$status" = "200"
           curl --fail --silent --show-error --max-time 10 http://127.0.0.1:3081/api/health | grep -q '"locked":false'
+          # Image defaults: V8 heap, libuv pool, and no per-request log lines.
+          docker exec amail-keyslot-ci sh -c 'tr "\0" "\n" < /proc/1/environ' | grep -qx 'NODE_OPTIONS=--max-old-space-size=384'
+          docker exec amail-keyslot-ci sh -c 'tr "\0" "\n" < /proc/1/environ' | grep -qx 'UV_THREADPOOL_SIZE=2'
+          if docker logs amail-keyslot-ci 2>&1 | grep -q '"url":"/api/health"'; then
+            echo 'keyslot boot logged a health request; LOG_LEVEL=error should silence pino-http' >&2
+            exit 1
+          fi
 
       - name: Remove ephemeral CI containers and volumes
         if: always()

@@ -100,7 +100,7 @@ Person flags are stored in the database, not the environment: manage them in **S
 
 The same image can run without any secret in its environment. With `AMAIL_KEY_MODE=keyslot` (and no `AMAIL_ENCRYPTION_KEY` / `AMAIL_ACCESS_TOKEN`), the container boots **locked**: the whole SQLite file is encrypted under a random data key that exists only in RAM while unlocked and is never stored bare. Every credential the tenant holds wraps that key into a *keyslot* next to the database — MCP bearer tokens, a passphrase, passkeys (via the WebAuthn PRF extension), a recovery code, and optionally an operator escrow slot the tenant can turn on to stay unlocked across restarts. Presenting any of them is the unlock; an agent's first MCP call with its token is enough. Locked or not, the operator never learns the key, and deleting the keyslots is a crypto-shred of the local cache.
 
-This is the model behind hosted aMail. Self-hosters can use it too; the operating procedure is in [`deploy/README.md`](deploy/README.md#keyslot-mode-hosted-tenants).
+This is the model behind hosted aMail. Self-hosters can use it too; the operating procedure is in [`deploy/README.md`](deploy/README.md#keyslot-mode-hosted-tenants). Keyslot mode also applies the hosted density profile when those variables are unset: `LOG_LEVEL=error`, `SYNC_INTERVAL_MINUTES=15`, `AMAIL_SYNC_BATCH_SIZE=100`, `AMAIL_SYNC_MAX_MESSAGE_BYTES=5MiB`, plus a 384 MiB V8 heap and `UV_THREADPOOL_SIZE=2` from the image entrypoint. Copy [`deploy/hosted.env.example`](deploy/hosted.env.example) into the tenant compose so OSS `.env.example` pins cannot override them.
 
 ## Upgrading from GigaMail
 
