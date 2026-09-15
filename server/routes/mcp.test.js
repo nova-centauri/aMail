@@ -160,7 +160,7 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     normalized_subject: 'hello from mcp',
     latest_at: '2026-03-01T00:00:00.000Z',
   });
-  repos.messages.upsert(messageInput({
+  const firstMessage = repos.messages.upsert(messageInput({
     accountId: account.id,
     threadId: thread.id,
     uid: 1,
@@ -180,6 +180,7 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     'list_accounts',
     'list_providers',
     'list_messages',
+    'list_unanalyzed_messages',
     'get_message',
     'get_thread',
     'send_message',
@@ -223,6 +224,58 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
   assert.equal(messagesPayload.total, 1);
   assert.equal(messagesPayload.messages[0].subject, 'Hello from MCP');
   assert.equal(messagesPayload.messages[0].from.email, 'friend@example.test');
+
+  const secondMessage = repos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 2, subject: 'Another message in the thread',
+    fromEmail: 'friend@example.test', timestamp: '2026-03-01T00:01:00.000Z',
+  }));
+  const thirdMessage = repos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 3, subject: 'Newest message in the thread',
+    fromEmail: 'friend@example.test', timestamp: '2026-03-01T00:02:00.000Z',
+  }));
+  const queueCall = (args) => mcpRpc(origin, {
+    token: accessToken, method: 'tools/call', params: { name: 'list_unanalyzed_messages', arguments: args },
+  });
+  const beforeReads = database.prepare('SELECT total_changes() AS count').get().count;
+  const queued = await queueCall({ pageSize: 2 });
+  assert.equal(queued.body.result.isError, undefined);
+  const page = JSON.parse(queued.body.result.content[0].text);
+  assert.equal(page.scope, 'all_cached_messages');
+  assert.equal(page.accountId, null);
+  assert.equal(page.total, 3);
+  assert.equal(page.pageSize, 2);
+  assert.equal(page.hasMore, true);
+  assert.equal(typeof page.nextCursor, 'string');
+  assert.deepEqual(page.messages.map((message) => message.id), [firstMessage.id, secondMessage.id]);
+  assert.ok(page.messages.every((message) => message.threadId === thread.id));
+  assert.ok(page.messages.every((message) => !Object.hasOwn(message, 'htmlBody') && !Object.hasOwn(message, 'textBody')));
+  assert.equal(database.prepare('SELECT total_changes() AS count').get().count, beforeReads);
+
+  // Leave the oldest blocked. Marking earlier messages must not shift cursor pages.
+  repos.messages.setState(secondMessage.id, { isAnalyzed: true, analyzedBy: 'test' });
+  const continued = await queueCall({ pageSize: 2, cursor: page.nextCursor });
+  const next = JSON.parse(continued.body.result.content[0].text);
+  assert.equal(next.total, 2, 'total still includes the blocked message before the cursor');
+  assert.equal(next.hasMore, false);
+  assert.equal(next.nextCursor, null);
+  assert.deepEqual(next.messages.map((message) => message.id), [thirdMessage.id]);
+  const repeated = JSON.parse((await queueCall({})).body.result.content[0].text);
+  assert.deepEqual(repeated.messages.map((message) => message.id), [firstMessage.id, thirdMessage.id]);
+  assert.equal(repeated.pageSize, 50);
+  const scoped = JSON.parse((await queueCall({ accountId: account.id, pageSize: 1 })).body.result.content[0].text);
+  assert.equal(scoped.total, 2);
+  assert.equal(scoped.accountId, account.id);
+  for (const args of [
+    { pageSize: 0 }, { pageSize: 201 }, { pageSize: 1.5 }, { cursor: 'not-json' },
+    { accountId: account.id, cursor: page.nextCursor },
+    { cursor: Buffer.from(JSON.stringify({ version: 1, accountId: null, timestamp: "' OR 1=1 --", id: 'x' })).toString('base64url') },
+    { accountId: 'missing-account' },
+  ]) {
+    const invalid = await queueCall(args);
+    assert.ok(invalid.body.result?.isError || invalid.body.error, `accepted invalid queue args: ${JSON.stringify(args)}`);
+  }
+  assert.equal(repos.messages.get(firstMessage.id).isRead, false);
+  assert.equal(repos.messages.get(firstMessage.id).isAnalyzed, false);
 
   const cookieAuth = await fetch(`${origin}/mcp`, {
     method: 'POST',

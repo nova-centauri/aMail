@@ -187,6 +187,141 @@ function messageFields(accountId, threadId, extra = {}) {
   };
 }
 
+test('the review queue drains over 5,000 pending messages beyond the newest 1,000 analyzed records', (t) => {
+  const db = createDatabase(tempConfig(t));
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const expected = [];
+  const baseline = Date.parse('2020-01-01T00:00:00.000Z');
+  repos.runWriteBatch(() => {
+    for (let index = 0; index < 6205; index += 1) {
+      const timestamp = new Date(baseline + index * 1000).toISOString();
+      const thread = repos.threads.create({
+        account_id: account.id, subject: `Review ${index}`, normalized_subject: `review ${index}`, latest_at: timestamp,
+      });
+      const message = repos.messages.upsert(messageFields(account.id, thread.id, {
+        uid: index + 1, rfc_message_id: `<review-${index}@example.test>`,
+        sent_at: timestamp, received_at: timestamp,
+      }));
+      if (index < 5205) expected.push(message.id);
+      else repos.messages.setState(message.id, { isAnalyzed: true, analyzedBy: 'previous-run' });
+    }
+  });
+  const changeCount = () => db.prepare('SELECT total_changes() AS count').get().count;
+  const before = changeCount();
+  const initial = repos.messages.listUnanalyzed({ limit: 200 });
+  assert.equal(initial.total, 5205);
+  assert.equal(initial.hasMore, true);
+  assert.deepEqual(initial.items.map((message) => message.id), expected.slice(0, 200));
+  assert.deepEqual(repos.messages.listUnanalyzed({ limit: 200 }), initial);
+  assert.equal(changeCount(), before, 'listing must not change messages, threads, or other database state');
+  const seen = [];
+  while (true) {
+    const page = repos.messages.listUnanalyzed({ limit: 200 });
+    assert.equal(page.total, expected.length - seen.length);
+    assert.equal(page.hasMore, page.total > page.items.length);
+    if (!page.items.length) break;
+    for (const message of page.items) {
+      assert.equal(message.isRead, false);
+      assert.equal(message.isAnalyzed, false);
+      assert.equal(Object.hasOwn(message, 'htmlBody'), false);
+      assert.equal(Object.hasOwn(message, 'textBody'), false);
+      seen.push(message.id);
+      repos.messages.setState(message.id, { isAnalyzed: true, analyzedBy: 'test-review' });
+    }
+  }
+  assert.deepEqual(seen, expected);
+  assert.equal(new Set(seen).size, 5205);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE is_read = 1').get().count, 0);
+});
+
+test('review summaries cover all cached folders, preserve message ids, scope totals, and bound untrusted metadata', (t) => {
+  const db = createDatabase(tempConfig(t));
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const other = seedAccount(repos, 'other@example.test');
+  const timestamp = '2020-01-01T00:00:00.000Z';
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Same thread', normalized_subject: 'same thread', latest_at: timestamp });
+  const states = [
+    {}, { mailbox: 'Sent', is_sent: 1 }, { mailbox: 'Archive', is_archived: 1 },
+    { mailbox: 'Spam', is_spam: 1 }, { mailbox: 'Trash', is_trashed: 1, is_spam: 1 },
+    { is_archived: 1, snoozed_until: '2099-01-01T00:00:00.000Z' }, { mailbox: 'Custom folder' },
+    { subject: 'Watchtower: no updates available', from_email: 'watchtower@example.test' },
+  ];
+  const ids = states.map((state, index) => repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: index + 1, rfc_message_id: `<folder-${index}@example.test>`, ...state,
+  })).id);
+  // Exercise the stored category regardless of the operator's configured sources.
+  db.prepare("UPDATE messages SET smart_category = 'ops_quiet' WHERE id = ?").run(ids.at(-1));
+  const otherThread = repos.threads.create({ account_id: other.id, subject: 'Other', normalized_subject: 'other', latest_at: timestamp });
+  const otherMessage = repos.messages.upsert(messageFields(other.id, otherThread.id));
+  const all = repos.messages.listUnanalyzed({ limit: 200 });
+  assert.equal(all.total, 9);
+  assert.equal(all.hasMore, false);
+  assert.deepEqual(all.items.map((item) => item.id), [...ids, otherMessage.id].sort());
+  const scoped = repos.messages.listUnanalyzed({ accountId: account.id, limit: 200 });
+  assert.equal(scoped.total, 8);
+  assert.deepEqual(scoped.items.map((item) => item.id), ids.sort());
+  assert.ok(scoped.items.every((item) => item.threadId === thread.id && item.id !== thread.id));
+  assert.ok(scoped.items.some((item) => item.category === 'ops_quiet'));
+  const otherOnly = repos.messages.listUnanalyzed({ accountId: other.id });
+  assert.equal(otherOnly.total, 1);
+  assert.equal(otherOnly.items[0].id, otherMessage.id);
+
+  const huge = 'x'.repeat(5000);
+  const people = Array.from({ length: 30 }, () => ({ name: huge, email: huge }));
+  db.prepare('UPDATE messages SET subject = ?, snippet = ?, from_name = ?, to_json = ?, html_body = ?, text_body = ? WHERE id = ?')
+    .run(huge, huge, huge, JSON.stringify(people), huge, huge, otherMessage.id);
+  const summary = repos.messages.listUnanalyzed({ accountId: other.id }).items[0];
+  assert.equal(summary.summaryTruncated, true);
+  assert.equal(summary.subject.length, 1000);
+  assert.equal(summary.snippet.length, 1000);
+  assert.equal(summary.from.name.length, 256);
+  assert.equal(summary.to.length, 20);
+  assert.equal(summary.to[0].email.length, 320);
+  assert.equal(Object.hasOwn(summary, 'htmlBody'), false);
+  assert.equal(Object.hasOwn(summary, 'textBody'), false);
+  assert.equal(repos.messages.get(otherMessage.id).textBody, huge);
+  for (const limit of [0, 201, -1, 1.5]) assert.throws(() => repos.messages.listUnanalyzed({ limit }), RangeError);
+});
+
+test('review cursors retain equal-time siblings and use received time with legacy timestamp fallbacks', (t) => {
+  const db = createDatabase(tempConfig(t));
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const timestamp = '2020-01-01T00:00:00.000Z';
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Cursor ties', normalized_subject: 'cursor ties', latest_at: timestamp });
+  const ids = Array.from({ length: 3 }, (_, index) => repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: index + 1, rfc_message_id: `<tie-${index}@example.test>`,
+    received_at: timestamp,
+    // Sender timestamps must not reorder messages with the same receipt time.
+    sent_at: new Date(Date.parse(timestamp) + index * 60_000).toISOString(),
+  })).id).sort();
+  const sentFallback = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 4, rfc_message_id: '<sent-fallback@example.test>', received_at: null, sent_at: '2021-01-01T00:00:00.000Z',
+  }));
+  const createdFallback = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 5, rfc_message_id: '<created-fallback@example.test>', received_at: null, sent_at: null,
+  }));
+  db.prepare('UPDATE messages SET created_at = ? WHERE id = ?').run('2022-01-01T00:00:00.000Z', createdFallback.id);
+  const first = repos.messages.listUnanalyzed({ limit: 2 });
+  assert.deepEqual(first.items.map((item) => item.id), ids.slice(0, 2));
+  repos.messages.setState(ids[1], { isAnalyzed: true });
+  const next = repos.messages.listUnanalyzed({ limit: 2, afterTimestamp: timestamp, afterId: ids[1] });
+  assert.equal(next.total, 4);
+  assert.equal(next.hasMore, true);
+  assert.deepEqual(next.items.map((item) => item.id), [ids[2], sentFallback.id]);
+  const final = repos.messages.listUnanalyzed({ limit: 2, afterTimestamp: sentFallback.sentAt, afterId: sentFallback.id });
+  assert.deepEqual(final.items.map((item) => item.id), [createdFallback.id]);
+  assert.equal(final.hasMore, false);
+  const end = repos.messages.listUnanalyzed({ afterTimestamp: final.items[0].createdAt, afterId: createdFallback.id });
+  assert.equal(end.items.length, 0);
+  assert.equal(end.total, 4, 'an exhausted cursor does not claim the earlier blocked queue is empty');
+});
+
 test('WAL uses NORMAL synchronous, a bounded cache, and an explicit autocheckpoint', (t) => {
   const config = tempConfig(t);
   const database = createDatabase(config);

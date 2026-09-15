@@ -96,6 +96,45 @@ function publicMessage(row) {
   };
 }
 
+/** Bounded review metadata. Fetch get_message for omitted bodies or clipped fields. */
+function publicReviewMessage(row) {
+  const { htmlBody: _html, textBody: _text, ...message } = publicMessage(row);
+  let summaryTruncated = false;
+  const clip = (value, limit) => {
+    if (typeof value !== 'string') return value;
+    if (value.length > limit) summaryTruncated = true;
+    return value.slice(0, limit);
+  };
+  const bounded = (values, transform) => {
+    if (values.length > 20) summaryTruncated = true;
+    return values.slice(0, 20).map(transform);
+  };
+  const person = (value) => typeof value === 'string'
+    ? clip(value, 320)
+    : { name: clip(value?.name || '', 256), email: clip(value?.email || value?.address || '', 320) };
+  message.subject = clip(message.subject, 1000);
+  message.snippet = clip(message.snippet, 1000);
+  message.from = person(message.from);
+  for (const field of ['to', 'cc', 'bcc', 'replyTo']) {
+    if (Array.isArray(message[field])) message[field] = bounded(message[field], person);
+  }
+  message.messageId = clip(message.messageId, 1000);
+  message.inReplyTo = clip(message.inReplyTo, 1000);
+  message.references = bounded(message.references, (value) => clip(value, 1000));
+  message.labels = bounded(message.labels, (value) => clip(value, 256));
+  message.mailbox = clip(message.mailbox, 256);
+  message.categoryReason = clip(message.categoryReason, 1000);
+  message.attachmentCount = message.attachments.length;
+  message.hasAttachments = message.attachmentCount > 0;
+  message.attachments = bounded(message.attachments, (value) => ({
+    ...value,
+    filename: clip(value.filename, 256),
+    contentType: clip(value.contentType, 256),
+    contentId: clip(value.contentId, 256),
+  }));
+  return { ...message, summaryTruncated };
+}
+
 function publicThread(row) {
   if (!row) return null;
   return {
@@ -680,6 +719,24 @@ export function createRepositories(db) {
       is_starred = @is_starred, labels_json = @labels_json, updated_at = @updated_at
       WHERE id = @id`),
     messageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
+    // This queue filters before LIMIT and spans all cached folders. Do not route
+    // it through the conversation UI's bounded list/search candidate window.
+    unanalyzedMessages: db.prepare(`SELECT
+        id, account_id, thread_id, mailbox, uid, rfc_message_id, in_reply_to,
+        references_json, subject, from_name, from_email, to_json, cc_json,
+        bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
+        labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
+        snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
+        smart_category_reason, created_at, updated_at
+      FROM messages
+      WHERE analyzed_at IS NULL AND (@accountId IS NULL OR account_id = @accountId)
+        AND (@afterTimestamp IS NULL OR
+          COALESCE(received_at, sent_at, created_at) > @afterTimestamp OR
+          (COALESCE(received_at, sent_at, created_at) = @afterTimestamp AND id > @afterId))
+      ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
+      LIMIT @limit`),
+    unanalyzedMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages
+      WHERE analyzed_at IS NULL AND (@accountId IS NULL OR account_id = @accountId)`),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
@@ -1026,6 +1083,16 @@ export function createRepositories(db) {
     messages: {
       get: (id) => publicMessage(queries.messageById.get(id)),
       getRaw: (id) => queries.messageById.get(id) || null,
+      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null } = {}) => {
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+          throw new RangeError('Review queue limit must be an integer from 1 to 200.');
+        }
+        // The read transaction keeps the count and page in the same snapshot.
+        const total = queries.unanalyzedMessageCount.get({ accountId }).count;
+        const rows = queries.unanalyzedMessages.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
+        const items = rows.slice(0, limit).map(publicReviewMessage);
+        return { items, total, hasMore: rows.length > limit };
+      }),
       list({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '', category = '', limit = 50, offset = 0 }) {
         const params = {
           accountId,
