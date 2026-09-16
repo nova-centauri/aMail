@@ -17,6 +17,7 @@ export function SettingsPanel({
   density,
   setDensity,
   onAddAccount,
+  onEditAccount,
   onUnlock,
   onSaveSignature,
   showUnified,
@@ -49,7 +50,7 @@ export function SettingsPanel({
         <div className="settings-scroll">
           <section className="settings-section">
             <h3>Accounts</h3>
-            <p className="settings-description">Choose which identity you are reading and sending as.</p>
+            <p className="settings-description">Choose an inbox, or edit an account to update its password, connection settings, or remove it from aMail.</p>
             <div className="settings-accounts">
               {showUnified && (
                 <button type="button" className={`settings-account ${!activeAccount ? 'is-active' : ''}`} onClick={() => setActiveAccount(null)}>
@@ -62,7 +63,8 @@ export function SettingsPanel({
                 </button>
               )}
               {accounts.map((account) => (
-                <button type="button" className={`settings-account ${activeAccount?.id === account.id ? 'is-active' : ''}`} key={account.id} onClick={() => setActiveAccount(account)}>
+                <div className="settings-account-row" key={account.id}>
+                <button type="button" className={`settings-account ${activeAccount?.id === account.id ? 'is-active' : ''}`} onClick={() => setActiveAccount(account)}>
                   <Avatar person={account} size="md" />
                   <span className="settings-account-copy"><strong>{account.name}</strong><small>{account.email}</small></span>
                   <span className="settings-account-meta">
@@ -70,6 +72,8 @@ export function SettingsPanel({
                     <Icon name={activeAccount?.id === account.id ? 'check' : 'chevronRight'} size={18} />
                   </span>
                 </button>
+                {!isDemo && onEditAccount && <button type="button" className="settings-account-edit" aria-label={`Edit account ${account.email}`} onClick={() => onEditAccount(account)}><Icon name="settings" size={16} /><span>Edit</span></button>}
+                </div>
               ))}
             </div>
             <button type="button" className="add-account-button" onClick={onAddAccount}><Icon name="plus" size={18} /> Add another account</button>

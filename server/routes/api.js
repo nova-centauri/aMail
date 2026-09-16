@@ -4,6 +4,7 @@ import { readSignedToken } from '../services/crypto.js';
 import { hydrateCidImages, hydrateRemoteContent } from '../services/message-html.js';
 import {
   accountTestInput,
+  accountLoginSettings,
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
@@ -274,6 +275,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   router.get('/accounts', (_request, response) => response.json({ accounts: repos.accounts.list() }));
+  router.get('/accounts/:id/settings', (request, response) => {
+    const existing = repos.accounts.getRaw(request.params.id);
+    if (!existing) throw new NotFoundError('Mail account not found.');
+    response.set('Cache-Control', 'private, no-store');
+    response.json({ account: repos.accounts.get(existing.id), credentials: accountLoginSettings(existing, config) });
+  });
   router.get('/accounts/providers', (request, response) => {
     const discoveryInput = {
       email: String(request.query.email || '').trim(),
@@ -295,7 +302,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     if (repos.accounts.getByEmailRaw(input.email)) throw new ConflictError('An account with this email already exists.');
     // Creation is atomic from the API's perspective: bad credentials or an
     // unreachable receiving/sending server never leave a broken saved account.
-    const connection = await mailService.testSettings(body);
+    const connection = await mailService.testSettings(accountTestInput(input, config));
     const account = repos.accounts.create(input);
     response.status(201).json({ account, connection });
   });
@@ -304,16 +311,24 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     if (!existing) throw new NotFoundError('Mail account not found.');
     const body = request.body || {};
     const input = serializeAccountInput(body, existing, config);
-    const connectionChanged = ['credentials', 'provider', 'serverHost', 'imap', 'smtp']
-      .some((field) => Object.hasOwn(body, field));
+    const connectionChanged = ['credential_ciphertext', 'provider', 'imap_host', 'imap_port', 'imap_secure', 'smtp_host', 'smtp_port', 'smtp_secure']
+      .some((field) => input[field] !== existing[field]);
     const connection = connectionChanged
-      ? await mailService.testSettings(accountTestInput(body, existing, config))
+      ? await mailService.testSettings(accountTestInput(input, config))
       : undefined;
+    const latest = repos.accounts.getRaw(existing.id);
+    if (!latest) throw new NotFoundError('Mail account not found.');
+    if (Object.keys(input).some((field) => JSON.stringify(latest[field]) !== JSON.stringify(existing[field]))) {
+      throw new ConflictError('This account changed while its connection was tested. Reload its settings and try again.');
+    }
     const account = repos.accounts.update(existing.id, input);
+    if (connectionChanged || input.sync_enabled !== existing.sync_enabled) mailService.invalidateAccount?.(existing.id);
     response.json({ account, ...(connection ? { connection } : {}) });
   });
   router.delete('/accounts/:id', (request, response) => {
     if (!repos.accounts.remove(request.params.id)) throw new NotFoundError('Mail account not found.');
+    // This is a local database cascade, never an IMAP mailbox/message delete.
+    mailService.invalidateAccount?.(request.params.id);
     response.status(204).end();
   });
   router.put('/accounts/:id/avatar', (request, response) => {

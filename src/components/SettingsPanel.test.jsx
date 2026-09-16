@@ -12,6 +12,20 @@ const account = {
 };
 
 describe('SettingsPanel signature editor', () => {
+  it('opens editing for the exact account without changing the selected inbox', async () => {
+    const onEditAccount = vi.fn();
+    const setActiveAccount = vi.fn();
+    render(<SettingsPanel open onClose={vi.fn()} accounts={[account]} activeAccount={null} setActiveAccount={setActiveAccount} privacy={{ privateImages: true }} setPrivacy={vi.fn()} density="Default" setDensity={vi.fn()} onAddAccount={vi.fn()} onEditAccount={onEditAccount} onUnlock={vi.fn()} onSaveSignature={vi.fn()} showUnified />);
+    await userEvent.click(screen.getByRole('button', { name: `Edit account ${account.email}` }));
+    expect(onEditAccount).toHaveBeenCalledWith(account);
+    expect(setActiveAccount).not.toHaveBeenCalled();
+  });
+
+  it('does not offer account mutations for preview identities', () => {
+    render(<SettingsPanel open onClose={vi.fn()} accounts={[account]} activeAccount={account} setActiveAccount={vi.fn()} privacy={{ privateImages: true }} setPrivacy={vi.fn()} density="Default" setDensity={vi.fn()} onAddAccount={vi.fn()} onEditAccount={vi.fn()} onUnlock={vi.fn()} onSaveSignature={vi.fn()} isDemo />);
+    expect(screen.queryByRole('button', { name: `Edit account ${account.email}` })).not.toBeInTheDocument();
+  });
+
   it('opens the HTML and visual editors for the selected account', async () => {
     render(
       <SettingsPanel

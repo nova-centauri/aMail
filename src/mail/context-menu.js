@@ -193,7 +193,8 @@ export function accountContextMenu(account, { active = false, handlers = {} } = 
     }),
   ];
   if (handlers.sync) items.push(item('sync', unified ? 'Sync all accounts' : 'Sync now', { icon: 'refresh', onSelect: () => handlers.sync(unified ? null : account) }));
-  if (handlers.openSettings) items.push(SEPARATOR, item('settings', unified ? 'Manage accounts' : 'Manage account in Settings', { icon: 'settings', onSelect: () => handlers.openSettings(unified ? null : account) }));
+  if (!unified && handlers.editAccount) items.push(SEPARATOR, item('edit', 'Edit account', { icon: 'settings', onSelect: () => handlers.editAccount(account) }));
+  else if (handlers.openSettings) items.push(SEPARATOR, item('settings', unified ? 'Manage accounts' : 'Manage account in Settings', { icon: 'settings', onSelect: () => handlers.openSettings(unified ? null : account) }));
   return { title: unified ? 'All inboxes' : account.email || account.name || 'Account', items };
 }
 

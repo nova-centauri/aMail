@@ -532,6 +532,43 @@ test('a hung IMAP session is closed at the deadline and does not block later syn
   await service.close();
 });
 
+test('changing or removing an account closes its pooled socket and invalidates recent sync results', async () => {
+  const { service, state } = syncHarness({ ...mailboxOf([1]), maxMessageBytes: 4096, syncMinIntervalMs: 60_000 });
+  await service.syncAccount('sync-account');
+  assert.equal(state.connects, 1);
+  service.invalidateAccount('sync-account');
+  assert.equal(state.clients[0].closed, true);
+  await service.syncAccount('sync-account');
+  assert.equal(state.connects, 2);
+  await service.close();
+});
+
+test('account invalidation stops an active fetch without writing deleted account sync state', async () => {
+  const { service, state } = syncHarness({ ...mailboxOf([1]), maxMessageBytes: 4096, fetchHangs: true });
+  const syncing = service.syncAccount('sync-account');
+  while (!state.clients[0]?.fetching) await new Promise((resolve) => setImmediate(resolve));
+  service.invalidateAccount('sync-account');
+  await assert.rejects(syncing, (error) => error.code === 'ACCOUNT_SETTINGS_CHANGED');
+  assert.equal(state.clients[0].closed, true);
+  assert.equal(state.savedSync, null);
+  assert.deepEqual(state.savedMessages, []);
+  assert.deepEqual(state.skips, []);
+  await service.close();
+});
+
+test('an account connection that finishes after invalidation cannot re-enter the pool', async () => {
+  const { service, state } = syncHarness({ ...mailboxOf([1]), maxMessageBytes: 4096, connectDelayMs: 15 });
+  const first = service.syncAccount('sync-account');
+  service.invalidateAccount('sync-account');
+  await assert.rejects(first);
+  assert.equal(state.clients[0].closed, true);
+  assert.deepEqual(state.savedMessages, []);
+  await service.syncAccount('sync-account');
+  assert.equal(state.connects, 2);
+  assert.equal(state.savedMessages.length, 1);
+  await service.close();
+});
+
 test('only replies fall back to subject threading', async () => {
   const header = (uid, subject, extra = []) => Buffer.from([
     'From: Sender <sender@example.test>',

@@ -9,6 +9,8 @@ import { createDatabase, createRepositories } from '../db.js';
 import { ServiceUnavailableError } from '../errors.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerApi } from './api.js';
+import { decryptJson } from '../services/crypto.js';
+import { serializeAccountInput } from '../services/account-input.js';
 
 function messageInput({ accountId, threadId, uid, subject, fromEmail, timestamp }) {
   return {
@@ -374,10 +376,16 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal((await invalidResponse.json()).error.code, 'VALIDATION_ERROR');
 
   const accountPayload = {
+    // Match AccountConnectForm.submit, including its legacy credentials.email.
+    name: 'New account',
     email: 'new-account@gmail.com',
     displayName: 'New account',
     provider: 'gmail',
-    credentials: { username: 'new-account@gmail.com', password: 'test-app-password' },
+    credentials: { username: 'new-account@gmail.com', email: 'new-account@gmail.com', password: 'test-app-password' },
+    signature: '',
+    color: '#1a73e8',
+    imap: { host: 'imap.gmail.com', port: 993, secure: true },
+    smtp: { host: 'smtp.gmail.com', port: 465, secure: true },
   };
   rejectConnection = true;
   const rejected = await fetch(`${origin}/api/accounts`, {
@@ -399,6 +407,7 @@ test('message API filters unified mail by smart category and account creation is
   assert.doesNotMatch(createdText, /test-app-password/);
   const created = JSON.parse(createdText);
   assert.equal(created.account.provider, 'gmail');
+  assert.deepEqual(decryptJson(repos.accounts.getRaw(created.account.id).credential_ciphertext, config.credentialKey), accountPayload.credentials);
   assert.deepEqual(created.connection, { imap: true, smtp: true });
 
   const disabledSync = await fetch(`${origin}/api/accounts/${created.account.id}`, {
@@ -418,4 +427,134 @@ test('message API filters unified mail by smart category and account creation is
   });
   assert.equal(rejectedUpdate.status, 503);
   assert.equal(repos.accounts.getRaw(created.account.id).credential_ciphertext, beforeRejectedUpdate);
+});
+
+test('account settings hide secrets, preserve blank passwords, verify changes atomically, and remove only local data', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-account-settings-'));
+  const config = { dataDir, dbPath: path.join(dataDir, 'mail.sqlite'), credentialKey: Buffer.alloc(32, 7), accessToken: 'settings-test-token' };
+  const database = createDatabase(config);
+  const repos = createRepositories(database);
+  const originalCredentials = {
+    username: 'owner@me.com', imapUsername: 'owner', smtpUsername: 'owner@me.com',
+    password: 'old-app-password', imapPassword: 'old-imap-password', smtpPassword: 'old-smtp-password',
+    accessToken: 'old-oauth-token', imapAccessToken: 'old-imap-token', smtpAccessToken: 'old-smtp-token',
+  };
+  // Seed a legacy mixed credential blob to ensure password replacement clears
+  // hidden higher-priority credentials, while a blank field preserves them.
+  const account = repos.accounts.create(serializeAccountInput({
+    email: 'owner@me.com', displayName: 'Owner', provider: 'icloud', credentials: originalCredentials,
+  }, null, config));
+  const untouched = repos.accounts.create(serializeAccountInput({
+    email: 'other@example.test', provider: 'gmail', credentials: { password: 'other-password' },
+  }, null, config));
+  let rejectConnection = false;
+  let whileTesting = () => {};
+  const probes = [];
+  const invalidated = [];
+  const mailService = {
+    async testSettings(settings) {
+      probes.push(settings);
+      whileTesting();
+      if (rejectConnection) throw new ServiceUnavailableError('Credentials were rejected.', 'IMAP_AUTH_FAILED');
+      return { imap: true, smtp: true };
+    },
+    invalidateAccount(id) { invalidated.push(id); },
+    // Removing an account must never call an IMAP delete, send, or sync API.
+    async updateMessageState() { assert.fail('Account removal must not mutate provider messages'); },
+    async syncAccount() { assert.fail('Account removal must not synchronize provider mail'); },
+    async sendMessage() { assert.fail('Account removal must not send mail'); },
+  };
+  const app = express();
+  app.use(express.json());
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  app.use(errorHandler({ error() {} }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}/api/accounts`;
+  const headers = { Authorization: `Bearer ${config.accessToken}`, 'Content-Type': 'application/json' };
+  const patch = (body) => fetch(`${origin}/${account.id}`, { method: 'PATCH', headers, body: JSON.stringify(body) });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  assert.equal((await fetch(`${origin}/${account.id}/settings`)).status, 401);
+  const read = await fetch(`${origin}/${account.id}/settings`, { headers });
+  assert.equal(read.status, 200);
+  assert.equal(read.headers.get('cache-control'), 'private, no-store');
+  const readText = await read.text();
+  for (const secret of Object.entries(originalCredentials).filter(([key]) => /password|token/i.test(key)).map(([, value]) => value)) {
+    assert.equal(readText.includes(secret), false);
+  }
+  assert.equal(readText.includes('credential_ciphertext'), false);
+  const settings = JSON.parse(readText);
+  assert.deepEqual(settings.credentials, { username: 'owner@me.com', imapUsername: 'owner', smtpUsername: 'owner@me.com', authType: 'oauth2' });
+  assert.deepEqual(settings.account.imap, account.imap);
+  assert.deepEqual(settings.account.smtp, account.smtp);
+  assert.equal((await fetch(`${origin}/missing/settings`, { headers })).status, 404);
+
+  const before = repos.accounts.getRaw(account.id);
+  assert.equal((await patch({ displayName: 'Personal mail', credentials: { password: '' } })).status, 200);
+  assert.equal((await patch({ color: '#334455' })).status, 200);
+  assert.equal(repos.accounts.getRaw(account.id).credential_ciphertext, before.credential_ciphertext);
+  assert.equal(probes.length, 0);
+  assert.equal(invalidated.length, 0);
+  const connectionBefore = repos.accounts.getRaw(account.id);
+  rejectConnection = true;
+  const failed = await patch({ credentials: { password: 'wrong-new-password' }, displayName: 'Should not save', imap: { host: 'imap.changed.test' } });
+  assert.equal(failed.status, 503);
+  assert.deepEqual(repos.accounts.getRaw(account.id), connectionBefore);
+  assert.equal(invalidated.length, 0);
+
+  rejectConnection = false;
+  whileTesting = () => assert.deepEqual(repos.accounts.getRaw(account.id), connectionBefore);
+  const saved = await patch({ credentials: { password: 'new-app-password' } });
+  assert.equal(saved.status, 200);
+  const savedText = await saved.text();
+  assert.doesNotMatch(savedText, /new-app-password|old-oauth-token|credential_ciphertext/);
+  assert.deepEqual(probes.at(-1).credentials, { username: 'owner@me.com', imapUsername: 'owner', smtpUsername: 'owner@me.com', password: 'new-app-password' });
+  assert.deepEqual(probes.at(-1).imap, settings.account.imap);
+  assert.deepEqual(probes.at(-1).smtp, settings.account.smtp);
+  const stored = repos.accounts.getRaw(account.id);
+  assert.notEqual(stored.credential_ciphertext, before.credential_ciphertext);
+  assert.equal(stored.credential_ciphertext.includes('new-app-password'), false);
+  assert.deepEqual(decryptJson(stored.credential_ciphertext, config.credentialKey), probes.at(-1).credentials);
+  assert.deepEqual(invalidated, [account.id]);
+  whileTesting = () => {};
+  assert.equal((await patch({ email: 'different@me.com' })).status, 400);
+  assert.equal((await patch({ credentials: [] })).status, 400);
+  assert.equal((await patch({ credentials: { password: null } })).status, 400);
+
+  whileTesting = () => repos.accounts.update(account.id, { display_name: 'Changed in another tab' });
+  assert.equal((await patch({ credentials: { password: 'would-overwrite-newer-settings' } })).status, 409);
+  assert.equal(repos.accounts.get(account.id).displayName, 'Changed in another tab');
+  assert.equal(decryptJson(repos.accounts.getRaw(account.id).credential_ciphertext, config.credentialKey).password, 'new-app-password');
+  whileTesting = () => {};
+
+  const timestamp = '2026-09-16T12:00:00.000Z';
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Local sample', normalized_subject: 'local sample', latest_at: timestamp });
+  repos.messages.upsert(messageInput({ accountId: account.id, threadId: thread.id, uid: 1, subject: 'Local sample', fromEmail: 'friend@example.test', timestamp }));
+  repos.drafts.create({ account_id: account.id, thread_id: thread.id, to_json: '[]', cc_json: '[]', bcc_json: '[]', subject: 'Draft', html_body: '', text_body: '', attachments_json: '[]' });
+  repos.sync.save({ account_id: account.id, mailbox: 'INBOX', last_uid: 1, uid_validity: 5, last_error: null, synced_at: timestamp });
+  repos.sync.recordSkip({ account_id: account.id, mailbox: 'INBOX', uid: 2, reason: 'test' });
+  const removed = await fetch(`${origin}/${account.id}`, { method: 'DELETE', headers });
+  assert.equal(removed.status, 204);
+  assert.equal(repos.accounts.get(account.id), null);
+  assert.ok(repos.accounts.get(untouched.id));
+  for (const table of ['messages', 'threads', 'drafts', 'sync_state', 'sync_skips']) {
+    assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE account_id = ?`).get(account.id).count, 0);
+  }
+  assert.deepEqual(invalidated, [account.id, account.id]);
+  assert.equal((await fetch(`${origin}/${account.id}`, { method: 'DELETE', headers })).status, 404);
+
+  // Removing and adding again is available, but produces a fresh local account.
+  const readded = await fetch(origin, { method: 'POST', headers, body: JSON.stringify({ email: account.email, provider: 'icloud', credentials: { username: account.email, password: 'new-app-password' } }) });
+  assert.equal(readded.status, 201);
+  assert.notEqual((await readded.json()).account.id, account.id);
+
+  whileTesting = () => repos.accounts.remove(untouched.id);
+  const removedWhileTesting = await fetch(`${origin}/${untouched.id}`, { method: 'PATCH', headers, body: JSON.stringify({ credentials: { password: 'replacement-after-removal' } }) });
+  assert.equal(removedWhileTesting.status, 404);
+  assert.equal(repos.accounts.get(untouched.id), null);
 });

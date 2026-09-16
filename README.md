@@ -123,6 +123,10 @@ Nothing to migrate. A GigaMail `.env` works unchanged, an existing `gigamail.sql
 
 Connections are verified in memory before anything is saved. `GET /api/accounts/providers` and `POST /api/accounts/test` expose the same discovery and rate-limited check to agents.
 
+To update an existing account, open **Quick settings → Accounts → Edit** (or right-click the account and choose **Edit account**). Enter a replacement app-specific password and select **Test & save changes**; leave the password blank to keep the saved credential. Display name, sync, and advanced IMAP/SMTP settings can also be edited. Saved passwords are never returned to the browser.
+
+**Remove account…** opens a separate confirmation. Removing an account deletes its cached messages, local drafts, and analyzed status from aMail, without deleting mail at the provider. You can add the account again afterward; its downloaded messages will need to be analyzed again.
+
 ## Search and smart views
 
 Search uses SQLite FTS5 plus Gmail-style operators: `from:`, `to:`, `subject:`, `has:attachment`, `after:`/`before:YYYY-MM-DD`, `newer_than:7d`, `older_than:2w`, `is:unread`, `is:starred`, `is:unanalyzed`, `is:analyzed`, `in:sent`. Explicit searches also surface the quiet ops digests that the default inbox hides.

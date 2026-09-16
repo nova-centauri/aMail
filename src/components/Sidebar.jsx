@@ -6,7 +6,7 @@ import { ContextMenu, useContextMenu } from './ContextMenu.jsx';
 import { Icon } from './Icon.jsx';
 import { Avatar, IconButton } from './ui.jsx';
 
-export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setActiveFolder, counts, onCompose, accounts, activeAccount, setActiveAccount, onSelectUnified, onOpenSettings, isDemo, onAddAccount, activePersonFlag, onSelectPersonFlag, personFlags = [], onManageFlags, agentQueueActive = false, onSelectAgentQueue, onSyncAccount }) {
+export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setActiveFolder, counts, onCompose, accounts, activeAccount, setActiveAccount, onSelectUnified, onOpenSettings, isDemo, onAddAccount, onEditAccount, activePersonFlag, onSelectPersonFlag, personFlags = [], onManageFlags, agentQueueActive = false, onSelectAgentQueue, onSyncAccount }) {
   const [showMore, setShowMore] = useState(false);
   const displayAccounts = accounts.length ? accounts : isDemo ? demoAccounts : [];
   const items = showMore
@@ -20,6 +20,7 @@ export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setA
       selectAccount: (item) => { setActiveAccount(item); onCloseMobile(); },
       selectUnified: () => { onSelectUnified(); onCloseMobile(); },
       sync: onSyncAccount && !isDemo ? onSyncAccount : undefined,
+      editAccount: onEditAccount && !isDemo ? (item) => { onEditAccount(item); onCloseMobile(); } : undefined,
       openSettings: () => { onOpenSettings(); onCloseMobile(); },
     },
   }));
@@ -105,7 +106,10 @@ export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setA
           <div className="accounts-section">
             <div className="side-section-heading">
               <span>Accounts</span>
+              <span className="account-heading-actions">
+              <IconButton label="Manage accounts" onClick={() => { onOpenSettings(); onCloseMobile(); }}><Icon name="settings" size={17} /></IconButton>
               <IconButton label="Add account" onClick={() => { onAddAccount?.(); onCloseMobile(); }}><Icon name="plus" size={18} /></IconButton>
+              </span>
             </div>
             {accounts.length > 0 && (
               <button type="button" className={`account-row unified-account-row ${!activeAccount ? 'is-active' : ''}`} onClick={() => { onSelectUnified(); onCloseMobile(); }} onContextMenu={(event) => openAccountMenu(event, null)} title={compact ? 'All inboxes' : undefined}>

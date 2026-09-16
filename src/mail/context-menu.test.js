@@ -183,6 +183,19 @@ describe('draftContextMenu', () => {
 });
 
 describe('accountContextMenu', () => {
+  it('opens the exact account editor while unified still opens account settings', () => {
+    const account = { id: 'a1', email: 'ops@example.com' };
+    const handlers = { editAccount: vi.fn(), openSettings: vi.fn() };
+    const menu = accountContextMenu(account, { handlers });
+    find(menu, 'edit').onSelect();
+    expect(handlers.editAccount).toHaveBeenCalledWith(account);
+    expect(handlers.openSettings).not.toHaveBeenCalled();
+    const unified = accountContextMenu(null, { handlers });
+    expect(find(unified, 'edit')).toBeUndefined();
+    find(unified, 'settings').onSelect();
+    expect(handlers.openSettings).toHaveBeenCalledWith(null);
+  });
+
   it('describes a connected account and syncs just that account', () => {
     const handlers = { selectAccount: vi.fn(), selectUnified: vi.fn(), sync: vi.fn(), openSettings: vi.fn() };
     const account = { id: 'a1', email: 'ops@example.com', name: 'Ops' };

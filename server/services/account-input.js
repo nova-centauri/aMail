@@ -25,6 +25,51 @@ export function parseAvatar(dataUrl) {
   return { avatar_blob: buffer, avatar_mime: match[1].toLowerCase() };
 }
 
+const CREDENTIAL_FIELDS = new Set([
+  // The account connection form includes email as legacy credential metadata;
+  // authentication still uses the explicit usernames or the account email.
+  'email', 'username', 'user', 'imapUsername', 'imapUser', 'smtpUsername', 'smtpUser',
+  'password', 'imapPassword', 'smtpPassword', 'accessToken', 'imapAccessToken', 'smtpAccessToken',
+]);
+
+function mergedCredentials(patch, current = {}) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw new ValidationError('Account credentials must be an object.');
+  }
+  for (const [field, value] of Object.entries(patch)) {
+    if (!CREDENTIAL_FIELDS.has(field) || typeof value !== 'string' || value.length > 16_384) {
+      throw new ValidationError('Account credentials contain an invalid field.');
+    }
+  }
+  const merged = { ...current };
+  // A replacement app password applies to both protocols. Old OAuth tokens
+  // and protocol-specific passwords would otherwise silently win in buildAuth.
+  if (patch.password) {
+    for (const field of ['password', 'imapPassword', 'smtpPassword', 'accessToken', 'imapAccessToken', 'smtpAccessToken']) {
+      delete merged[field];
+    }
+  }
+  for (const [field, value] of Object.entries(patch)) {
+    // Empty password inputs mean "keep the saved password", never "erase it".
+    if (/Password$|^password$/.test(field) && value === '') continue;
+    merged[field] = value;
+  }
+  return merged;
+}
+
+export function accountLoginSettings(existing, config) {
+  const credentials = decryptJson(existing.credential_ciphertext, config.credentialKey);
+  const username = String(credentials.username || credentials.user || existing.email).trim();
+  // An explicit allowlist is essential: stored credentials also contain
+  // passwords and OAuth tokens, which must never be returned to the browser.
+  return {
+    username,
+    imapUsername: String(credentials.imapUsername || credentials.imapUser || username).trim(),
+    smtpUsername: String(credentials.smtpUsername || credentials.smtpUser || username).trim(),
+    authType: credentials.accessToken || credentials.imapAccessToken || credentials.smtpAccessToken ? 'oauth2' : 'password',
+  };
+}
+
 export function serializeAccountInput(body, existing, config) {
   const email = String(body.email ?? existing?.email ?? '').trim().toLowerCase();
   if (!isEmail(email)) throw new ValidationError('A valid account email is required.');
@@ -44,8 +89,11 @@ export function serializeAccountInput(body, existing, config) {
   });
   let credentials;
   if (body.credentials !== undefined) {
-    if (!body.credentials || typeof body.credentials !== 'object') throw new ValidationError('Account credentials are required.');
-    credentials = encryptJson(body.credentials, config.credentialKey);
+    const current = existing ? decryptJson(existing.credential_ciphertext, config.credentialKey) : {};
+    const merged = mergedCredentials(body.credentials, current);
+    credentials = existing && JSON.stringify(current) === JSON.stringify(merged)
+      ? existing.credential_ciphertext
+      : encryptJson(merged, config.credentialKey);
   } else if (existing) {
     credentials = existing.credential_ciphertext;
   } else {
@@ -74,23 +122,20 @@ export function serializeAccountInput(body, existing, config) {
   };
 }
 
-export function accountTestInput(body, existing, config) {
+export function accountTestInput(input, config) {
   return {
-    email: existing.email,
-    provider: body.provider ?? existing.provider,
-    serverHost: body.serverHost,
+    email: input.email,
+    provider: input.provider,
     imap: {
-      host: existing.imap_host,
-      port: existing.imap_port,
-      secure: Boolean(existing.imap_secure),
-      ...(body.imap || {}),
+      host: input.imap_host,
+      port: input.imap_port,
+      secure: Boolean(input.imap_secure),
     },
     smtp: {
-      host: existing.smtp_host,
-      port: existing.smtp_port,
-      secure: Boolean(existing.smtp_secure),
-      ...(body.smtp || {}),
+      host: input.smtp_host,
+      port: input.smtp_port,
+      secure: Boolean(input.smtp_secure),
     },
-    credentials: body.credentials ?? decryptJson(existing.credential_ciphertext, config.credentialKey),
+    credentials: decryptJson(input.credential_ciphertext, config.credentialKey),
   };
 }

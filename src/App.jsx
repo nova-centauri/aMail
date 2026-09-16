@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
 import { AccessPanel } from './components/AccessPanel.jsx';
 import { AddAccountModal } from './components/AddAccountModal.jsx';
+import { EditAccountModal } from './components/EditAccountModal.jsx';
 import { ComposeModal } from './components/ComposeModal.jsx';
 import { OnboardingWizard } from './components/OnboardingWizard.jsx';
 import { Icon } from './components/Icon.jsx';
@@ -64,6 +65,7 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(false);
   const [addAccountOpen, setAddAccountOpen] = useState(false);
+  const [editingAccount, setEditingAccount] = useState(null);
   const [passkeyCount, setPasskeyCount] = useState(0);
   const [keyMode, setKeyMode] = useState('env');
   const [passkeys, setPasskeys] = useState([]);
@@ -650,6 +652,8 @@ export default function App() {
 
   useEffect(() => {
     const handleKeys = (event) => {
+      // Account editing owns its keyboard; never mutate mail behind this dialog.
+      if (editingAccount) return;
       // Open context menus own their keys (arrows, Enter, Escape, typeahead).
       if (event.target?.closest?.('[role="menu"]')) return;
       const action = shortcutAction(event);
@@ -695,7 +699,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeys);
     return () => window.removeEventListener('keydown', handleKeys);
-  }, [composeOpen, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds]);
+  }, [composeOpen, editingAccount, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds]);
 
   const loadRemoteContent = async (message) => {
     try {
@@ -824,6 +828,7 @@ export default function App() {
     setComposeOpen(false);
     setComposeContext(null);
     setAddAccountOpen(false);
+    setEditingAccount(null);
     try {
       await api('/session', { method: 'DELETE' });
     } catch {
@@ -924,6 +929,38 @@ export default function App() {
     }
   };
 
+  const openAccountEditor = (account) => {
+    if (isDemo || !account?.id) return;
+    setProfileOpen(false);
+    setMobileSidebarOpen(false);
+    setEditingAccount(account);
+  };
+
+  const accountUpdated = (account) => {
+    // Discard list requests that started before the saved change.
+    loadRequestRef.current += 1;
+    setAccounts((current) => current.map((item) => item.id === account.id ? account : item));
+    setActiveAccount((current) => current?.id === account.id ? account : current);
+    setNotice(`${account.email} settings saved.`);
+    setSessionStamp((current) => current + 1);
+  };
+
+  const accountRemoved = (accountId) => {
+    loadRequestRef.current += 1;
+    setAccounts((current) => current.filter((item) => item.id !== accountId));
+    setActiveAccount(null);
+    setSelectedThread(null);
+    setSelectedIds([]);
+    setThreads([]);
+    setSavedDrafts([]);
+    setMailTotal(0);
+    setFolderCounts({ ...EMPTY_FOLDER_COUNTS });
+    setCategoryCounts(countSmartCategories([]));
+    setNotice('Account removed from aMail. Mail at the provider was not deleted.');
+    // Refresh with the newly selected unified scope, including last-account removal.
+    setSessionStamp((current) => current + 1);
+  };
+
   const accountAdded = (account) => {
     setOffline(false);
     setAccounts((current) => [...current.filter((item) => item.id !== account.id), account]);
@@ -986,6 +1023,7 @@ export default function App() {
         onSelectUnified={() => setActiveAccount(null)}
         onOpenSettings={() => setSettingsOpen(true)}
         onAddAccount={() => setAddAccountOpen(true)}
+        onEditAccount={openAccountEditor}
         activePersonFlag={activePersonFlag}
         onSelectPersonFlag={selectPersonFlag}
         personFlags={effectivePersonFlags}
@@ -1053,6 +1091,7 @@ export default function App() {
         density={density}
         setDensity={updateDensity}
         onAddAccount={() => setAddAccountOpen(true)}
+        onEditAccount={openAccountEditor}
         onUnlock={() => setAccessOpen(true)}
         onSaveSignature={saveAccountSignature}
         showUnified={hasConnectedAccounts}
@@ -1069,6 +1108,7 @@ export default function App() {
       />
       <ProfileMenu open={profileOpen} onClose={() => setProfileOpen(false)} account={displayAccount} accounts={identityAccounts} setActiveAccount={setActiveAccount} onSelectUnified={() => setActiveAccount(null)} onOpenSettings={() => setSettingsOpen(true)} onLogout={lockSession} showUnified={hasConnectedAccounts} />
       {addAccountOpen && <AddAccountModal onClose={() => setAddAccountOpen(false)} onAdded={accountAdded} />}
+      {editingAccount && authenticated && !authRequired && <EditAccountModal key={editingAccount.id} account={editingAccount} onClose={() => setEditingAccount(null)} onUpdated={accountUpdated} onRemoved={accountRemoved} removalBlockedReason={composeOpen ? 'Close the open draft before removing an account.' : ''} />}
       {onboardingOpen && authenticated && !authRequired && (
         <OnboardingWizard
           accounts={accounts}

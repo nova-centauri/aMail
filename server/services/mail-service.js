@@ -441,6 +441,13 @@ export function createMailService({
   const newSmtpTransport = (account, credentials) => createSmtpTransport(buildSmtpOptions(account, credentials, config));
   const attachmentCache = new Map();
   const imapPool = new Map();
+  const accountGenerations = new Map();
+  const accountGeneration = (accountId) => accountGenerations.get(accountId) || 0;
+  const assertAccountGeneration = (accountId, generation) => {
+    if (accountGeneration(accountId) !== generation) {
+      throw new ServiceUnavailableError('Mail account settings changed; start a new connection.', 'ACCOUNT_SETTINGS_CHANGED');
+    }
+  };
   const poolIdleMs = Number.isSafeInteger(config.imapPoolIdleMs) ? config.imapPoolIdleMs : DEFAULT_IMAP_POOL_IDLE_MS;
   // Once a mailbox has spent this long importing, it stops after the current
   // page and reports `remaining`; the rest drains on following passes.
@@ -473,12 +480,14 @@ export function createMailService({
   const poolConnecting = new Map();
 
   async function acquirePooledClient(account, credentials) {
+    const generation = accountGeneration(account.id);
     // Callers that arrive while the session is still connecting (a thread-wide
     // action fans out one call per message) share that one attempt, including
     // its failure: retrying a rejected login once per waiter is how accounts
     // get locked out.
     const pending = poolConnecting.get(account.id);
     if (pending) await pending;
+    assertAccountGeneration(account.id, generation);
     const existing = imapPool.get(account.id);
     if (existing?.usable) {
       existing.refs += 1;
@@ -486,7 +495,7 @@ export function createMailService({
       clearPoolTimer(existing);
       return existing;
     }
-    const connecting = openPooledClient(account, credentials, existing);
+    const connecting = openPooledClient(account, credentials, existing, generation);
     poolConnecting.set(account.id, connecting);
     try {
       return await connecting;
@@ -495,11 +504,13 @@ export function createMailService({
     }
   }
 
-  async function openPooledClient(account, credentials, existing) {
+  async function openPooledClient(account, credentials, existing, generation) {
     if (existing) await evictPoolEntry(account.id);
+    assertAccountGeneration(account.id, generation);
     const client = newImapClient(account, credentials, { pooled: true });
     try {
       await client.connect();
+      assertAccountGeneration(account.id, generation);
       if (failedImapClients.has(client)) throw new Error('IMAP connection closed during setup');
     } catch (error) {
       // A failed connection never enters the pool; close any partially opened
@@ -511,6 +522,7 @@ export function createMailService({
       client,
       account,
       credentials,
+      generation,
       refs: 1,
       usable: true,
       folders: null,
@@ -612,9 +624,10 @@ export function createMailService({
     });
   }
 
-  async function ingestImapMessage({ account, mailbox, role, allMailMirror = false, message }) {
+  async function ingestImapMessage({ account, mailbox, role, allMailMirror = false, message, generation }) {
     if (!message.source) return null;
     const parsed = await simpleParser(message.source);
+    assertAccountGeneration(account.id, generation);
     const envelope = message.envelope || {};
     const messageId = parsed.messageId || envelope.messageId || null;
     const references = normalizeMessageIds(parsed.references || envelope.references);
@@ -674,7 +687,7 @@ export function createMailService({
     };
   }
 
-  async function syncMailbox({ account, client, descriptor, limit }) {
+  async function syncMailbox({ account, client, descriptor, limit, generation }) {
     const { mailbox, role, allMailMirror = false } = descriptor;
     const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
       ? config.syncMaxMessageBytes
@@ -692,6 +705,7 @@ export function createMailService({
     const pendingWrites = [];
 
     const persistPayloads = (payloads) => {
+      assertAccountGeneration(account.id, generation);
       if (!payloads.length) return;
       const write = () => {
         for (const payload of payloads) {
@@ -725,6 +739,7 @@ export function createMailService({
     };
 
     const saveProgress = () => {
+      assertAccountGeneration(account.id, generation);
       repos.sync.save({
         account_id: account.id,
         mailbox,
@@ -743,6 +758,7 @@ export function createMailService({
           mailbox,
           role,
           allMailMirror,
+          generation,
           message: { ...message, source },
         });
         if (payload) {
@@ -750,6 +766,7 @@ export function createMailService({
           if (pendingWrites.length >= SYNC_WRITE_CHUNK) flushWrites();
         }
       } catch (error) {
+        assertAccountGeneration(account.id, generation);
         // A message the parser or the database rejects must not pin the
         // window: retrying it on every cycle costs the full fetch and parse
         // each time and blocks everything newer in the mailbox.
@@ -807,6 +824,7 @@ export function createMailService({
 
     try {
       lock = await client.getMailboxLock(mailbox);
+      assertAccountGeneration(account.id, generation);
       uidValidity = Number(client.mailbox?.uidValidity) || null;
       const previousUidValidity = Number(previousSync?.uid_validity) || null;
       if (previousUidValidity && uidValidity && previousUidValidity !== uidValidity) {
@@ -884,6 +902,7 @@ export function createMailService({
         uidValidityChanged,
       };
     } catch (error) {
+      assertAccountGeneration(account.id, generation);
       flushWrites();
       repos.sync.save({
         account_id: account.id,
@@ -901,6 +920,7 @@ export function createMailService({
   }
 
   async function runSyncAccount(accountId, { mailbox, limit = config.syncBatchSize } = {}) {
+    const generation = accountGeneration(accountId);
     const { account, credentials } = accountAndCredentials(accountId);
     const explicitMailbox = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : null;
     // Existing UI clients ask to sync "INBOX". Treat that as the normal account
@@ -928,14 +948,16 @@ export function createMailService({
 
     try {
       const folders = singleMailbox ? null : await pooledList(entry);
+      assertAccountGeneration(accountId, generation);
       const descriptors = singleMailbox
         ? [{ mailbox: explicitMailbox, role: folderForMailbox(explicitMailbox), allMailMirror: false }]
         : discoverSyncMailboxes(folders);
       const mailboxes = [];
       for (const descriptor of descriptors) {
         try {
-          mailboxes.push(await syncMailbox({ account, client, descriptor, limit }));
+          mailboxes.push(await syncMailbox({ account, client, descriptor, limit, generation }));
         } catch {
+          assertAccountGeneration(accountId, generation);
           const failed = { mailbox: descriptor.mailbox, role: descriptor.role, status: 'failed', imported: 0, error: 'IMAP_SYNC_FAILED' };
           mailboxes.push(failed);
           if (singleMailbox) {
@@ -986,13 +1008,13 @@ export function createMailService({
   // until the process restarts. Past the deadline the socket is destroyed
   // (LOGOUT would queue behind the stuck command), which rejects whatever is
   // pending and lets the pass finish with this account marked failed.
-  function withSyncDeadline(accountId, promise) {
+  function withSyncDeadline(accountId, promise, generation) {
     if (accountTimeoutMs <= 0) return promise;
     let timer;
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => {
         const entry = imapPool.get(accountId);
-        if (entry) {
+        if (entry?.generation === generation) {
           imapPool.delete(accountId);
           clearPoolTimer(entry);
           entry.usable = false;
@@ -1011,6 +1033,7 @@ export function createMailService({
   const accountSyncKey = (accountId, { mailbox, limit }) => `${accountId}\u0000${syncKey({ mailbox, limit })}`;
 
   async function syncAccount(accountId, { mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false } = {}) {
+    const generation = accountGeneration(accountId);
     const key = accountSyncKey(accountId, { mailbox, limit });
     const pending = accountInFlight.get(key);
     if (pending) return pending;
@@ -1018,14 +1041,15 @@ export function createMailService({
     const age = Math.max(Number(maxAgeMs) || 0, floor);
     const last = accountLastSync.get(key);
     if (age > 0 && last && Date.now() - last.finishedAt < age) return last.result;
-    const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit }));
+    const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit }), generation);
     accountInFlight.set(key, promise);
     try {
       const result = await promise;
+      assertAccountGeneration(accountId, generation);
       accountLastSync.set(key, { finishedAt: Date.now(), result });
       return result;
     } finally {
-      accountInFlight.delete(key);
+      if (accountInFlight.get(key) === promise) accountInFlight.delete(key);
     }
   }
 
@@ -1083,6 +1107,7 @@ export function createMailService({
   // a run that finished recently instead of starting another.
   let inFlightSync = null;
   let lastFullSync = null;
+  let settingsGeneration = 0;
   const syncKey = ({ mailbox, limit }) => {
     const target = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : 'INBOX';
     return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
@@ -1099,11 +1124,12 @@ export function createMailService({
     if (age > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < age) {
       return lastFullSync.results;
     }
+    const generation = settingsGeneration;
     const promise = runSyncAll({ mailbox, limit, force }).finally(() => afterSyncMaintenance());
     inFlightSync = { key, promise };
     try {
       const results = await promise;
-      lastFullSync = { key, finishedAt: Date.now(), results };
+      if (generation === settingsGeneration) lastFullSync = { key, finishedAt: Date.now(), results };
       return results;
     } finally {
       inFlightSync = null;
@@ -1113,6 +1139,27 @@ export function createMailService({
   async function close() {
     const ids = [...imapPool.keys()];
     await Promise.all(ids.map((id) => evictPoolEntry(id)));
+  }
+
+  function invalidateAccount(accountId) {
+    // Retire the session immediately: LOGOUT can queue behind a stuck FETCH.
+    // Generation checks also retire connections still opening and prevent a
+    // parser that finishes later from repopulating an account's local cache.
+    accountGenerations.set(accountId, accountGeneration(accountId) + 1);
+    settingsGeneration += 1;
+    const entry = imapPool.get(accountId);
+    if (entry) {
+      imapPool.delete(accountId);
+      clearPoolTimer(entry);
+      entry.usable = false;
+      try { entry.client.close?.(); } catch { /* Already closed. */ }
+    }
+    poolConnecting.delete(accountId);
+    for (const key of accountInFlight.keys()) if (key.startsWith(`${accountId}\u0000`)) accountInFlight.delete(key);
+    for (const key of accountLastSync.keys()) if (key.startsWith(`${accountId}\u0000`)) accountLastSync.delete(key);
+    // Small transient caches contain message ids, so clear them conservatively.
+    attachmentCache.clear();
+    lastFullSync = null;
   }
 
   async function fetchAttachment(messageId, index, { strict = false } = {}) {
@@ -1571,5 +1618,5 @@ export function createMailService({
     }
   }
 
-  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, close };
+  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, invalidateAccount, close };
 }

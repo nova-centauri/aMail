@@ -469,7 +469,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     assertProbeAllowed();
     const input = serializeAccountInput(body, null, config);
     if (repos.accounts.getByEmailRaw(input.email)) throw new ConflictError('An account with this email already exists.');
-    const connection = await mailService.testSettings(body);
+    const connection = await mailService.testSettings(accountTestInput(input, config));
     const account = repos.accounts.create(input);
     return {
       account: sanitizeAccountPayload(publicAccountSummary(account)),
@@ -496,13 +496,19 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     const existing = repos.accounts.getRaw(body.id);
     if (!existing) throw new NotFoundError('Mail account not found.');
     const input = serializeAccountInput(body, existing, config);
-    const connectionChanged = ['credentials', 'provider', 'serverHost', 'imap', 'smtp']
-      .some((field) => Object.hasOwn(body, field) && body[field] !== undefined);
+    const connectionChanged = ['credential_ciphertext', 'provider', 'imap_host', 'imap_port', 'imap_secure', 'smtp_host', 'smtp_port', 'smtp_secure']
+      .some((field) => input[field] !== existing[field]);
     if (connectionChanged) assertProbeAllowed();
     const connection = connectionChanged
-      ? await mailService.testSettings(accountTestInput(body, existing, config))
+      ? await mailService.testSettings(accountTestInput(input, config))
       : undefined;
+    const latest = repos.accounts.getRaw(existing.id);
+    if (!latest) throw new NotFoundError('Mail account not found.');
+    if (Object.keys(input).some((field) => JSON.stringify(latest[field]) !== JSON.stringify(existing[field]))) {
+      throw new ConflictError('This account changed while its connection was tested. Reload its settings and try again.');
+    }
     const account = repos.accounts.update(existing.id, input);
+    if (connectionChanged || input.sync_enabled !== existing.sync_enabled) mailService.invalidateAccount?.(existing.id);
     return {
       account: sanitizeAccountPayload(publicAccountSummary(account)),
       ...(connection ? { connection } : {}),
@@ -517,6 +523,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     },
   }, async ({ id }) => runTool(async () => {
     if (!repos.accounts.remove(id)) throw new NotFoundError('Mail account not found.');
+    mailService.invalidateAccount?.(id);
     return { deleted: true, id };
   }));
 
