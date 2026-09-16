@@ -120,6 +120,14 @@ export function loadConfig(env = process.env) {
     // MCP). Inside this window the previous result is returned. 0 disables.
     // Manual refresh passes force=true to bypass it.
     syncMinIntervalMs: integer(readEnv(env, 'SYNC_MIN_INTERVAL_MS'), 60_000, { min: 0, max: 3_600_000 }),
+    // A mailbox with more new mail than one SYNC_BATCH_SIZE page keeps paging
+    // (oldest first) until this much time has passed, then resumes next pass.
+    syncPassBudgetMs: integer(readEnv(env, 'SYNC_PASS_BUDGET_MS'), 60_000, { min: 0, max: 30 * 60_000 }),
+    // Accounts synchronized in parallel, each on its own IMAP session.
+    syncConcurrency: integer(readEnv(env, 'SYNC_CONCURRENCY'), keyslotMode ? 1 : 3, { min: 1, max: 16 }),
+    // Hard stop for one account's pass; its socket is closed so a server that
+    // stops answering cannot stall every later sync. 0 disables.
+    syncAccountTimeoutMs: integer(readEnv(env, 'SYNC_ACCOUNT_TIMEOUT_MS'), 10 * 60_000, { min: 0, max: 60 * 60_000 }),
     // Keep one IMAP TCP session per account this long after the last use so
     // the next pass skips the TLS handshake. 0 logs out immediately (tests).
     imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),

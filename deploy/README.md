@@ -56,6 +56,14 @@ from each supported folder (200 by default). This is a recent-mail client
 rather than a full historical migration tool; increase the value (up to 1000)
 before connecting an account if you need a larger initial window.
 
+After that first pass, every message above a folder's high-water mark is
+imported, oldest first, in pages of `AMAIL_SYNC_BATCH_SIZE`. A burst larger
+than one page is never skipped: a pass keeps paging for up to
+`AMAIL_SYNC_PASS_BUDGET_MS` (60 s) and the background poller picks up any
+remainder a few seconds later. Up to `AMAIL_SYNC_CONCURRENCY` accounts (3)
+synchronize at once, and an account whose server stops answering is cut off
+after `AMAIL_SYNC_ACCOUNT_TIMEOUT_MS` (10 minutes) so it cannot stall the rest.
+
 ## Upgrading from GigaMail
 
 aMail is the open-source continuation of GigaMail and is a drop-in upgrade:
@@ -331,6 +339,7 @@ those OSS values — drop those pins or use `hosted.env.example`.
 | `AMAIL_SYNC_MAX_MESSAGE_BYTES` | `5 MiB` | `10 MiB` |
 | `AMAIL_SYNC_MIN_INTERVAL_MS` | `60000` | `60000` |
 | `AMAIL_IMAP_POOL_IDLE_MS` | `480000` | `480000` |
+| `AMAIL_SYNC_CONCURRENCY` | `1` | `3` |
 | `AMAIL_RETAIN_DAYS` | `0` (off) | `0` (off) |
 | `NODE_OPTIONS` | `--max-old-space-size=384` | unset |
 | `UV_THREADPOOL_SIZE` | `2` | unset |

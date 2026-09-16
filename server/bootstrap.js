@@ -9,6 +9,8 @@ import { createVault } from './vault.js';
 import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
 
+const BACKLOG_DRAIN_DELAY_MS = 5_000;
+
 /**
  * Wire one aMail process. Both key modes share every service; they differ only
  * in where the key material comes from and when the database opens:
@@ -21,10 +23,24 @@ import { createApp } from './app.js';
 export function createHarness({ config, logger }) {
   const metering = createMeteringService({ config, logger });
   let pollTimer = null;
+  let drainTimer = null;
 
   function startPolling(mailService) {
     if (pollTimer || config.syncIntervalMinutes <= 0) return;
-    const poll = () => mailService.syncAll({ maxAgeMs: config.syncMinIntervalMs || 0 }).catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
+    const poll = ({ force = false } = {}) => mailService.syncAll({ maxAgeMs: config.syncMinIntervalMs || 0, force })
+      .then((results) => {
+        // A pass that ran out of budget with mail still waiting continues
+        // shortly instead of leaving the backlog for the next interval.
+        const backlog = (results || []).reduce((sum, result) => sum + (Number(result?.remaining) || 0), 0);
+        if (backlog > 0 && pollTimer && !drainTimer) {
+          drainTimer = setTimeout(() => {
+            drainTimer = null;
+            poll({ force: true });
+          }, BACKLOG_DRAIN_DELAY_MS);
+          drainTimer.unref();
+        }
+      })
+      .catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
     pollTimer = setInterval(poll, config.syncIntervalMinutes * 60_000);
     pollTimer.unref();
     logger.info({ intervalMinutes: config.syncIntervalMinutes }, 'Background IMAP polling enabled');
@@ -32,7 +48,9 @@ export function createHarness({ config, logger }) {
 
   function stopPolling() {
     if (pollTimer) clearInterval(pollTimer);
+    if (drainTimer) clearTimeout(drainTimer);
     pollTimer = null;
+    drainTimer = null;
   }
 
   /** Open the database and build the services that depend on it. */
