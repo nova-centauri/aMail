@@ -147,6 +147,7 @@ test('TLS failures point to certificate hostnames without returning raw errors',
 function syncHarness({
   maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false, connectDelayMs = 0,
   imapPoolIdleMs, syncMinIntervalMs, connectFailure = false, fetchHangs = false, syncPassBudgetMs, syncAccountTimeoutMs,
+  threadsBySubject = new Map(),
 }) {
   const account = {
     id: 'sync-account',
@@ -272,7 +273,7 @@ function syncHarness({
     },
     threads: {
       get: () => null,
-      findBySubject: () => null,
+      findBySubject: (accountId, subject) => threadsBySubject.get(subject) || null,
       create: () => ({ id: `thread-${state.savedMessages.length + 1}`, accountId: account.id }),
     },
     messages: {
@@ -511,6 +512,40 @@ test('a hung IMAP session is closed at the deadline and does not block later syn
   const [again] = await service.syncAll({ force: true });
   assert.equal(again.error, 'IMAP_SYNC_TIMEOUT');
   assert.equal(state.connects, 2);
+  await service.close();
+});
+
+test('only replies fall back to subject threading', async () => {
+  const header = (uid, subject, extra = []) => Buffer.from([
+    'From: Sender <sender@example.test>',
+    'To: Sync Account <sync@example.test>',
+    `Subject: ${subject}`,
+    `Message-ID: <thread-${uid}@example.test>`,
+    ...extra,
+    '',
+    'Body',
+  ].join('\r\n'));
+  const sources = new Map([
+    [1, header(1, 'Quote Request')],
+    [2, header(2, 'RE: Quote Request')],
+    [3, header(3, 'Quote Request', ['In-Reply-To: <not-stored@example.test>'])],
+  ]);
+  const existing = { id: 'existing-thread', accountId: 'sync-account' };
+  const { service, state } = syncHarness({
+    maxMessageBytes: 4096,
+    messages: [1, 2, 3].map((uid) => ({ uid, size: sources.get(uid).length })),
+    sources,
+    threadsBySubject: new Map([['quote request', existing]]),
+  });
+
+  await service.syncAccount('sync-account');
+
+  const threadOf = Object.fromEntries(state.savedMessages.map((message) => [message.uid, message.thread_id]));
+  // A new message that merely shares a subject starts its own conversation.
+  assert.notEqual(threadOf[1], 'existing-thread');
+  // A reply prefix or reply header whose parent is not stored still joins it.
+  assert.equal(threadOf[2], 'existing-thread');
+  assert.equal(threadOf[3], 'existing-thread');
   await service.close();
 });
 

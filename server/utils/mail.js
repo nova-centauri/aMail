@@ -139,12 +139,19 @@ export function mailProviderCatalog() {
   }));
 }
 
+const REPLY_PREFIX = /^(?:(?:re|fw|fwd|aw|sv|antw)\s*:\s*)/i;
+
+/** True when the subject carries a reply/forward prefix such as "Re:". */
+export function hasReplyPrefix(value) {
+  return REPLY_PREFIX.test(String(value || '').trim());
+}
+
 export function normalizeSubject(value) {
   let subject = String(value || '').trim();
   // Collapse common repeated reply/forward prefixes but leave the actual subject
   // intact. This is only a fallback; RFC Message-ID references take precedence.
-  while (/^(?:(?:re|fw|fwd|aw|sv|antw)\s*:\s*)/i.test(subject)) {
-    subject = subject.replace(/^(?:(?:re|fw|fwd|aw|sv|antw)\s*:\s*)/i, '').trim();
+  while (REPLY_PREFIX.test(subject)) {
+    subject = subject.replace(REPLY_PREFIX, '').trim();
   }
   return subject.toLocaleLowerCase();
 }

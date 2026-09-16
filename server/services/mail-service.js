@@ -10,6 +10,7 @@ import {
   appendSignature,
   buildAuth,
   folderForMailbox,
+  hasReplyPrefix,
   isEmail,
   normalizeMessageIds,
   normalizeSubject,
@@ -544,7 +545,12 @@ export function createMailService({
       if (parent?.threadId) return repos.threads.get(parent.threadId);
     }
     const normalizedSubject = normalizeSubject(subject);
-    if (normalizedSubject) {
+    // Subject matching is only a fallback for replies whose parent is not
+    // stored locally. Applied to every message it merges unrelated mail that
+    // shares a subject (form notifications, alerts, "Quote request") into one
+    // ever-growing conversation.
+    const looksLikeReply = hasReplyPrefix(subject) || Boolean(inReplyTo) || candidates.length > 0;
+    if (normalizedSubject && looksLikeReply) {
       const existing = repos.threads.findBySubject(accountId, normalizedSubject);
       if (existing) return existing;
     }

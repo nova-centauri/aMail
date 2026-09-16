@@ -438,6 +438,9 @@ function initSchema(db) {
     db.pragma('foreign_keys = ON');
   }
 
+  // Reply threading falls back to the newest thread with the same subject.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_threads_subject ON threads(account_id, normalized_subject, latest_at DESC)');
+
   // Review pages seek directly through pending messages, both across all
   // accounts and within one account. Install after any legacy table rebuild.
   db.exec(`
