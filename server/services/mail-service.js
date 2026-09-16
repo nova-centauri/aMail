@@ -742,7 +742,7 @@ export function createMailService({
     // fetchOne here waits for the FETCH, which waits for the loop: deadlock).
     // Parsing and SQLite writes are fine because neither touches the socket.
     const fetchSources = async (chunk) => {
-      const reportedSizes = new Map(chunk.map((candidate) => [candidate.uid, candidate.size]));
+      const wantedUids = new Set(chunk.map((candidate) => candidate.uid));
       const seen = new Set();
       for await (const message of client.fetch(chunk.map((candidate) => candidate.uid).join(','), {
         uid: true,
@@ -754,16 +754,17 @@ export function createMailService({
         source: { start: 0, maxLength: maxMessageBytes + 1 },
       }, { uid: true })) {
         const uid = Number(message.uid || 0);
-        if (!reportedSizes.has(uid) || seen.has(uid)) continue;
+        if (!wantedUids.has(uid) || seen.has(uid)) continue;
         seen.add(uid);
-        const reportedSize = reportedSizes.get(uid);
         const source = message.source;
+        // The byte cap is one past the limit, so a longer source is exactly the
+        // truncation signal. Do not compare with RFC822.SIZE: Gmail routinely
+        // reports a size a few percent off the bytes it serves, and treating
+        // that as unavailable silently dropped real mail.
         if (!Buffer.isBuffer(source)) {
           skippedUnavailable += 1;
         } else if (source.length > maxMessageBytes) {
           skippedTooLarge += 1;
-        } else if (reportedSize !== null && source.length !== reportedSize) {
-          skippedUnavailable += 1;
         } else {
           await ingestSource(message, source);
         }

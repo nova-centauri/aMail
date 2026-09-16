@@ -435,6 +435,23 @@ test('sources arrive in chunked FETCHes and never a command inside a FETCH loop'
   await service.close();
 });
 
+test('a source whose length differs from the reported size is still imported', async () => {
+  const source = plainSource(7);
+  // Gmail's RFC822.SIZE is often a few percent off the bytes it returns.
+  const { service, state } = syncHarness({
+    maxMessageBytes: 4096,
+    messages: [{ uid: 7, size: source.length - 40 }, { uid: 8, size: source.length + 40 }],
+    sources: new Map([[7, source], [8, plainSource(8)]]),
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.status, 'ok');
+  assert.equal(result.imported, 2);
+  assert.equal(result.skipped, 0);
+  await service.close();
+});
+
 test('a burst larger than one page is imported oldest first instead of skipped', async () => {
   const uids = Array.from({ length: 12 }, (_, index) => index + 11);
   const { service, state } = syncHarness({
