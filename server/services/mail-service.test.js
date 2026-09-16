@@ -1143,3 +1143,154 @@ test('attachment download re-fetches the original IMAP source and returns one pa
   assert.equal(fetchOneUid, null);
   assert.equal(cached.body.equals(first.body), true);
 });
+
+function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}, sourceParts, sourceId = '<strict@example.test>', sourceUid = 42, uidValidity = 7, syncUidValidity = 7, sourceLimit = 64 * 1024 * 1024, rawAttachments } = {}) {
+  const content = Buffer.from([0, 255, 1, 128, 13, 10]);
+  const metadata = { index: 0, filename: 'sample.bin', contentType: 'application/octet-stream', size: content.length, contentId: 'part-0', ...metadataOverrides };
+  const message = {
+    id: 'strict-message', accountId: 'strict-account', mailbox: 'INBOX', uid: 42,
+    messageId: '<strict@example.test>', attachments: [metadata], ...messageOverrides,
+  };
+  const parts = sourceParts || [{ ...metadata, content }];
+  const lines = [
+    'From: Synthetic <sender@example.test>', 'To: Owner <owner@example.test>', 'Subject: Synthetic attachment',
+    `Message-ID: ${sourceId}`, 'MIME-Version: 1.0', 'Content-Type: multipart/mixed; boundary="strict-bound"', '',
+    '--strict-bound', 'Content-Type: text/plain', '', 'Synthetic fixture.',
+    ...parts.flatMap((part) => [
+      '--strict-bound', `Content-Type: ${part.contentType}`, `Content-Disposition: attachment; filename="${part.filename}"`,
+      `Content-ID: <${part.contentId || 'part-0'}>`, 'Content-Transfer-Encoding: base64', '', part.content.toString('base64'),
+    ]),
+    '--strict-bound--', '',
+  ];
+  const state = { source: Buffer.from(lines.join('\r\n')), connects: 0, fetches: 0, logouts: 0, releases: 0, mutations: [] };
+  class FakeImapClient {
+    mailbox = { path: 'INBOX', uidValidity };
+    async connect() { state.connects += 1; }
+    async getMailboxLock(mailbox, options) {
+      assert.equal(mailbox, 'INBOX');
+      assert.deepEqual(options, { readOnly: true });
+      return { release() { state.releases += 1; } };
+    }
+    async fetchOne(uid, query, options) {
+      state.fetches += 1;
+      assert.equal(uid, 42);
+      assert.deepEqual(options, { uid: true });
+      state.sourceMaxLength = query.source.maxLength;
+      return { uid: sourceUid, source: state.source };
+    }
+    async logout() { state.logouts += 1; }
+    async messageFlagsAdd() { state.mutations.push('flags'); throw new Error('must not mark'); }
+  }
+  const account = {
+    id: 'strict-account', email: 'owner@example.test', provider: 'custom',
+    credential_ciphertext: encryptJson({ username: 'owner@example.test', password: 'synthetic-password' }, config.credentialKey),
+    imap_host: 'imap.example.test', imap_port: 993, imap_secure: 1,
+  };
+  const service = createMailService({
+    config: { ...config, syncMaxMessageBytes: sourceLimit },
+    repos: {
+      accounts: { getRaw(id) { assert.equal(id, account.id); return account; } },
+      messages: {
+        get: (id) => id === message.id ? message : null,
+        getRaw: () => ({ attachments_json: JSON.stringify(rawAttachments || []) }),
+        setState() { state.mutations.push('state'); throw new Error('must not mark'); },
+      },
+      sync: { get(accountId, mailbox) { assert.equal(accountId, account.id); assert.equal(mailbox, 'INBOX'); return { uid_validity: syncUidValidity }; } },
+    },
+    logger: { info() {}, warn() {} }, ImapClient: FakeImapClient,
+  });
+  return { service, state, message, content };
+}
+
+test('strict attachment download verifies message and part and opens IMAP read-only', async () => {
+  const { service, state, content } = strictAttachmentHarness();
+  const attachment = await service.fetchAttachment('strict-message', 0, { strict: true });
+  assert.deepEqual(attachment.body, content);
+  assert.equal(state.sourceMaxLength, 12 * 1024 * 1024 + 1);
+  assert.equal(state.fetches, 1);
+  assert.equal(state.releases, 1);
+  assert.equal(state.logouts, 1);
+  assert.deepEqual(state.mutations, []);
+});
+
+test('strict attachment download refuses stale or unverified message identity', async () => {
+  for (const options of [
+    { sourceId: '<different@example.test>' }, { sourceUid: 99 }, { uidValidity: 8 },
+    { messageOverrides: { messageId: null } }, { messageOverrides: { mailbox: '' } },
+  ]) {
+    const { service, state } = strictAttachmentHarness(options);
+    await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IDENTITY_UNVERIFIED' });
+    assert.deepEqual(state.mutations, []);
+    assert.equal(state.logouts, state.connects);
+  }
+});
+
+test('strict attachment download does not fall back to a different indexed part', async () => {
+  const { service } = strictAttachmentHarness({
+    metadataOverrides: { index: 1 },
+    sourceParts: [{ filename: 'sample.bin', contentType: 'application/octet-stream', contentId: 'part-0', content: Buffer.from([0, 255, 1, 128, 13, 10]) }],
+  });
+  await assert.rejects(service.fetchAttachment('strict-message', 1, { strict: true }), { code: 'ATTACHMENT_IDENTITY_UNVERIFIED' });
+  await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'NOT_FOUND' });
+});
+
+test('strict attachment download verifies known metadata at the selected index', async () => {
+  for (const mismatch of [
+    { filename: 'wrong.bin' }, { contentType: 'image/png' }, { contentId: 'wrong-id' }, { content: Buffer.from('different-size') },
+  ]) {
+    const { service } = strictAttachmentHarness({ sourceParts: [{
+      filename: 'sample.bin', contentType: 'application/octet-stream', contentId: 'part-0',
+      content: Buffer.from([0, 255, 1, 128, 13, 10]), ...mismatch,
+    }] });
+    await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IDENTITY_UNVERIFIED' });
+  }
+});
+
+test('strict attachment download bypasses legacy cached content', async () => {
+  const { service, state } = strictAttachmentHarness();
+  await service.fetchAttachment('strict-message', 0);
+  state.source = Buffer.from(state.source.toString().replace('<strict@example.test>', '<reused-uid@example.test>'));
+  await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IDENTITY_UNVERIFIED' });
+  assert.equal(state.fetches, 2);
+});
+
+test('strict stored attachment bytes must match cached metadata and actual size', async () => {
+  const content = Buffer.from([0, 255, 1, 128, 13, 10]);
+  const raw = { index: 0, filename: 'sample.bin', contentType: 'application/octet-stream', size: content.length, contentId: 'part-0', content: content.toString('base64') };
+  const valid = strictAttachmentHarness({ rawAttachments: [raw], messageOverrides: { messageId: null, uid: null } });
+  assert.deepEqual((await valid.service.fetchAttachment('strict-message', 0, { strict: true })).body, content);
+  assert.equal(valid.state.connects, 0);
+  for (const options of [
+    { metadataOverrides: { size: 99 }, rawAttachments: [{ ...raw, size: 99 }] },
+    { rawAttachments: [{ ...raw, filename: 'different.bin' }] },
+    { rawAttachments: [{ ...raw, contentType: 'text/plain' }] },
+    { rawAttachments: [{ ...raw, contentId: 'different-part' }] },
+  ]) {
+    const { service, state } = strictAttachmentHarness(options);
+    await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IDENTITY_UNVERIFIED' });
+    assert.equal(state.connects, 0);
+  }
+});
+
+test('strict attachment download bounds metadata, stored bytes, decoded bytes, and original source', async () => {
+  const maxBytes = 8 * 1024 * 1024;
+  const knownOversize = strictAttachmentHarness({ metadataOverrides: { size: maxBytes + 1 } });
+  await assert.rejects(knownOversize.service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'VALIDATION_ERROR' });
+  assert.equal(knownOversize.state.connects, 0);
+
+  const storedOversize = strictAttachmentHarness({ rawAttachments: [{ index: 0, content: Buffer.alloc(maxBytes + 1).toString('base64') }] });
+  await assert.rejects(storedOversize.service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'VALIDATION_ERROR' });
+  assert.equal(storedOversize.state.connects, 0);
+
+  const decodedOversize = strictAttachmentHarness({ metadataOverrides: { size: undefined }, sourceParts: [{
+    filename: 'sample.bin', contentType: 'application/octet-stream', contentId: 'part-0', content: Buffer.alloc(maxBytes + 1),
+  }] });
+  await assert.rejects(decodedOversize.service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'VALIDATION_ERROR' });
+  assert.equal(decodedOversize.state.fetches, 1);
+
+  const sourceOversize = strictAttachmentHarness({ sourceLimit: 32 });
+  await assert.rejects(sourceOversize.service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_SOURCE_UNAVAILABLE' });
+  assert.equal(sourceOversize.state.sourceMaxLength, 33);
+  assert.equal(sourceOversize.state.releases, 1);
+  assert.equal(sourceOversize.state.logouts, 1);
+});

@@ -30,6 +30,8 @@ import {
 } from './compose-attachments.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
+const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_STRICT_ATTACHMENT_SOURCE_BYTES = 12 * 1024 * 1024;
 const SYNC_WRITE_CHUNK = 50;
 // Sources per UID FETCH. Bounds the bytes in flight to this many capped
 // messages while replacing one round trip per message with one per chunk.
@@ -103,6 +105,19 @@ function pickParsedAttachment(parsedAttachments, index, meta) {
     return list.find((item) => item.filename === meta.filename) || null;
   }
   return null;
+}
+
+function strictParsedAttachment(parsedAttachments, index, meta) {
+  const picked = Array.isArray(parsedAttachments) ? parsedAttachments[index] : null;
+  if (!picked) return null;
+  const actual = attachmentMetadata([picked])[0];
+  if (['filename', 'contentType', 'contentId'].some((key) => meta[key] != null && meta[key] !== actual[key])) return null;
+  if (Number.isFinite(meta.size) && meta.size >= 0 && meta.size !== actual.size) return null;
+  return picked;
+}
+
+function attachmentIdentityError() {
+  return new ServiceUnavailableError('Attachment identity could not be verified against the cached message.', 'ATTACHMENT_IDENTITY_UNVERIFIED');
 }
 
 export function buildImapOptions(account, credentials, config, { pooled = false } = {}) {
@@ -1083,37 +1098,56 @@ export function createMailService({
     await Promise.all(ids.map((id) => evictPoolEntry(id)));
   }
 
-  async function fetchAttachment(messageId, index) {
+  async function fetchAttachment(messageId, index, { strict = false } = {}) {
     const resolvedIndex = Number(index);
     if (!Number.isInteger(resolvedIndex) || resolvedIndex < 0) {
       throw new ValidationError('Attachment index is invalid.');
     }
     const cacheKey = `${messageId}:${resolvedIndex}`;
-    const cached = cachedAttachment(cacheKey);
+    // Strict callers must verify the current message/part, never reuse a value
+    // obtained by the legacy filename/content-id fallback or a previous UID.
+    const cached = strict ? null : cachedAttachment(cacheKey);
     if (cached) return cached;
 
     const message = repos.messages.get(messageId);
     if (!message) throw new NotFoundError('Message not found.');
+    const strictMatches = strict && Array.isArray(message.attachments)
+      ? message.attachments.filter((item) => item?.index === resolvedIndex)
+      : [];
+    if (strict && strictMatches.length !== 1) throw new NotFoundError('Attachment not found.');
+    const strictMeta = strictMatches[0];
+    if (strict && Number(strictMeta.size) > MAX_STRICT_ATTACHMENT_BYTES) {
+      throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+    }
     let rawAttachments = [];
     try {
       rawAttachments = JSON.parse(repos.messages.getRaw?.(messageId)?.attachments_json || '[]');
     } catch {
       rawAttachments = [];
     }
-    const rawMeta = rawAttachments.find((item, index) => (Number.isInteger(item?.index) ? item.index : index) === resolvedIndex)
-      || rawAttachments[resolvedIndex];
+    if (!Array.isArray(rawAttachments)) rawAttachments = [];
+    const rawMatches = rawAttachments.filter((item, index) => (Number.isInteger(item?.index) ? item.index : index) === resolvedIndex);
+    const rawMeta = strict ? (rawMatches.length === 1 ? rawMatches[0] : null)
+      : rawMatches[0] || rawAttachments[resolvedIndex];
+    if (strict && typeof rawMeta?.content === 'string' && rawMeta.content.length > Math.ceil(MAX_STRICT_ATTACHMENT_BYTES / 3) * 4) {
+      throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+    }
     const stored = attachmentContentBuffer(rawMeta);
     if (stored) {
+      if (strict && stored.length > MAX_STRICT_ATTACHMENT_BYTES) throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+      if (strict && !strictParsedAttachment([{ ...rawMeta, size: stored.length, content: stored }], 0, strictMeta)) {
+        throw attachmentIdentityError();
+      }
       const value = {
         filename: rawMeta.filename || 'attachment',
         contentType: rawMeta.contentType || 'application/octet-stream',
         body: stored,
         contentId: rawMeta.contentId || null,
       };
-      rememberAttachment(cacheKey, value);
+      if (!strict) rememberAttachment(cacheKey, value);
       return value;
     }
-    const meta = (message.attachments || []).find((item) => item.index === resolvedIndex)
+    const meta = strictMeta || (message.attachments || []).find((item) => item.index === resolvedIndex)
       || message.attachments?.[resolvedIndex]
       || (rawMeta ? publicAttachmentMeta(rawMeta, resolvedIndex) : null);
     if (!meta) throw new NotFoundError('Attachment not found.');
@@ -1123,16 +1157,26 @@ export function createMailService({
         'ATTACHMENT_IMAP_UID_MISSING',
       );
     }
+    if (strict && (typeof message.messageId !== 'string' || !message.messageId.trim() || !message.mailbox)) {
+      throw attachmentIdentityError();
+    }
 
     const { account, credentials } = accountAndCredentials(message.accountId);
-    const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
+    if (strict && account.id !== message.accountId) throw attachmentIdentityError();
+    const configuredMaxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes) && config.syncMaxMessageBytes > 0
       ? config.syncMaxMessageBytes
       : DEFAULT_SYNC_MAX_MESSAGE_BYTES;
+    const maxMessageBytes = strict ? Math.min(configuredMaxMessageBytes, MAX_STRICT_ATTACHMENT_SOURCE_BYTES) : configuredMaxMessageBytes;
+    const previousUidValidity = strict ? repos.sync?.get?.(message.accountId, message.mailbox)?.uid_validity : null;
     const client = newImapClient(account, credentials);
     let lock;
     try {
       await client.connect();
-      lock = await client.getMailboxLock(message.mailbox || 'INBOX');
+      lock = await client.getMailboxLock(message.mailbox || 'INBOX', { readOnly: true });
+      if (strict && ((client.mailbox?.path && client.mailbox.path !== message.mailbox)
+        || (previousUidValidity != null && String(previousUidValidity) !== String(client.mailbox?.uidValidity)))) {
+        throw attachmentIdentityError();
+      }
       const sourceMessage = await client.fetchOne(message.uid, {
         uid: true,
         source: { start: 0, maxLength: maxMessageBytes + 1 },
@@ -1141,19 +1185,24 @@ export function createMailService({
       if (!Buffer.isBuffer(source) || source.length > maxMessageBytes) {
         throw new ServiceUnavailableError('The original message could not be downloaded for this attachment.', 'ATTACHMENT_SOURCE_UNAVAILABLE');
       }
+      if (strict && sourceMessage.uid !== message.uid) throw attachmentIdentityError();
       const parsed = await simpleParser(source);
-      const picked = pickParsedAttachment(parsed.attachments, resolvedIndex, meta);
+      if (strict && parsed.messageId !== message.messageId) throw attachmentIdentityError();
+      const picked = strict ? strictParsedAttachment(parsed.attachments, resolvedIndex, meta)
+        : pickParsedAttachment(parsed.attachments, resolvedIndex, meta);
+      if (strict && !picked) throw attachmentIdentityError();
       const body = picked?.content;
       if (!Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
         throw new NotFoundError('Attachment not found in the original message.');
       }
+      if (strict && body.length > MAX_STRICT_ATTACHMENT_BYTES) throw new ValidationError('Attachment exceeds the 8 MiB limit.');
       const value = {
         filename: picked.filename || meta.filename || 'attachment',
         contentType: picked.contentType || meta.contentType || 'application/octet-stream',
         body: Buffer.from(body),
         contentId: picked.cid || meta.contentId || null,
       };
-      rememberAttachment(cacheKey, value);
+      if (!strict) rememberAttachment(cacheKey, value);
       return value;
     } catch (error) {
       if (error instanceof NotFoundError || error instanceof ServiceUnavailableError || error instanceof ValidationError) throw error;
