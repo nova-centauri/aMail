@@ -32,6 +32,12 @@ import {
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_SOURCE_BYTES = 12 * 1024 * 1024;
+const ATTACHMENT_FAILURE_CODES = new Set([
+  'AUTHENTICATIONFAILED', 'AUTHORIZATIONFAILED', 'UNAVAILABLE', 'NONEXISTENT', 'NOPERM', 'INUSE',
+  'LIMIT', 'OVERQUOTA', 'CLIENTBUG', 'SERVERBUG', 'CANNOT', 'CORRUPTION', 'EXPIRED', 'PRIVACYREQUIRED',
+  'CONTACTADMIN', 'ALREADYEXISTS', 'TOOBIG', 'UNKNOWN-CTE', 'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED',
+  'ENOTFOUND', 'EAI_AGAIN', 'ETHROTTLE', 'NOCONNECTION',
+]);
 const SYNC_WRITE_CHUNK = 50;
 // Sources per UID FETCH. Bounds the bytes in flight to this many capped
 // messages while replacing one round trip per message with one per chunk.
@@ -118,6 +124,17 @@ function strictParsedAttachment(parsedAttachments, index, meta) {
 
 function attachmentIdentityError() {
   return new ServiceUnavailableError('Attachment identity could not be verified against the cached message.', 'ATTACHMENT_IDENTITY_UNVERIFIED');
+}
+
+function attachmentFailureDiagnostic(error, operation) {
+  const candidates = [error?.serverResponseCode, error?.code, error?.response?.attributes?.[0]?.section?.[0]?.value];
+  const code = candidates.filter((value) => typeof value === 'string')
+    .map((value) => value.toUpperCase().trim()).find((value) => ATTACHMENT_FAILURE_CODES.has(value)) || null;
+  return {
+    operation,
+    responseStatus: ['NO', 'BAD'].includes(error?.responseStatus) ? error.responseStatus : null,
+    code,
+  };
 }
 
 export function buildImapOptions(account, credentials, config, { pooled = false } = {}) {
@@ -1170,13 +1187,16 @@ export function createMailService({
     const previousUidValidity = strict ? repos.sync?.get?.(message.accountId, message.mailbox)?.uid_validity : null;
     const client = newImapClient(account, credentials);
     let lock;
+    let operation = 'connect';
     try {
       await client.connect();
+      operation = 'open_mailbox';
       lock = await client.getMailboxLock(message.mailbox || 'INBOX', { readOnly: true });
       if (strict && ((client.mailbox?.path && client.mailbox.path !== message.mailbox)
         || (previousUidValidity != null && String(previousUidValidity) !== String(client.mailbox?.uidValidity)))) {
         throw attachmentIdentityError();
       }
+      operation = 'fetch_source';
       const sourceMessage = await client.fetchOne(message.uid, {
         uid: true,
         source: { start: 0, maxLength: maxMessageBytes + 1 },
@@ -1186,6 +1206,7 @@ export function createMailService({
         throw new ServiceUnavailableError('The original message could not be downloaded for this attachment.', 'ATTACHMENT_SOURCE_UNAVAILABLE');
       }
       if (strict && sourceMessage.uid !== message.uid) throw attachmentIdentityError();
+      operation = 'parse_source';
       const parsed = await simpleParser(source);
       if (strict && parsed.messageId !== message.messageId) throw attachmentIdentityError();
       const picked = strict ? strictParsedAttachment(parsed.attachments, resolvedIndex, meta)
@@ -1206,7 +1227,9 @@ export function createMailService({
       return value;
     } catch (error) {
       if (error instanceof NotFoundError || error instanceof ServiceUnavailableError || error instanceof ValidationError) throw error;
-      logger.warn({ messageId, err: cleanupError(error) }, 'IMAP attachment download failed');
+      // Command text can contain credentials, and response/parser text may
+      // contain mail content. Emit only fixed diagnostic enums for this path.
+      logger.warn({ messageId, ...attachmentFailureDiagnostic(error, operation) }, 'IMAP attachment download failed');
       throw new ServiceUnavailableError('Could not download this attachment from the mail server.', 'ATTACHMENT_IMAP_FAILED');
     } finally {
       lock?.release();

@@ -1144,7 +1144,7 @@ test('attachment download re-fetches the original IMAP source and returns one pa
   assert.equal(cached.body.equals(first.body), true);
 });
 
-function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}, sourceParts, sourceId = '<strict@example.test>', sourceUid = 42, uidValidity = 7, syncUidValidity = 7, sourceLimit = 64 * 1024 * 1024, rawAttachments } = {}) {
+function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}, sourceParts, sourceId = '<strict@example.test>', sourceUid = 42, uidValidity = 7, syncUidValidity = 7, sourceLimit = 64 * 1024 * 1024, rawAttachments, failureAt, failure } = {}) {
   const content = Buffer.from([0, 255, 1, 128, 13, 10]);
   const metadata = { index: 0, filename: 'sample.bin', contentType: 'application/octet-stream', size: content.length, contentId: 'part-0', ...metadataOverrides };
   const message = {
@@ -1162,17 +1162,19 @@ function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}
     ]),
     '--strict-bound--', '',
   ];
-  const state = { source: Buffer.from(lines.join('\r\n')), connects: 0, fetches: 0, logouts: 0, releases: 0, mutations: [] };
+  const state = { source: Buffer.from(lines.join('\r\n')), connects: 0, fetches: 0, logouts: 0, releases: 0, mutations: [], warnings: [] };
   class FakeImapClient {
     mailbox = { path: 'INBOX', uidValidity };
-    async connect() { state.connects += 1; }
+    async connect() { state.connects += 1; if (failureAt === 'connect') throw failure; }
     async getMailboxLock(mailbox, options) {
       assert.equal(mailbox, 'INBOX');
       assert.deepEqual(options, { readOnly: true });
+      if (failureAt === 'open_mailbox') throw failure;
       return { release() { state.releases += 1; } };
     }
     async fetchOne(uid, query, options) {
       state.fetches += 1;
+      if (failureAt === 'fetch_source') throw failure;
       assert.equal(uid, 42);
       assert.deepEqual(options, { uid: true });
       state.sourceMaxLength = query.source.maxLength;
@@ -1197,7 +1199,7 @@ function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}
       },
       sync: { get(accountId, mailbox) { assert.equal(accountId, account.id); assert.equal(mailbox, 'INBOX'); return { uid_validity: syncUidValidity }; } },
     },
-    logger: { info() {}, warn() {} }, ImapClient: FakeImapClient,
+    logger: { info() {}, warn(...args) { state.warnings.push(args); } }, ImapClient: FakeImapClient,
   });
   return { service, state, message, content };
 }
@@ -1211,6 +1213,32 @@ test('strict attachment download verifies message and part and opens IMAP read-o
   assert.equal(state.releases, 1);
   assert.equal(state.logouts, 1);
   assert.deepEqual(state.mutations, []);
+});
+
+test('attachment failure diagnostics expose only fixed operation, status, and code enums', async () => {
+  for (const operation of ['connect', 'open_mailbox', 'fetch_source']) {
+    const failure = Object.assign(new Error('secret parser or server content'), {
+      responseStatus: 'NO', serverResponseCode: 'NOPERM',
+      executedCommand: 'LOGIN private@example.test secret-password', responseText: 'private mail body',
+    });
+    const { service, state } = strictAttachmentHarness({ failureAt: operation, failure });
+    await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IMAP_FAILED' });
+    assert.deepEqual(state.warnings, [[{
+      messageId: 'strict-message', operation, responseStatus: 'NO', code: 'NOPERM',
+    }, 'IMAP attachment download failed']]);
+    assert.equal(state.logouts, 1);
+  }
+  for (const [errorFields, expected] of [
+    [{ responseStatus: 'secret-response', code: 'secret-code', serverResponseCode: 'secret-server-code' }, { responseStatus: null, code: null }],
+    [{ responseStatus: 'BAD', response: { attributes: [{ section: [{ value: 'NONEXISTENT' }] }] } }, { responseStatus: 'BAD', code: 'NONEXISTENT' }],
+    [{ code: 'ECONNRESET' }, { responseStatus: null, code: 'ECONNRESET' }],
+  ]) {
+    const failure = Object.assign(new Error('secret'), errorFields);
+    const { service, state } = strictAttachmentHarness({ failureAt: 'fetch_source', failure });
+    await assert.rejects(service.fetchAttachment('strict-message', 0, { strict: true }), { code: 'ATTACHMENT_IMAP_FAILED' });
+    assert.deepEqual(state.warnings[0][0], { messageId: 'strict-message', operation: 'fetch_source', ...expected });
+    assert.equal(JSON.stringify(state.warnings).includes('secret'), false);
+  }
 });
 
 test('strict attachment download refuses stale or unverified message identity', async () => {
