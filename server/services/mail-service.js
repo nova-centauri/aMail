@@ -374,9 +374,31 @@ export function createMailService({
   compileMessage = compileRfc822Message,
   createMessageId = () => `<${randomUUID()}@amail.local>`,
 }) {
-  const newImapClient = (account, credentials, { pooled = false } = {}) => (
-    new ImapClient(buildImapOptions(account, credentials, config, { pooled }))
-  );
+  const failedImapClients = new WeakSet();
+  const newImapClient = (account, credentials, { pooled = false } = {}) => {
+    const client = new ImapClient(buildImapOptions(account, credentials, config, { pooled }));
+    const invalidate = () => {
+      failedImapClients.add(client);
+      const entry = imapPool.get(account.id);
+      // A late event from an evicted socket must not invalidate its replacement.
+      if (entry?.client === client) {
+        entry.usable = false;
+        clearPoolTimer(entry);
+      }
+    };
+    // IMAP can emit errors while idle or after a command promise has settled.
+    // Keep this listener for the socket's entire lifetime, including logout:
+    // an unhandled EventEmitter error terminates the whole HTTP/MCP process.
+    client.on?.('error', (error) => {
+      invalidate();
+      logger.warn({
+        accountId: account.id,
+        code: classifyMailConnectionError(error, { protocol: 'imap', provider: account.provider }).code,
+      }, 'IMAP connection became unavailable');
+    });
+    client.on?.('close', invalidate);
+    return client;
+  };
   const newSmtpTransport = (account, credentials) => createSmtpTransport(buildSmtpOptions(account, credentials, config));
   const attachmentCache = new Map();
   const imapPool = new Map();
@@ -413,7 +435,15 @@ export function createMailService({
     }
     if (existing) await evictPoolEntry(account.id);
     const client = newImapClient(account, credentials, { pooled: true });
-    await client.connect();
+    try {
+      await client.connect();
+      if (failedImapClients.has(client)) throw new Error('IMAP connection closed during setup');
+    } catch (error) {
+      // A failed connection never enters the pool; close any partially opened
+      // socket while retaining its error listener for late teardown events.
+      try { client.close?.(); } catch { /* Already closed. */ }
+      throw error;
+    }
     const entry = {
       client,
       account,

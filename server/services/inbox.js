@@ -169,7 +169,7 @@ export function listConversations(repos, {
         ftsQuery,
         limit: Math.min(500, page * pageSize + pageSize),
       });
-      return { items: repos.messages.forThreads(threadIds, { folder, mailbox: String(mailbox || 'INBOX') }) };
+      return { items: repos.messages.forThreads(threadIds, { folder, mailbox: String(mailbox || 'INBOX'), includeBodies: false }) };
     }
     return repos.messages.list({
       accountId: account.id,
@@ -179,6 +179,8 @@ export function listConversations(repos, {
       category: '',
       limit: 1000,
       offset: 0,
+      includeBodies: false,
+      includeTotal: false,
     });
   });
   const byThread = new Map();
@@ -205,7 +207,20 @@ export function listConversations(repos, {
       if (category) return true;
       if (personFlag) return true;
       return !isHiddenDefaultCategory(latest.category);
-    })
+    }).sort(({ latest: left }, { latest: right }) =>
+      String(right.sentAt || right.receivedAt || right.createdAt).localeCompare(String(left.sentAt || left.receivedAt || left.createdAt)));
+  const categoryCounts = emptyCategoryCounts();
+  for (const { latest } of conversations) {
+    if (isHiddenDefaultCategory(latest.category)) continue;
+    if (Object.hasOwn(categoryCounts, latest.category)) categoryCounts[latest.category] += 1;
+  }
+  const all = category
+    ? conversations.filter(({ latest }) => latest.category === category)
+    : conversations;
+  const start = (page - 1) * pageSize;
+  // Filtering still uses all candidate messages in each conversation. Only
+  // visible rows need their stored, whole-thread unread/analyzed aggregates.
+  const pageItems = all.slice(start, start + pageSize)
     .map(({ latest: latestMessage, messages }) => {
       const thread = repos.threads.get(latestMessage.threadId);
       const latestAt = latestMessage.sentAt || latestMessage.receivedAt || latestMessage.createdAt;
@@ -226,21 +241,9 @@ export function listConversations(repos, {
         isRead: (thread?.unreadCount || 0) === 0,
         isAnalyzed: thread ? thread.unanalyzedCount === 0 : messages.every((message) => message.isAnalyzed),
         isStarred: thread?.isStarred ?? latestMessage.isStarred,
-        _threadMessages: messages,
         ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
       };
-    }).sort((left, right) =>
-      String(right.latestAt || right.sentAt || right.receivedAt || right.createdAt).localeCompare(String(left.latestAt || left.sentAt || left.receivedAt || left.createdAt)));
-  const categoryCounts = emptyCategoryCounts();
-  for (const conversation of conversations) {
-    if (isHiddenDefaultCategory(conversation.category)) continue;
-    if (Object.hasOwn(categoryCounts, conversation.category)) categoryCounts[conversation.category] += 1;
-  }
-  const all = category
-    ? conversations.filter((conversation) => conversation.category === category)
-    : conversations;
-  const start = (page - 1) * pageSize;
-  const pageItems = all.slice(start, start + pageSize).map(({ _threadMessages, ...conversation }) => conversation);
+    });
   return {
     messages: pageItems,
     total: all.length,

@@ -5,6 +5,8 @@ import path from 'node:path';
 import { once } from 'node:events';
 import test from 'node:test';
 import express from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createDatabase, createRepositories } from '../db.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerMcp } from './mcp.js';
@@ -74,6 +76,123 @@ async function mcpRpc(origin, { token, method, params, id = 1 }) {
     }
   }
   return { response, body, text };
+}
+
+async function lifecycleEndpoint(t) {
+  const app = express();
+  app.use(express.json());
+  registerMcp(app, { config: {}, repos: {}, mailService: {}, remoteContent: {} });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function promptly(promise, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 2000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('MCP client disconnect aborts a pending tool and closes its server once', async (t) => {
+  const entered = Promise.withResolvers();
+  const aborted = Promise.withResolvers();
+  const closed = Promise.withResolvers();
+  const connect = McpServer.prototype.connect;
+  const transportClose = t.mock.method(StreamableHTTPServerTransport.prototype, 'close');
+  let closeCount = 0;
+  t.mock.method(McpServer.prototype, 'connect', async function (transport) {
+    this.registerTool('wait_for_disconnect', {}, async ({ signal }) => {
+      entered.resolve(signal);
+      await new Promise((resolve) => signal.addEventListener('abort', () => {
+        aborted.resolve();
+        resolve();
+      }, { once: true }));
+      return { content: [] };
+    });
+    this.server.onclose = () => {
+      closeCount += 1;
+      closed.resolve();
+    };
+    t.after(() => this.close());
+    await connect.call(this, transport);
+  });
+  const origin = await lifecycleEndpoint(t);
+  const controller = new AbortController();
+  t.after(() => controller.abort());
+  const request = fetch(`${origin}/mcp`, {
+    method: 'POST',
+    signal: controller.signal,
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'wait_for_disconnect', arguments: {} } }),
+  }).then((response) => response.text()).catch((error) => error);
+  const signal = await promptly(entered.promise, 'pending tool did not start');
+  assert.equal(signal.aborted, false);
+  controller.abort();
+  await promptly(Promise.all([aborted.promise, closed.promise, request]), 'disconnect did not abort the tool and close the server');
+  assert.equal(signal.aborted, true);
+  assert.equal(closeCount, 1);
+  assert.equal(transportClose.mock.callCount(), 1);
+});
+
+test('MCP delayed successful response finishes before request resources close', async (t) => {
+  const entered = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const closed = Promise.withResolvers();
+  const connect = McpServer.prototype.connect;
+  const transportClose = t.mock.method(StreamableHTTPServerTransport.prototype, 'close');
+  t.mock.method(McpServer.prototype, 'connect', async function (transport) {
+    this.registerTool('delayed_result', {}, async ({ signal }) => {
+      entered.resolve(signal);
+      await release.promise;
+      return { content: [{ type: 'text', text: 'completed synthetic work' }] };
+    });
+    this.server.onclose = () => closed.resolve();
+    t.after(() => this.close());
+    await connect.call(this, transport);
+  });
+  t.after(() => release.resolve());
+  const origin = await lifecycleEndpoint(t);
+  const request = mcpRpc(origin, { method: 'tools/call', params: { name: 'delayed_result', arguments: {} } });
+  const signal = await promptly(entered.promise, 'delayed tool did not start');
+  assert.equal(signal.aborted, false);
+  assert.equal(transportClose.mock.callCount(), 0);
+  release.resolve();
+  const result = await promptly(request, 'successful SSE response did not end');
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.result.content[0].text, 'completed synthetic work');
+  await promptly(closed.promise, 'successful request did not close its server');
+  assert.equal(transportClose.mock.callCount(), 1);
+});
+
+for (const phase of ['connect', 'handleRequest']) {
+  test(`MCP ${phase} failure returns an error and closes request resources once`, async (t) => {
+    const transportClose = t.mock.method(StreamableHTTPServerTransport.prototype, 'close');
+    const serverClose = t.mock.method(McpServer.prototype, 'close');
+    const target = phase === 'connect' ? McpServer.prototype : StreamableHTTPServerTransport.prototype;
+    t.mock.method(target, phase, async () => {
+      throw new Error('synthetic transport failure');
+    });
+    const origin = await lifecycleEndpoint(t);
+    const result = await mcpRpc(origin, { method: 'tools/list', params: {} });
+    assert.equal(result.response.status, 500);
+    assert.deepEqual(result.body, {
+      jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null,
+    });
+    assert.equal(transportClose.mock.callCount(), 1);
+    assert.equal(serverClose.mock.callCount(), 1);
+  });
 }
 
 test('MCP endpoint requires access token and exposes inbox tools', async (t) => {

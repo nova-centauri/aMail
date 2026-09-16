@@ -58,7 +58,7 @@ Every connected inbox is reachable through one MCP endpoint. Authenticate with `
 | Tool | Purpose |
 | --- | --- |
 | `list_accounts`, `list_providers` | Connected accounts and provider presets |
-| `list_messages` | List/search conversations. `q` honours `from:`, `to:`, `subject:`, `has:attachment`, `after:`/`before:`, `is:unread`, `is:starred`, `is:unanalyzed`, `is:analyzed`, `in:` |
+| `list_messages` | List/search conversation metadata and snippets (bodies omitted; use `get_message`/`get_thread` for content). `q` honours `from:`, `to:`, `subject:`, `has:attachment`, `after:`/`before:`, `is:unread`, `is:starred`, `is:unanalyzed`, `is:analyzed`, `in:` |
 | `list_unanalyzed_messages` | Complete cached review queue: individual messages across every folder, exact remaining count, oldest received first; optional `accountId`, `pageSize` (1–200), and opaque `cursor` |
 | `get_message`, `get_thread` | Read one message or a whole thread |
 | `send_message` | Compose and send via the account's SMTP |

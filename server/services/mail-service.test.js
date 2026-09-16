@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
 import {
   buildImapOptions,
   buildSmtpOptions,
@@ -145,7 +146,7 @@ test('TLS failures point to certificate hostnames without returning raw errors',
 
 function syncHarness({
   maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false, connectDelayMs = 0,
-  imapPoolIdleMs, syncMinIntervalMs,
+  imapPoolIdleMs, syncMinIntervalMs, connectFailure = false,
 }) {
   const account = {
     id: 'sync-account',
@@ -163,6 +164,7 @@ function syncHarness({
     credential_ciphertext: encryptJson({ username: 'sync@example.test', password: 'test-password' }, config.credentialKey),
   };
   const state = {
+    clients: [],
     connects: 0,
     openSessions: 0,
     maxOpenSessions: 0,
@@ -176,12 +178,21 @@ function syncHarness({
     logs: [],
   };
   const latestUid = Math.max(0, ...messages.map((message) => message.uid));
-  class FakeImapClient {
+  class FakeImapClient extends EventEmitter {
+    constructor() {
+      super();
+      state.clients.push(this);
+    }
     async connect() {
       state.connects += 1;
       state.openSessions += 1;
       state.maxOpenSessions = Math.max(state.maxOpenSessions, state.openSessions);
       if (connectDelayMs) await new Promise((resolve) => setTimeout(resolve, connectDelayMs));
+      if (connectFailure) {
+        const error = new Error('Socket timeout during connect');
+        this.emit('error', error);
+        throw error;
+      }
     }
     async list() {
       state.listCalls += 1;
@@ -201,7 +212,13 @@ function syncHarness({
       const source = sources.get(uid);
       return source === undefined ? null : { uid, source };
     }
-    async logout() { state.openSessions -= 1; }
+    async logout() {
+      if (this.closed) return;
+      this.closed = true;
+      state.openSessions -= 1;
+      this.emit('close');
+    }
+    close() { void this.logout(); }
   }
   const repos = {
     accounts: {
@@ -393,6 +410,73 @@ test('the server enforces a minimum sync interval unless force is set', async ()
   await service.syncAll({ mailbox: 'INBOX', force: true });
   assert.ok(state.checkpoints > checkpoints);
   await service.close();
+});
+
+test('idle IMAP errors retire the connection without crashing or retiring its replacement', async () => {
+  const { service, state } = syncHarness({ messages: [], sources: new Map() });
+  try {
+    await service.syncAll({ force: true });
+    const first = state.clients[0];
+    assert.doesNotThrow(() => first.emit('error', new Error('Socket timeout')));
+    await service.syncAll({ force: true });
+    assert.equal(state.connects, 2, 'a failed idle socket must not be reused');
+    const replacement = state.clients[1];
+    assert.doesNotThrow(() => first.emit('error', new Error('late old-socket error')));
+    await service.syncAll({ force: true });
+    assert.equal(state.connects, 2, 'late errors from the retired socket leave its replacement usable');
+    replacement.emit('close');
+    await service.syncAll({ force: true });
+    assert.equal(state.connects, 3, 'a closed connection must also be replaced');
+    assert.ok(state.logs.some((entry) => entry.message === 'IMAP connection became unavailable'));
+    await service.close();
+    assert.doesNotThrow(() => state.clients.at(-1).emit('error', new Error('late shutdown error')));
+  } finally {
+    await service.close();
+  }
+});
+
+test('IMAP error handling is installed before connect and remains during teardown', async () => {
+  let client;
+  const logs = [];
+  class FailingImapClient extends EventEmitter {
+    constructor() { super(); client = this; }
+    async connect() {
+      assert.equal(this.listenerCount('error'), 1);
+      this.emit('error', new Error('Socket timeout password=fixture-secret'));
+      throw new Error('Socket timeout');
+    }
+    async logout() { this.emit('error', new Error('late teardown error')); }
+  }
+  const service = createMailService({
+    config,
+    repos: {},
+    logger: { info() {}, warn(fields, message) { logs.push({ fields, message }); } },
+    ImapClient: FailingImapClient,
+    createSmtpTransport: () => ({ async verify() {}, close() {} }),
+  });
+  await assert.rejects(() => service.testSettings({
+    email: 'person@example.test', provider: 'custom', serverHost: 'mail.example.test',
+    credentials: { username: 'person@example.test', password: 'fixture-secret' },
+  }), (error) => error.code === 'IMAP_TIMEOUT');
+  assert.doesNotThrow(() => client.emit('error', new Error('after logout')));
+  assert.ok(logs.some(({ fields }) => fields.code === 'IMAP_TIMEOUT'));
+  assert.doesNotMatch(JSON.stringify(logs), /fixture-secret|person@example/);
+});
+
+test('failed pooled IMAP connects close their socket and never enter the reusable pool', async () => {
+  const { service, state } = syncHarness({ messages: [], sources: new Map(), connectFailure: true });
+  try {
+    await assert.rejects(() => service.syncAccount('sync-account', { force: true }),
+      (error) => error.code === 'IMAP_SYNC_FAILED');
+    assert.equal(state.openSessions, 0);
+    assert.doesNotThrow(() => state.clients[0].emit('error', new Error('late failed-connect error')));
+    await assert.rejects(() => service.syncAccount('sync-account', { force: true }),
+      (error) => error.code === 'IMAP_SYNC_FAILED');
+    assert.equal(state.connects, 2);
+    assert.equal(state.openSessions, 0);
+  } finally {
+    await service.close();
+  }
 });
 
 test('sqlite constraint messages are named without retrying the fetch', () => {

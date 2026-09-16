@@ -322,6 +322,41 @@ test('review cursors retain equal-time siblings and use received time with legac
   assert.equal(end.total, 4, 'an exhausted cursor does not claim the earlier blocked queue is empty');
 });
 
+test('review pages use pending-message ordering indexes in every scope and cursor mode', (t) => {
+  const db = createDatabase(tempConfig(t));
+  let pageQuery;
+  const tracked = new Proxy(db, {
+    get(target, property) {
+      if (property === 'prepare') return (sql) => {
+        const statement = target.prepare(sql);
+        if (/FROM messages WHERE analyzed_at IS NULL/.test(sql) && /ORDER BY/.test(sql)) {
+          const all = statement.all.bind(statement);
+          statement.all = (...args) => {
+            pageQuery = { sql, args };
+            return all(...args);
+          };
+        }
+        return statement;
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const repos = createRepositories(tracked);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  for (const accountId of [null, account.id]) {
+    for (const afterTimestamp of [null, '2026-01-01T00:00:00.000Z']) {
+      repos.messages.listUnanalyzed({ accountId, afterTimestamp, afterId: 'cursor-id', limit: 10 });
+      const plan = db.prepare(`EXPLAIN QUERY PLAN ${pageQuery.sql}`).all(...pageQuery.args)
+        .map((row) => row.detail).join('\n');
+      assert.doesNotMatch(plan, /TEMP B-TREE/);
+      if (accountId) assert.match(plan, /SEARCH messages USING INDEX idx_messages_review_account_order \(account_id=/);
+      else assert.match(plan, /USING INDEX idx_messages_review_order/);
+    }
+  }
+});
+
 test('WAL uses NORMAL synchronous, a bounded cache, and an explicit autocheckpoint', (t) => {
   const config = tempConfig(t);
   const database = createDatabase(config);

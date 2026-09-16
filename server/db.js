@@ -26,6 +26,15 @@ const json = (value, fallback = []) => {
 const stringify = (value, fallback = []) => JSON.stringify(value ?? fallback);
 const now = () => new Date().toISOString();
 
+// List/search candidates never need full message bodies. Keep this projection
+// explicit so SQLite does not load them before the UI's conversation pagination.
+const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_message_id, in_reply_to,
+  references_json, subject, from_name, from_email, to_json, cc_json,
+  bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
+  labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
+  snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
+  smart_category_reason, created_at, updated_at`;
+
 function publicAccount(row) {
   if (!row) return null;
   return {
@@ -96,9 +105,14 @@ function publicMessage(row) {
   };
 }
 
+function publicMessageMetadata(row) {
+  const { htmlBody: _html, textBody: _text, ...message } = publicMessage(row);
+  return message;
+}
+
 /** Bounded review metadata. Fetch get_message for omitted bodies or clipped fields. */
 function publicReviewMessage(row) {
-  const { htmlBody: _html, textBody: _text, ...message } = publicMessage(row);
+  const message = publicMessageMetadata(row);
   let summaryTruncated = false;
   const clip = (value, limit) => {
     if (typeof value !== 'string') return value;
@@ -424,6 +438,15 @@ function initSchema(db) {
     db.pragma('foreign_keys = ON');
   }
 
+  // Review pages seek directly through pending messages, both across all
+  // accounts and within one account. Install after any legacy table rebuild.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_review_order
+      ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_messages_review_account_order
+      ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL;
+  `);
+
   // Rules are partly operator-configured (ops-digest sources), so a changed
   // fingerprint reclassifies everything rather than only version-stale rows.
   const fingerprint = smartFilterFingerprint();
@@ -677,6 +700,29 @@ export function createDatabase(config, { key = config.databaseKey || null } = {}
 }
 
 export function createRepositories(db) {
+  const messageListSql = (projection) => `SELECT ${projection} FROM messages m
+      WHERE m.account_id = @accountId AND
+        CASE @folder
+          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
+          WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
+          WHEN 'drafts' THEN 0
+          WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
+          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
+          WHEN 'trash' THEN m.is_trashed = 1
+          WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
+          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
+        END
+        AND (@category = '' OR m.smart_category = @category)
+        AND (@query = '' OR m.subject LIKE @likeQuery OR m.from_name LIKE @likeQuery OR m.from_email LIKE @likeQuery OR m.snippet LIKE @likeQuery)
+      ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC LIMIT @limit OFFSET @offset`;
+  const reviewQueueSql = (scoped, after) => `SELECT ${MESSAGE_METADATA_COLUMNS}
+      FROM messages WHERE analyzed_at IS NULL
+        ${scoped ? 'AND account_id = @accountId' : ''}
+        ${after ? 'AND (COALESCE(received_at, sent_at, created_at), id) > (@afterTimestamp, @afterId)' : ''}
+      ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
+      LIMIT @limit`;
   const queries = {
     accountById: db.prepare('SELECT * FROM accounts WHERE id = ?'),
     accountByEmail: db.prepare('SELECT * FROM accounts WHERE email = ? COLLATE NOCASE'),
@@ -721,42 +767,17 @@ export function createRepositories(db) {
     messageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
     // This queue filters before LIMIT and spans all cached folders. Do not route
     // it through the conversation UI's bounded list/search candidate window.
-    unanalyzedMessages: db.prepare(`SELECT
-        id, account_id, thread_id, mailbox, uid, rfc_message_id, in_reply_to,
-        references_json, subject, from_name, from_email, to_json, cc_json,
-        bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
-        labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
-        snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
-        smart_category_reason, created_at, updated_at
-      FROM messages
-      WHERE analyzed_at IS NULL AND (@accountId IS NULL OR account_id = @accountId)
-        AND (@afterTimestamp IS NULL OR
-          COALESCE(received_at, sent_at, created_at) > @afterTimestamp OR
-          (COALESCE(received_at, sent_at, created_at) = @afterTimestamp AND id > @afterId))
-      ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
-      LIMIT @limit`),
-    unanalyzedMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages
-      WHERE analyzed_at IS NULL AND (@accountId IS NULL OR account_id = @accountId)`),
+    unanalyzedMessages: db.prepare(reviewQueueSql(false, false)),
+    unanalyzedMessagesAfter: db.prepare(reviewQueueSql(false, true)),
+    unanalyzedAccountMessages: db.prepare(reviewQueueSql(true, false)),
+    unanalyzedAccountMessagesAfter: db.prepare(reviewQueueSql(true, true)),
+    unanalyzedMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL'),
+    unanalyzedAccountMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND account_id = @accountId'),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
-    messageList: db.prepare(`SELECT m.* FROM messages m
-      WHERE m.account_id = @accountId AND
-        CASE @folder
-          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-          WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
-          WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
-          WHEN 'drafts' THEN 0
-          WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'trash' THEN m.is_trashed = 1
-          WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
-          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-          ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
-        END
-        AND (@category = '' OR m.smart_category = @category)
-        AND (@query = '' OR m.subject LIKE @likeQuery OR m.from_name LIKE @likeQuery OR m.from_email LIKE @likeQuery OR m.snippet LIKE @likeQuery)
-      ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC LIMIT @limit OFFSET @offset`),
+    messageList: db.prepare(messageListSql('m.*')),
+    messageListMetadata: db.prepare(messageListSql(MESSAGE_METADATA_COLUMNS.split(',').map((column) => `m.${column.trim()}`).join(', '))),
     messageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages m
       WHERE m.account_id = @accountId AND
         CASE @folder
@@ -1088,12 +1109,17 @@ export function createRepositories(db) {
           throw new RangeError('Review queue limit must be an integer from 1 to 200.');
         }
         // The read transaction keeps the count and page in the same snapshot.
-        const total = queries.unanalyzedMessageCount.get({ accountId }).count;
-        const rows = queries.unanalyzedMessages.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
+        const scoped = accountId !== null;
+        const count = scoped ? queries.unanalyzedAccountMessageCount : queries.unanalyzedMessageCount;
+        const page = scoped
+          ? (afterTimestamp === null ? queries.unanalyzedAccountMessages : queries.unanalyzedAccountMessagesAfter)
+          : (afterTimestamp === null ? queries.unanalyzedMessages : queries.unanalyzedMessagesAfter);
+        const total = count.get({ accountId }).count;
+        const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
         const items = rows.slice(0, limit).map(publicReviewMessage);
         return { items, total, hasMore: rows.length > limit };
       }),
-      list({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '', category = '', limit = 50, offset = 0 }) {
+      list({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '', category = '', limit = 50, offset = 0, includeBodies = true, includeTotal = true }) {
         const params = {
           accountId,
           folder,
@@ -1105,8 +1131,9 @@ export function createRepositories(db) {
           offset,
           now: now(),
         };
-        const items = queries.messageList.all(params).map(publicMessage);
-        return { items, total: queries.messageCount.get(params).count };
+        const statement = includeBodies ? queries.messageList : queries.messageListMetadata;
+        const items = statement.all(params).map(includeBodies ? publicMessage : publicMessageMetadata);
+        return { items, ...(includeTotal ? { total: queries.messageCount.get(params).count } : {}) };
       },
       categoryCounts({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '' }) {
         const counts = Object.fromEntries(SMART_CATEGORY_SLUGS.map((category) => [category, 0]));
@@ -1221,10 +1248,10 @@ export function createRepositories(db) {
           now: now(),
         }).map((row) => row.threadId);
       },
-      forThreads(threadIds = [], { folder = '', mailbox = 'INBOX' } = {}) {
+      forThreads(threadIds = [], { folder = '', mailbox = 'INBOX', includeBodies = true } = {}) {
         const ids = [...new Set(threadIds.filter(Boolean))];
         if (!ids.length) return [];
-        const sql = `SELECT * FROM messages WHERE thread_id IN (${ids.map(() => '?').join(',')})
+        const sql = `SELECT ${includeBodies ? '*' : MESSAGE_METADATA_COLUMNS} FROM messages WHERE thread_id IN (${ids.map(() => '?').join(',')})
           ${folder ? `AND CASE ?
             WHEN 'inbox' THEN mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
             WHEN 'starred' THEN is_starred = 1 AND is_trashed = 0
@@ -1243,7 +1270,7 @@ export function createRepositories(db) {
         const params = folder
           ? [...ids, folder, nowValue, nowValue, nowValue, mailbox]
           : ids;
-        return statement.all(...params).map(publicMessage);
+        return statement.all(...params).map(includeBodies ? publicMessage : publicMessageMetadata);
       },
     },
     threads: {

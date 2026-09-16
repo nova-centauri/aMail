@@ -10,25 +10,39 @@ export function registerMcp(app, { config, repos, mailService, remoteContent, au
   const gate = accessGate(auth);
   const handleMcp = async (request, response) => {
     const server = createAmailMcpServer({ config, repos, mailService, remoteContent });
+    let transport;
+    let closed = false;
+    const cleanup = async () => {
+      if (closed) return;
+      closed = true;
+      await transport?.close().catch(() => {});
+      await server.close().catch(() => {});
+    };
+    // handleRequest waits for the SSE response to finish. Register first so a
+    // disconnect also closes the protocol and aborts any in-flight tool handler.
+    response.once('close', cleanup);
     try {
-      const transport = new StreamableHTTPServerTransport({
+      transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
       await server.connect(transport);
+      if (response.destroyed) {
+        await cleanup();
+        return;
+      }
       await transport.handleRequest(request, response, request.body);
-      response.on('close', () => {
-        transport.close().catch(() => {});
-        server.close().catch(() => {});
-      });
     } catch (error) {
       request.log?.error?.({ err: error }, 'MCP request failed');
-      if (!response.headersSent) {
+      if (!response.headersSent && !response.destroyed) {
         response.status(500).json({
           jsonrpc: '2.0',
           error: { code: -32603, message: 'Internal server error' },
           id: null,
         });
+      } else if (!response.writableEnded && !response.destroyed) {
+        response.end();
       }
+      await cleanup();
     }
   };
 
