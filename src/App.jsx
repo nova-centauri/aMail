@@ -22,6 +22,7 @@ import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.
 import { quotedComposeHtml } from './mail/html.js';
 import { formatMessageDate, getArray, normalizeAccount, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
 import { collectKnownPeople } from './mail/people.js';
+import { mergeOpenThread, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
 import { sanitizeSignatureHtml } from './mail/signature.js';
 import { syncResultStatus, syncSkippedMessageCount } from './mail/sync.js';
 import { authenticateWithPasskey, passkeysSupported, registerPasskey } from './passkeys.js';
@@ -278,12 +279,9 @@ export default function App() {
         setDismissedFreshDrafts(prunedDismissals);
         writeDismissedFreshDrafts(prunedDismissals);
       }
-      if (keepSelection && selectedThread) {
-        const replacement = (isFreshSetup ? previewThreads : nextThreads).find((item) => item.id === selectedThread.id);
-        setSelectedThread(replacement || null);
-      } else {
-        setSelectedThread(null);
-      }
+      // Functional update so an in-flight reload cannot close a thread opened after it started.
+      const loadedThreads = isFreshSetup ? previewThreads : nextThreads;
+      setSelectedThread((current) => reconcileSelectedThread(current, loadedThreads, { keepSelection }));
     } catch (error) {
       if (requestId !== loadRequestRef.current) return;
       if (error.status === 401 || error.status === 403) {
@@ -308,7 +306,7 @@ export default function App() {
     } finally {
       if (requestId === loadRequestRef.current) setLoading(false);
     }
-  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, debouncedQuery, onboardingDismissed, selectedThread]);
+  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, debouncedQuery, onboardingDismissed]);
 
   const lastChangeRef = useRef('');
   const liveSyncInboxes = useCallback(async ({ immediate } = {}) => {
@@ -570,8 +568,12 @@ export default function App() {
         messages: data?.messages || data?.thread?.messages || [],
       };
       const detailed = normalizeThread(raw);
-      setSelectedThread(detailed);
-      setThreads((current) => current.map((item) => item.id === detailed.id ? { ...item, ...detailed } : item));
+      setSelectedThread((current) => (
+        sameOpenThread(current, thread) || sameOpenThread(current, detailed)
+          ? mergeOpenThread(current, detailed)
+          : current
+      ));
+      setThreads((current) => current.map((item) => sameOpenThread(item, detailed) ? { ...item, ...detailed } : item));
     } catch {
       // The compact list payload remains a valid reader view.
     }
