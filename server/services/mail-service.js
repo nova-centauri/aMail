@@ -438,7 +438,15 @@ export function createMailService({
     await entry.client.logout().catch(() => {});
   }
 
+  const poolConnecting = new Map();
+
   async function acquirePooledClient(account, credentials) {
+    // Callers that arrive while the session is still connecting (a thread-wide
+    // action fans out one call per message) share that one attempt, including
+    // its failure: retrying a rejected login once per waiter is how accounts
+    // get locked out.
+    const pending = poolConnecting.get(account.id);
+    if (pending) await pending;
     const existing = imapPool.get(account.id);
     if (existing?.usable) {
       existing.refs += 1;
@@ -446,6 +454,16 @@ export function createMailService({
       clearPoolTimer(existing);
       return existing;
     }
+    const connecting = openPooledClient(account, credentials, existing);
+    poolConnecting.set(account.id, connecting);
+    try {
+      return await connecting;
+    } finally {
+      if (poolConnecting.get(account.id) === connecting) poolConnecting.delete(account.id);
+    }
+  }
+
+  async function openPooledClient(account, credentials, existing) {
     if (existing) await evictPoolEntry(account.id);
     const client = newImapClient(account, credentials, { pooled: true });
     try {
@@ -1386,14 +1404,18 @@ export function createMailService({
       };
     }
     const { account, credentials } = accountAndCredentials(message.accountId);
-    const client = newImapClient(account, credentials);
+    // Mutations share the account's pooled session with sync. An agent or a
+    // thread-wide action can issue thousands of these; a login per message
+    // (and, for a thread, all of them at once) is what providers throttle.
+    // ImapFlow queues commands and the mailbox lock serializes SELECTs.
+    const entry = await acquirePooledClient(account, credentials);
+    const client = entry.client;
     let lock;
     const action = remoteMoveAction(state);
     try {
-      await client.connect();
       let destination = null;
       if (action) {
-        destination = specialUseDestination(await client.list(), action);
+        destination = specialUseDestination(await pooledList(entry), action);
         if (!destination) {
           return {
             message,
@@ -1442,9 +1464,14 @@ export function createMailService({
         message: movedMessage,
         remoteSync: { attempted: true, status: 'moved', action, destination, tracking },
       };
+    } catch (error) {
+      if (imapPool.get(account.id) === entry && (failedImapClients.has(client) || !entry.usable)) {
+        await evictPoolEntry(account.id);
+      }
+      throw error;
     } finally {
       lock?.release();
-      await client.logout().catch(() => {});
+      if (imapPool.get(account.id) === entry) releasePooledClient(account.id);
     }
   }
 

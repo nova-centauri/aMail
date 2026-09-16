@@ -977,6 +977,79 @@ test('Gmail skips IMAP APPEND because Gmail automatically files SMTP sends', asy
   });
 });
 
+function mutationHarness({ connectFailure = false } = {}) {
+  const account = {
+    id: 'mutation-account',
+    email: 'mutate@example.test',
+    provider: 'custom',
+    imap_host: 'mail.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    credential_ciphertext: encryptJson({ username: 'mutate@example.test', password: 'test-password' }, config.credentialKey),
+  };
+  const state = { connects: 0, openSessions: 0, maxOpenSessions: 0, flagged: [] };
+  class FakeImapClient extends EventEmitter {
+    async connect() {
+      state.connects += 1;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (connectFailure) throw Object.assign(new Error('Invalid credentials'), { authenticationFailed: true });
+      state.openSessions += 1;
+      state.maxOpenSessions = Math.max(state.maxOpenSessions, state.openSessions);
+    }
+    async list() { return [{ path: 'INBOX', specialUse: '\\Inbox' }]; }
+    async mailboxOpen() {}
+    async getMailboxLock() { return { release() {} }; }
+    async messageFlagsAdd(uid, flags) { state.flagged.push({ uid, flags }); return true; }
+    async logout() {
+      if (this.closed) return;
+      this.closed = true;
+      state.openSessions -= 1;
+    }
+    close() { void this.logout(); }
+  }
+  const messages = new Map(Array.from({ length: 50 }, (_, index) => {
+    const id = `message-${index + 1}`;
+    return [id, { id, accountId: account.id, mailbox: 'INBOX', uid: index + 1 }];
+  }));
+  const service = createMailService({
+    config: { ...config, imapPoolIdleMs: 60_000 },
+    repos: {
+      accounts: { getRaw: (id) => (id === account.id ? account : null) },
+      messages: {
+        get: (id) => messages.get(id),
+        setState: (id) => messages.get(id),
+      },
+    },
+    logger: { info() {}, warn() {} },
+    ImapClient: FakeImapClient,
+  });
+  return { service, state, ids: [...messages.keys()] };
+}
+
+test('a burst of message mutations shares one pooled IMAP session', async () => {
+  const { service, state, ids } = mutationHarness();
+
+  // A thread-wide "read" fans out one update per message, all at once.
+  const results = await Promise.all(ids.map((id) => service.updateMessageState(id, { isRead: true })));
+
+  assert.ok(results.every((result) => result.remoteSync.status === 'synced'));
+  assert.equal(state.connects, 1);
+  assert.equal(state.maxOpenSessions, 1);
+  assert.equal(state.flagged.length, 50);
+  await service.close();
+  assert.equal(state.openSessions, 0);
+});
+
+test('concurrent mutations share one failed login instead of retrying it per message', async () => {
+  const { service, state, ids } = mutationHarness({ connectFailure: true });
+
+  const results = await Promise.all(ids.map((id) => service.updateMessageState(id, { isRead: true })));
+
+  assert.ok(results.every((result) => result.remoteSync.status === 'failed'));
+  assert.equal(state.connects, 1);
+  await service.close();
+});
+
 test('attachment download re-fetches the original IMAP source and returns one part', async () => {
   const pdf = Buffer.from('%PDF-1.4 attachment-bytes');
   const source = Buffer.from([
