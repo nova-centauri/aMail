@@ -220,7 +220,13 @@ function syncHarness({
       const matches = messages.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
       if (fetchHangs) {
         this.fetching = true;
-        await new Promise((_, reject) => this.once('close', () => reject(new Error('Connection closed'))));
+        // A real stuck socket is a live handle; without one the event loop
+        // would drain before the (unref'd) deadline could fire.
+        const socket = setInterval(() => {}, 1_000);
+        await new Promise((_, reject) => this.once('close', () => {
+          clearInterval(socket);
+          reject(new Error('Connection closed'));
+        }));
       }
       this.fetching = true;
       try {
