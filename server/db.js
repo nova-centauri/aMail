@@ -34,7 +34,7 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
   labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
-  smart_category_reason, created_at, updated_at`;
+  smart_category_reason, source_imported, created_at, updated_at`;
 
 function publicAccount(row) {
   if (!row) return null;
@@ -98,6 +98,7 @@ function publicMessage(row) {
     isAnalyzed: Boolean(row.analyzed_at),
     analyzedAt: row.analyzed_at || null,
     analyzedBy: row.analyzed_by || null,
+    sourceImported: row.source_imported === undefined || row.source_imported === null ? true : Boolean(row.source_imported),
     category,
     categoryLabel: categoryLabel(category),
     categoryReason: row.smart_category_reason || 'No automated category signal matched.',
@@ -276,6 +277,7 @@ function initSchema(db) {
       smart_category_reason TEXT NOT NULL DEFAULT '',
       smart_category_rule TEXT NOT NULL DEFAULT '',
       smart_category_version INTEGER NOT NULL DEFAULT 0,
+      source_imported INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(account_id, mailbox, uid)
@@ -346,6 +348,7 @@ function initSchema(db) {
   if (!messageColumns.has('smart_category_version')) db.exec('ALTER TABLE messages ADD COLUMN smart_category_version INTEGER NOT NULL DEFAULT 0');
   if (!messageColumns.has('analyzed_at')) db.exec('ALTER TABLE messages ADD COLUMN analyzed_at TEXT');
   if (!messageColumns.has('analyzed_by')) db.exec("ALTER TABLE messages ADD COLUMN analyzed_by TEXT NOT NULL DEFAULT ''");
+  if (!messageColumns.has('source_imported')) db.exec('ALTER TABLE messages ADD COLUMN source_imported INTEGER NOT NULL DEFAULT 1');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_smart_category ON messages(account_id, smart_category, sent_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_analyzed ON messages(account_id, analyzed_at)');
   const threadColumns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => column.name));
@@ -442,13 +445,20 @@ function initSchema(db) {
   // Reply threading falls back to the newest thread with the same subject.
   db.exec('CREATE INDEX IF NOT EXISTS idx_threads_subject ON threads(account_id, normalized_subject, latest_at DESC)');
 
+  const columnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
+  if (!columnsAfterRebuild.has('source_imported')) {
+    db.exec('ALTER TABLE messages ADD COLUMN source_imported INTEGER NOT NULL DEFAULT 1');
+  }
+
   // Review pages seek directly through pending messages, both across all
   // accounts and within one account. Install after any legacy table rebuild.
   db.exec(`
+    DROP INDEX IF EXISTS idx_messages_review_order;
+    DROP INDEX IF EXISTS idx_messages_review_account_order;
     CREATE INDEX IF NOT EXISTS idx_messages_review_order
-      ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL;
+      ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
     CREATE INDEX IF NOT EXISTS idx_messages_review_account_order
-      ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL;
+      ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
   `);
 
   // Rules are partly operator-configured (ops-digest sources), so a changed
@@ -799,7 +809,7 @@ export function createRepositories(db) {
         AND (@query = '' OR m.subject LIKE @likeQuery OR m.from_name LIKE @likeQuery OR m.from_email LIKE @likeQuery OR m.snippet LIKE @likeQuery)
       ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC LIMIT @limit OFFSET @offset`;
   const reviewQueueSql = (scoped, after) => `SELECT ${MESSAGE_METADATA_COLUMNS}
-      FROM messages WHERE analyzed_at IS NULL
+      FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
         ${scoped ? 'AND account_id = @accountId' : ''}
         ${after ? 'AND (COALESCE(received_at, sent_at, created_at), id) > (@afterTimestamp, @afterId)' : ''}
       ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
@@ -852,8 +862,8 @@ export function createRepositories(db) {
     unanalyzedMessagesAfter: db.prepare(reviewQueueSql(false, true)),
     unanalyzedAccountMessages: db.prepare(reviewQueueSql(true, false)),
     unanalyzedAccountMessagesAfter: db.prepare(reviewQueueSql(true, true)),
-    unanalyzedMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL'),
-    unanalyzedAccountMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND account_id = @accountId'),
+    unanalyzedMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1'),
+    unanalyzedAccountMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1 AND account_id = @accountId'),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
@@ -941,6 +951,7 @@ export function createRepositories(db) {
             AND mailbox = 'INBOX'
             AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
             AND analyzed_at IS NULL
+            AND COALESCE(source_imported, 1) = 1
             AND (snoozed_until IS NULL OR snoozed_until <= @now)
             AND smart_category <> 'ops_quiet'
           GROUP BY thread_id
@@ -953,14 +964,14 @@ export function createRepositories(db) {
       sent_at, received_at, html_body, text_body, snippet, attachments_json, labels_json,
       is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent,
       smart_category, smart_category_reason, smart_category_rule, smart_category_version,
-      created_at, updated_at
+      source_imported, created_at, updated_at
     ) VALUES (
       @id, @account_id, @thread_id, @mailbox, @uid, @rfc_message_id, @in_reply_to, @references_json,
       @subject, @from_name, @from_email, @to_json, @cc_json, @bcc_json, @reply_to_json,
       @sent_at, @received_at, @html_body, @text_body, @snippet, @attachments_json, @labels_json,
       @is_read, @is_starred, @is_archived, @is_trashed, @is_spam, @snoozed_until, @is_sent,
       @smart_category, @smart_category_reason, @smart_category_rule, @smart_category_version,
-      @created_at, @updated_at
+      @source_imported, @created_at, @updated_at
     )`),
     messageUpdate: db.prepare(`UPDATE messages SET
       thread_id = @thread_id, mailbox = @mailbox, uid = @uid, rfc_message_id = @rfc_message_id,
@@ -973,7 +984,8 @@ export function createRepositories(db) {
       is_spam = @is_spam, snoozed_until = @snoozed_until,
       is_sent = @is_sent, smart_category = @smart_category,
       smart_category_reason = @smart_category_reason, smart_category_rule = @smart_category_rule,
-      smart_category_version = @smart_category_version, updated_at = @updated_at
+      smart_category_version = @smart_category_version,
+      source_imported = COALESCE(@source_imported, source_imported), updated_at = @updated_at
       WHERE id = @id`),
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
     messageState: db.prepare(`UPDATE messages SET
@@ -1063,7 +1075,7 @@ export function createRepositories(db) {
       latest_at: newest.sent_at || newest.received_at || newest.created_at,
       message_count: messages.length,
       unread_count: messages.filter((message) => !message.is_read).length,
-      unanalyzed_count: messages.filter((message) => !message.analyzed_at).length,
+      unanalyzed_count: messages.filter((message) => !message.analyzed_at && Number(message.source_imported ?? 1) === 1).length,
       is_starred: messages.some((message) => message.is_starred) ? 1 : 0,
       labels_json: stringify(labels),
       updated_at: now(),
@@ -1221,6 +1233,7 @@ export function createRepositories(db) {
       },
       forThread: (threadId) => queries.messagesByThread.all(threadId).map(publicMessage),
       findByRfcId: (accountId, messageId) => publicMessage(queries.messageByRfcId.get(accountId, messageId)),
+      findByUid: (accountId, mailbox, uid) => publicMessage(queries.messageByUid.get(accountId, mailbox, uid)),
       upsert: db.transaction((input) => {
         const classification = classifyMessage(input);
         const classifiedInput = {
@@ -1229,6 +1242,7 @@ export function createRepositories(db) {
           smart_category_reason: classification.categoryReason,
           smart_category_rule: classification.rule,
           smart_category_version: classification.version,
+          source_imported: input.source_imported === 0 ? 0 : 1,
         };
         const uid = classifiedInput.uid === null || classifiedInput.uid === undefined
           ? null
@@ -1244,6 +1258,10 @@ export function createRepositories(db) {
 
         if (byUid) {
           row.id = byUid.id;
+          // Envelope-only IMAP hits must not wipe a fully imported source.
+          if (Number(byUid.source_imported ?? 1) === 1 && classifiedInput.source_imported === 0) {
+            return publicMessage(byUid);
+          }
           return updateMessageRow(byUid, row);
         }
 
@@ -1251,6 +1269,9 @@ export function createRepositories(db) {
         // Message-ID in the same mailbox and fills the server-assigned UID in.
         if (byRfc && byRfc.mailbox === classifiedInput.mailbox) {
           row.id = byRfc.id;
+          if (Number(byRfc.source_imported ?? 1) === 1 && classifiedInput.source_imported === 0) {
+            return publicMessage(byRfc);
+          }
           return updateMessageRow(byRfc, row);
         }
 
@@ -1305,6 +1326,7 @@ export function createRepositories(db) {
         category = '',
         personEmails = [],
         hideQuiet = false,
+        extraThreadIds = [],
         limit = 50,
         offset = 0,
       } = {}) {
@@ -1317,6 +1339,7 @@ export function createRepositories(db) {
           category,
           personEmails,
           hideQuiet,
+          extraThreadIds,
           limit,
           offset,
           nowIso: now(),

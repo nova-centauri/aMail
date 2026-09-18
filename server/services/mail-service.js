@@ -28,6 +28,16 @@ import {
   publicAttachmentMeta,
   storedAttachmentRecords,
 } from './compose-attachments.js';
+import {
+  IMAP_ENVELOPE_FETCH_CAP,
+  IMAP_SEARCH_MAILBOX_CAP,
+  bodyStructureFilenames,
+  canUseGmraw,
+  mailboxesForSearch,
+  newestUids,
+  toGmailRawQuery,
+  toImapSearchQuery,
+} from '../mail/imap-search.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
@@ -442,6 +452,9 @@ export function createMailService({
   const attachmentCache = new Map();
   const imapPool = new Map();
   const accountGenerations = new Map();
+  let searchGeneration = 0;
+  let activeSearchAbort = null;
+  let searchChain = Promise.resolve();
   const accountGeneration = (accountId) => accountGenerations.get(accountId) || 0;
   const assertAccountGeneration = (accountId, generation) => {
     if (accountGeneration(accountId) !== generation) {
@@ -684,6 +697,65 @@ export function createMailService({
       is_spam: mailboxRole === 'spam' ? 1 : 0,
       snoozed_until: null,
       is_sent: isSent ? 1 : 0,
+      source_imported: 1,
+    };
+  }
+
+  function envelopeSearchPayload({ account, mailbox, role, allMailMirror = false, message }) {
+    const envelope = message.envelope || {};
+    const messageId = envelope.messageId || null;
+    const references = normalizeMessageIds(envelope.references);
+    const inReplyTo = normalizeMessageIds(envelope.inReplyTo)[0] || null;
+    const subject = envelope.subject || '(no subject)';
+    const flags = new Set(setValues(message.flags));
+    const labels = setValues(message.labels).map(String);
+    const mailboxRole = role || folderForMailbox(mailbox);
+    const isSent = mailboxRole === 'sent';
+    if (allMailMirror && messageId) {
+      const existing = repos.messages.findByRfcId(account.id, messageId);
+      if (existing && existing.mailbox !== mailbox) return null;
+    }
+    const existingUid = Number.isInteger(message.uid)
+      ? repos.messages.findByUid?.(account.id, mailbox, message.uid)
+      : null;
+    if (existingUid?.sourceImported) return null;
+    const thread = existingUid
+      ? repos.threads.get(existingUid.threadId)
+      : resolveThread({ accountId: account.id, subject, inReplyTo, references });
+    const filenames = bodyStructureFilenames(message.bodyStructure);
+    const receivedAt = asIso(message.internalDate || envelope.date);
+    return {
+      account_id: account.id,
+      thread_id: thread.id,
+      mailbox,
+      uid: Number.isInteger(message.uid) ? message.uid : null,
+      rfc_message_id: messageId,
+      in_reply_to: inReplyTo,
+      references_json: stringify(references),
+      subject,
+      from_name: sender(envelope.from).name,
+      from_email: sender(envelope.from).email,
+      to_json: serializeAddresses(envelope.to),
+      cc_json: serializeAddresses(envelope.cc),
+      bcc_json: serializeAddresses(envelope.bcc),
+      reply_to_json: stringify(addressList(envelope.replyTo), null),
+      sent_at: asIso(envelope.date || message.internalDate),
+      received_at: receivedAt,
+      html_body: '',
+      text_body: '',
+      snippet: textSnippet(subject),
+      attachments_json: stringify(filenames.map((filename, index) => ({
+        index, filename, contentType: 'application/octet-stream', size: 0, contentId: null,
+      }))),
+      labels_json: stringify(labels),
+      is_read: flags.has('\\Seen') ? 1 : 0,
+      is_starred: flags.has('\\Flagged') ? 1 : 0,
+      is_archived: mailboxRole === 'archive' ? 1 : 0,
+      is_trashed: mailboxRole === 'trash' ? 1 : 0,
+      is_spam: mailboxRole === 'spam' ? 1 : 0,
+      snoozed_until: null,
+      is_sent: isSent ? 1 : 0,
+      source_imported: 0,
     };
   }
 
@@ -1595,6 +1667,173 @@ export function createMailService({
     }
   }
 
+  async function hydrateMessageSource(id, { signal } = {}) {
+    const message = repos.messages.get(id);
+    if (!message) throw new NotFoundError('Message not found.');
+    if (message.sourceImported !== false) return message;
+    if (!Number.isInteger(message.uid) || message.uid < 1) return message;
+    const { account, credentials } = accountAndCredentials(message.accountId);
+    const generation = accountGeneration(account.id);
+    const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
+      ? config.syncMaxMessageBytes
+      : DEFAULT_SYNC_MAX_MESSAGE_BYTES;
+    const client = newImapClient(account, credentials);
+    let lock;
+    try {
+      if (signal?.aborted) return message;
+      await client.connect();
+      lock = await client.getMailboxLock(message.mailbox || 'INBOX', { readOnly: true });
+      const sourceMessage = await client.fetchOne(message.uid, {
+        uid: true,
+        envelope: true,
+        flags: true,
+        labels: true,
+        internalDate: true,
+        source: { start: 0, maxLength: maxMessageBytes + 1 },
+      }, { uid: true });
+      const source = sourceMessage?.source;
+      if (!Buffer.isBuffer(source) || source.length > maxMessageBytes) return message;
+      const payload = await ingestImapMessage({
+        account,
+        mailbox: message.mailbox || 'INBOX',
+        role: folderForMailbox(message.mailbox),
+        generation,
+        message: { ...sourceMessage, source },
+      });
+      if (!payload) return message;
+      payload.source_imported = 1;
+      return repos.messages.upsert(payload) || message;
+    } catch (error) {
+      logger.warn({ messageId: id, err: cleanupError(error) }, 'Could not hydrate message source from IMAP');
+      return message;
+    } finally {
+      lock?.release();
+      await client.logout().catch(() => {});
+    }
+  }
+
+  async function searchAccountMailboxes({ account, credentials, parsed, folder, abort }) {
+    const generation = accountGeneration(account.id);
+    const entry = await acquirePooledClient(account, credentials);
+    const client = entry.client;
+    const pending = [];
+    const threadIds = new Set();
+    try {
+      const folders = await pooledList(entry);
+      const descriptors = mailboxesForSearch(discoverSyncMailboxes(folders), folder).slice(0, IMAP_SEARCH_MAILBOX_CAP);
+      const useGmraw = canUseGmraw(account, client);
+      const raw = useGmraw ? toGmailRawQuery(parsed) : '';
+      const imapQuery = useGmraw ? (raw ? { gmraw: raw } : null) : toImapSearchQuery(parsed);
+      if (!imapQuery) return [];
+      for (const descriptor of descriptors) {
+        if (abort?.aborted) return [...threadIds];
+        let lock;
+        try {
+          lock = await client.getMailboxLock(descriptor.mailbox, { readOnly: true });
+          const uids = newestUids(await client.search(imapQuery, { uid: true }) || []);
+          if (abort?.aborted) return [...threadIds];
+          const missing = [];
+          for (const uid of uids) {
+            const existing = repos.messages.findByUid?.(account.id, descriptor.mailbox, uid);
+            if (existing) {
+              if (existing.threadId) threadIds.add(existing.threadId);
+              continue;
+            }
+            missing.push(uid);
+            if (missing.length >= IMAP_ENVELOPE_FETCH_CAP) break;
+          }
+          if (!missing.length) continue;
+          for await (const message of client.fetch(missing.join(','), {
+            uid: true,
+            envelope: true,
+            flags: true,
+            labels: true,
+            internalDate: true,
+            bodyStructure: true,
+          }, { uid: true })) {
+            if (abort?.aborted) return [...threadIds];
+            if (parsed.hasAttachment != null && !canUseGmraw(account, client)) {
+              const filenames = bodyStructureFilenames(message.bodyStructure);
+              if (parsed.hasAttachment === true && !filenames.length) continue;
+              if (parsed.hasAttachment === false && filenames.length) continue;
+            }
+            const payload = envelopeSearchPayload({
+              account,
+              mailbox: descriptor.mailbox,
+              role: descriptor.role,
+              allMailMirror: descriptor.allMailMirror,
+              message,
+            });
+            if (payload) pending.push(payload);
+          }
+        } catch (error) {
+          logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH failed for a mailbox');
+        } finally {
+          lock?.release();
+        }
+      }
+      if (!pending.length || abort?.aborted) return [...threadIds];
+      const write = () => {
+        for (const payload of pending) {
+          try {
+            const saved = repos.messages.upsert(payload);
+            if (saved?.threadId) threadIds.add(saved.threadId);
+          } catch (error) {
+            logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH hit could not be stored');
+          }
+        }
+      };
+      if (typeof repos.runWriteBatch === 'function') repos.runWriteBatch(write);
+      else write();
+      assertAccountGeneration(account.id, generation);
+      return [...threadIds];
+    } finally {
+      if (imapPool.get(account.id) === entry) releasePooledClient(account.id);
+    }
+  }
+
+  async function searchAndMaterialize({ accounts = [], parsed, folder = 'inbox', signal } = {}) {
+    const generation = ++searchGeneration;
+    activeSearchAbort?.abort();
+    const abort = new AbortController();
+    activeSearchAbort = abort;
+    if (signal) {
+      if (signal.aborted) abort.abort();
+      else signal.addEventListener?.('abort', () => abort.abort(), { once: true });
+    }
+    const run = async () => {
+      const threadIds = [];
+      if (generation !== searchGeneration || abort.aborted) return { cancelled: true, threadIds };
+      // Search uses the accounts already in this list request. Disabled background
+      // sync must not hide provider SEARCH for leftover-text human queries.
+      const list = (accounts || []).filter(Boolean);
+      for (const account of list) {
+        if (generation !== searchGeneration || abort.aborted) return { cancelled: true, threadIds };
+        try {
+          const raw = repos.accounts.getRaw(account.id) || account;
+          const credentials = decryptJson(raw.credential_ciphertext, config.credentialKey);
+          const found = await searchAccountMailboxes({
+            account: raw,
+            credentials,
+            parsed,
+            folder,
+            abort,
+          });
+          if (Array.isArray(found)) threadIds.push(...found);
+        } catch (error) {
+          logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH fallback failed for an account');
+        }
+      }
+      return {
+        cancelled: abort.aborted || generation !== searchGeneration,
+        threadIds: [...new Set(threadIds)],
+      };
+    };
+    const queued = searchChain.then(run, run);
+    searchChain = queued.catch(() => {});
+    return queued;
+  }
+
   async function updateMessageState(id, state) {
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
@@ -1618,5 +1857,5 @@ export function createMailService({
     }
   }
 
-  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, invalidateAccount, close };
+  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, hydrateMessageSource, searchAndMaterialize, invalidateAccount, close };
 }

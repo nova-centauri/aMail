@@ -38,6 +38,14 @@ describe('parseMailboxQuery', () => {
       'from:Ada to:sales@example.com has:attachment after:2026-01-06 is:starred invoice',
     );
   });
+
+  it('treats in:anywhere as All Mail and preserves the MCP opt-in flag', () => {
+    const parsed = parseMailboxQuery('in:anywhere invoice', { now });
+    expect(parsed.anywhere).toBe(true);
+    expect(parsed.folder).toBe('all');
+    expect(parsed.text).toBe('invoice');
+    expect(serializeMailboxQuery(parsed)).toBe('in:anywhere invoice');
+  });
 });
 
 describe('conversationMatchesMailboxQuery', () => {

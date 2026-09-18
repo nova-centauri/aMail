@@ -189,7 +189,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       folder: z.string().optional().describe('inbox, starred, snoozed, sent, drafts, all, trash, spam, or archive'),
       accountId: z.string().optional().describe('Limit to one account id'),
       category: z.string().optional().describe('Smart filter: primary, github_ci, logs, status, ops_error'),
-      q: z.string().optional().describe('Search query. Gmail-style operators work: from:, to:, subject:, has:attachment, after:, before:, is:unread, is:starred, is:unanalyzed, is:analyzed, in:'),
+      q: z.string().optional().describe('Search query. Gmail-style operators work: from:, to:, subject:, has:attachment, after:, before:, is:unread, is:starred, is:unanalyzed, is:analyzed, in:. Cache-only unless q includes in:anywhere, which also searches the provider. is:analyzed / is:unanalyzed never search IMAP.'),
       page: z.number().int().optional().describe('Page number (1-based)'),
       pageSize: z.number().int().optional().describe('Results per page (1-200)'),
       flag: z.string().optional().describe('Person flag id (see list_flags)'),
@@ -202,6 +202,8 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     page: args.page,
     pageSize: args.pageSize,
     query: args.q,
+    mailService,
+    searchSource: 'mcp',
   })));
 
   server.registerTool('list_unanalyzed_messages', {
@@ -246,8 +248,9 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       id: z.string().describe('Message id'),
     },
   }, async ({ id }) => runTool(async () => {
-    const message = repos.messages.get(id);
+    let message = repos.messages.get(id);
     if (!message) throw new NotFoundError('Message not found.');
+    if (mailService?.hydrateMessageSource) message = await mailService.hydrateMessageSource(id);
     return { message };
   }));
 
@@ -307,7 +310,11 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
   }, async ({ id }) => runTool(async () => {
     const thread = repos.threads.get(id);
     if (!thread) throw new NotFoundError('Thread not found.');
-    const messages = repos.messages.forThread(thread.id);
+    const stored = repos.messages.forThread(thread.id);
+    const messages = [];
+    for (const item of stored) {
+      messages.push(mailService?.hydrateMessageSource ? await mailService.hydrateMessageSource(item.id) : item);
+    }
     return { thread: { ...thread, messages }, messages };
   }));
 

@@ -10,6 +10,7 @@ import {
   sqliteConstraintReason,
 } from './mail-service.js';
 import { encryptJson } from './crypto.js';
+import { parseMailboxQuery } from '../mail/search-query.js';
 
 const config = {
   allowInsecureTls: false,
@@ -1358,4 +1359,238 @@ test('strict attachment download bounds metadata, stored bytes, decoded bytes, a
   assert.equal(sourceOversize.state.sourceMaxLength, 33);
   assert.equal(sourceOversize.state.releases, 1);
   assert.equal(sourceOversize.state.logouts, 1);
+});
+
+function searchHarness({
+  provider = 'custom',
+  messages = [],
+  sources = new Map(),
+  searchDelayMs = 0,
+  gate = null,
+} = {}) {
+  const account = {
+    id: 'search-account',
+    email: 'sync@example.test',
+    display_name: 'Search Account',
+    provider,
+    imap_host: 'mail.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    smtp_host: 'mail.example.test',
+    smtp_port: 465,
+    smtp_secure: 1,
+    signature: '',
+    sync_enabled: 0,
+    credential_ciphertext: encryptJson({ username: 'sync@example.test', password: 'test-password' }, config.credentialKey),
+  };
+  const state = {
+    searchQueries: [],
+    fetchCalls: [],
+    fetchOneCalls: [],
+    savedMessages: [],
+    searchStarts: 0,
+  };
+  class FakeImapClient extends EventEmitter {
+    constructor() {
+      super();
+      this.capabilities = provider === 'gmail' ? new Map([['X-GM-EXT-1', true]]) : new Map();
+    }
+    async connect() {}
+    async list() {
+      return [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }];
+    }
+    async mailboxOpen() {}
+    async getMailboxLock() {
+      return { release() {} };
+    }
+    async search(query) {
+      state.searchStarts += 1;
+      state.searchQueries.push(query);
+      if (gate?.started) gate.started();
+      if (gate?.hold) await gate.hold;
+      if (searchDelayMs) await new Promise((resolve) => setTimeout(resolve, searchDelayMs));
+      return messages.map((message) => message.uid);
+    }
+    async *fetch(range, query, options) {
+      state.fetchCalls.push({ range, query, options });
+      const wanted = new Set(String(range).split(',').map(Number));
+      for (const message of messages.filter((item) => wanted.has(item.uid))) {
+        yield { uid: message.uid, ...message };
+      }
+    }
+    async fetchOne(uid, query, options) {
+      state.fetchOneCalls.push({ uid, query, options });
+      const message = messages.find((item) => item.uid === uid);
+      const source = sources.get(uid);
+      if (!message && source === undefined) return null;
+      return { uid, ...message, source };
+    }
+    async logout() { this.emit('close'); }
+    close() { void this.logout(); }
+  }
+  const repos = {
+    accounts: {
+      getRaw: (id) => id === account.id ? account : null,
+      list: () => [{ id: account.id, syncEnabled: false }],
+    },
+    threads: {
+      get: (id) => id ? { id, accountId: account.id } : null,
+      findBySubject: () => null,
+      create: () => ({ id: `thread-${state.savedMessages.length + 1}`, accountId: account.id }),
+    },
+    messages: {
+      findByRfcId: (accountId, messageId) => state.savedMessages.find((row) => (
+        row.account_id === accountId && row.rfc_message_id === messageId
+      )) || null,
+      findByUid: (accountId, mailbox, uid) => state.savedMessages.find((row) => (
+        row.account_id === accountId && row.mailbox === mailbox && row.uid === uid
+      )) || null,
+      get: (id) => state.savedMessages.find((row) => row.id === id) || null,
+      upsert(value) {
+        const existing = state.savedMessages.find((row) => row.account_id === value.account_id && row.mailbox === value.mailbox && row.uid === value.uid);
+        if (existing) {
+          Object.assign(existing, value);
+          existing.threadId = value.thread_id || existing.threadId;
+          existing.sourceImported = value.source_imported !== 0;
+          existing.htmlBody = value.html_body || '';
+          existing.textBody = value.text_body || '';
+          return existing;
+        }
+        const saved = {
+          ...value,
+          id: `message-${state.savedMessages.length + 1}`,
+          threadId: value.thread_id,
+          sourceImported: value.source_imported !== 0,
+          htmlBody: value.html_body || '',
+          textBody: value.text_body || '',
+          mailbox: value.mailbox,
+          uid: value.uid,
+          accountId: value.account_id,
+        };
+        state.savedMessages.push(saved);
+        return saved;
+      },
+    },
+    runWriteBatch(fn) { return fn(); },
+  };
+  const service = createMailService({
+    config: { ...config, imapPoolIdleMs: 60_000 },
+    repos,
+    logger: { info() {}, warn() {} },
+    ImapClient: FakeImapClient,
+  });
+  return { service, state, account };
+}
+
+function historicalInvoice() {
+  return {
+    uid: 99,
+    envelope: {
+      messageId: '<old-invoice@example.test>',
+      subject: 'Old invoice',
+      from: [{ name: 'Vendor', address: 'accounts@vendor.test' }],
+      to: [{ address: 'sync@example.test' }],
+      date: new Date('2019-01-01T00:00:00Z'),
+    },
+    flags: new Set(),
+    labels: [],
+    internalDate: new Date('2019-01-01T00:00:00Z'),
+    bodyStructure: {
+      childNodes: [
+        { type: 'text/plain', disposition: 'inline' },
+        { type: 'application/pdf', disposition: 'attachment', dispositionParameters: { filename: 'invoice.pdf' } },
+      ],
+    },
+  };
+}
+
+test('IMAP SEARCH materializes envelope rows and hydrates full source on open', async () => {
+  const source = Buffer.from([
+    'From: Vendor <accounts@vendor.test>',
+    'To: Search Account <sync@example.test>',
+    'Subject: Old invoice',
+    'Message-ID: <old-invoice@example.test>',
+    'Date: Tue, 01 Jan 2019 00:00:00 +0000',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Pay the historical invoice body.',
+  ].join('\r\n'));
+  const { service, state, account } = searchHarness({
+    messages: [historicalInvoice()],
+    sources: new Map([[99, source]]),
+  });
+  const parsed = parseMailboxQuery('invoice');
+  const result = await service.searchAndMaterialize({
+    accounts: [{ id: account.id, syncEnabled: false }],
+    parsed,
+    folder: 'inbox',
+  });
+  assert.equal(result.cancelled, false);
+  assert.equal(state.searchQueries.length, 1);
+  assert.equal(state.searchQueries[0].text, 'invoice');
+  assert.equal(state.searchQueries[0].gmraw, undefined);
+  assert.equal(state.fetchCalls.length, 1);
+  assert.equal(state.savedMessages.length, 1);
+  assert.equal(state.savedMessages[0].source_imported, 0);
+  assert.equal(state.savedMessages[0].html_body, '');
+  assert.deepEqual(result.threadIds, [state.savedMessages[0].threadId]);
+
+  const hydrated = await service.hydrateMessageSource(state.savedMessages[0].id);
+  assert.equal(state.fetchOneCalls.length, 1);
+  assert.equal(hydrated.source_imported ?? (hydrated.sourceImported === false ? 0 : 1), 1);
+  assert.match(hydrated.text_body || hydrated.textBody, /historical invoice body/);
+  await service.close();
+});
+
+test('Gmail leftover-text search uses gmraw and skips already cached UIDs', async () => {
+  const { service, state, account } = searchHarness({
+    provider: 'gmail',
+    messages: [historicalInvoice()],
+  });
+  state.savedMessages.push({
+    id: 'already-local',
+    account_id: account.id,
+    mailbox: 'INBOX',
+    uid: 99,
+    threadId: 'thread-local',
+    sourceImported: true,
+  });
+  const result = await service.searchAndMaterialize({
+    accounts: [{ id: account.id }],
+    parsed: parseMailboxQuery('invoice from:vendor'),
+    folder: 'inbox',
+  });
+  assert.equal(state.searchQueries[0].gmraw, 'from:vendor invoice');
+  assert.equal(state.fetchCalls.length, 0);
+  assert.deepEqual(result.threadIds, ['thread-local']);
+  await service.close();
+});
+
+test('a newer leftover-text search cancels the in-flight IMAP SEARCH', async () => {
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  let started;
+  const startedSearch = new Promise((resolve) => { started = resolve; });
+  const { service, state, account } = searchHarness({
+    messages: [historicalInvoice()],
+    gate: { hold, started },
+  });
+  const first = service.searchAndMaterialize({
+    accounts: [{ id: account.id }],
+    parsed: parseMailboxQuery('firstquery'),
+    folder: 'inbox',
+  });
+  await startedSearch;
+  const second = service.searchAndMaterialize({
+    accounts: [{ id: account.id }],
+    parsed: parseMailboxQuery('secondquery'),
+    folder: 'inbox',
+  });
+  release();
+  const firstResult = await first;
+  const secondResult = await second;
+  assert.equal(firstResult.cancelled, true);
+  assert.equal(secondResult.cancelled, false);
+  assert.ok(state.searchQueries.some((query) => query.text === 'secondquery'));
+  await service.close();
 });

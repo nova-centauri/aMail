@@ -389,8 +389,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json(flagsPayload(savePersonFlags(repos, input ?? [])));
   });
 
-  router.get('/messages', (request, response) => {
-    response.json(listConversations(repos, {
+  router.get('/messages', async (request, response) => {
+    response.json(await listConversations(repos, {
       accountId: request.query.accountId ? String(request.query.accountId) : null,
       folder: request.query.folder,
       category: request.query.category,
@@ -399,11 +399,15 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       pageSize: request.query.pageSize || request.query.limit,
       query: request.query.q,
       mailbox: request.query.mailbox,
+      mailService,
+      searchSource: 'human',
+      signal: request.signal,
     }));
   });
-  router.get('/messages/:id', (request, response) => {
-    const message = repos.messages.get(request.params.id);
+  router.get('/messages/:id', async (request, response) => {
+    let message = repos.messages.get(request.params.id);
     if (!message) throw new NotFoundError('Message not found.');
+    if (mailService?.hydrateMessageSource) message = await mailService.hydrateMessageSource(message.id);
     response.json({ message: hydrateMessage(message, remoteContent) });
   });
   router.post('/messages', async (request, response) => {
@@ -468,11 +472,16 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     return response.json({ thread: { ...thread, messages }, messages, htmlBody: messages.at(-1)?.htmlBody || '' });
   });
 
-  router.get('/threads/:id', (request, response) => {
+  router.get('/threads/:id', async (request, response) => {
     const thread = repos.threads.get(request.params.id);
     if (!thread) throw new NotFoundError('Thread not found.');
-    const messages = repos.messages.forThread(thread.id).map((message) => hydrateMessage(message, remoteContent));
-    response.json({ thread: { ...thread, messages }, messages });
+    const stored = repos.messages.forThread(thread.id);
+    const hydrated = [];
+    for (const item of stored) {
+      const next = mailService?.hydrateMessageSource ? await mailService.hydrateMessageSource(item.id) : item;
+      hydrated.push(hydrateMessage(next, remoteContent));
+    }
+    response.json({ thread: { ...thread, messages: hydrated }, messages: hydrated });
   });
 
   router.get('/drafts', (request, response) => {
