@@ -39,6 +39,7 @@ export function emptyMailboxQuery() {
     // Agent-side counterpart of unread: null = ignore, true = only analyzed.
     isAnalyzed: null,
     folder: null,
+    anywhere: false,
   };
 }
 
@@ -160,7 +161,9 @@ export function parseMailboxQuery(raw, { now = Date.now() } = {}) {
       continue;
     }
     if (operator.key === 'in') {
-      parsed.folder = FOLDER_ALIASES[value.toLowerCase()] || null;
+      const folder = FOLDER_ALIASES[value.toLowerCase()] || null;
+      parsed.folder = folder;
+      if (value.toLowerCase() === 'anywhere') parsed.anywhere = true;
     }
   }
   parsed.text = textParts.filter(Boolean).join(' ').trim();
@@ -183,7 +186,8 @@ export function mailboxQueryIsActive(parsed) {
     || parsed.isUnread != null
     || parsed.isStarred != null
     || parsed.isAnalyzed != null
-    || parsed.folder,
+    || parsed.folder
+    || parsed.anywhere,
   );
 }
 
@@ -216,7 +220,8 @@ export function serializeMailboxQuery(parsed) {
   if (parsed.isStarred === false) parts.push('is:unstarred');
   if (parsed.isAnalyzed === true) parts.push('is:analyzed');
   if (parsed.isAnalyzed === false) parts.push('is:unanalyzed');
-  if (parsed.folder) parts.push(`in:${parsed.folder}`);
+  if (parsed.anywhere) parts.push('in:anywhere');
+  else if (parsed.folder) parts.push(`in:${parsed.folder}`);
   if (parsed.text) parts.push(parsed.text);
   return parts.join(' ');
 }
