@@ -11,6 +11,13 @@ export function toFtsMatchQuery(raw) {
   return tokens.slice(0, 12).map((token) => `"${token.replace(/"/g, '')}"*`).join(' AND ');
 }
 
+export function attachmentFilenames(row, json) {
+  return json(row.attachments_json)
+    .map((item) => item?.filename || item?.name || '')
+    .filter(Boolean)
+    .join(' ');
+}
+
 export function ftsDocument(row, json) {
   const recipients = [...json(row.to_json), ...json(row.cc_json), ...json(row.bcc_json)]
     .map((item) => `${item?.name || ''} ${item?.email || ''}`)
@@ -23,5 +30,6 @@ export function ftsDocument(row, json) {
     from_email: row.from_email || '',
     recipients,
     text_body: String(row.text_body || '').slice(0, 80_000),
+    attachments: attachmentFilenames(row, json),
   };
 }

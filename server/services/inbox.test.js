@@ -116,3 +116,63 @@ test('pagination preserves matching against older messages and whole-thread stat
   }
   assert.equal(listConversations(repos, { query: 'from:older@example.test is:analyzed' }).total, 0);
 });
+
+test('operator and FTS search paginate through the whole cached corpus', (t) => {
+  const { repos, add, thread } = fixture(t);
+  const oldFrom = thread('Ancient invoice');
+  add(oldFrom, {
+    from_email: 'accounts@vendor.test',
+    from_name: 'Vendor Accounts',
+    text_body: 'unique-corpus-token winter-close',
+    snippet: 'unique-corpus-token',
+    sent_at: '2020-01-01T00:00:00.000Z',
+    received_at: '2020-01-01T00:00:00.000Z',
+    uid: 1,
+  });
+  const originMs = Date.parse('2026-06-01T00:00:00.000Z');
+  for (let index = 0; index < 1100; index += 1) {
+    const timestamp = new Date(originMs + ((1100 - index) * 1000)).toISOString();
+    add(thread(`Recent ${index}`), {
+      from_email: 'noreply@example.test',
+      sent_at: timestamp,
+      received_at: timestamp,
+      uid: index + 2,
+      rfc_message_id: `<recent-${index}@example.test>`,
+    });
+  }
+  const fromPage = listConversations(repos, { query: 'from:accounts@vendor.test', pageSize: 10 });
+  assert.equal(fromPage.total, 1);
+  assert.equal(fromPage.messages[0].id, oldFrom.id);
+
+  const ftsPage = listConversations(repos, { query: 'unique-corpus-token', page: 1, pageSize: 5 });
+  assert.equal(ftsPage.total, 1);
+  assert.equal(ftsPage.messages[0].id, oldFrom.id);
+
+  const newest = listConversations(repos, { page: 1, pageSize: 50 });
+  assert.equal(newest.total, 1101);
+  assert.equal(newest.messages.length, 50);
+  const later = listConversations(repos, { page: 23, pageSize: 50 });
+  assert.equal(later.total, 1101);
+  assert.ok(later.messages.some((item) => item.id === oldFrom.id));
+});
+
+test('attachment filenames are indexed and pruneBodies keeps existing FTS tokens', (t) => {
+  const { repos, add, thread } = fixture(t);
+  const conversation = thread('Catering');
+  const message = add(conversation, {
+    text_body: 'please find the winter menu attached',
+    snippet: 'please find the winter menu attached',
+    attachments_json: JSON.stringify([{ index: 0, filename: 'wintermenu.pdf', contentType: 'application/pdf', size: 2048 }]),
+  });
+  const byName = listConversations(repos, { query: 'wintermenu' });
+  assert.equal(byName.total, 1);
+  assert.equal(byName.messages[0].id, conversation.id);
+
+  const pruned = repos.retention.pruneBodies('2099-01-01T00:00:00.000Z');
+  assert.equal(pruned, 1);
+  assert.equal(repos.messages.get(message.id).textBody, '');
+  const stillFound = listConversations(repos, { query: 'winter menu attached' });
+  assert.equal(stillFound.total, 1);
+  assert.equal(stillFound.messages[0].id, conversation.id);
+});
+
