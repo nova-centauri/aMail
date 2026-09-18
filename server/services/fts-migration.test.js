@@ -92,6 +92,10 @@ test('reopening a pre-FTS mailbox indexes search in batches and keeps SQLite tem
 
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages').get().count, 120);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 120);
+  assert.match(
+    String(db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`).get()?.sql || ''),
+    /content\s*=\s*''/,
+  );
   assert.ok(fs.statSync(path.join(dataDir, 'tmp')).isDirectory());
   assert.equal(process.env.SQLITE_TMPDIR, path.join(dataDir, 'tmp'));
   assert.ok(
@@ -189,8 +193,8 @@ test('deleting messages and removing accounts drop their search rows', (t) => {
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 0);
 });
 
-test('reopening a database with the earlier FTS delete trigger repairs it', (t) => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-fts-trigger-'));
+test('migrating a content-bearing FTS index to contentless keeps pruned body tokens', (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-fts-contentless-'));
   const config = { dataDir, dbPath: path.join(dataDir, 'amail.sqlite') };
   const seed = createDatabase(config);
   const seedRepos = createRepositories(seed);
@@ -199,20 +203,28 @@ test('reopening a database with the earlier FTS delete trigger repairs it', (t) 
     account_id: account.id,
     subject: 'Hello',
     normalized_subject: 'hello',
-    latest_at: '2026-08-01T00:00:00.000Z',
+    latest_at: '2020-08-01T00:00:00.000Z',
   });
   const message = seedRepos.messages.upsert(messageInput({
-    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello', textBody: 'legacy-token', timestamp: '2026-08-01T00:00:00.000Z',
+    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello', textBody: 'legacy-token', timestamp: '2020-08-01T00:00:00.000Z',
   }));
-  // The trigger shipped before this fix used the FTS5 'delete' command, which a
-  // content-bearing table rejects, so no message row could ever be deleted.
+  const rowid = seed.prepare('SELECT rowid AS rowid FROM messages WHERE id = ?').get(message.id).rowid;
+  seedRepos.retention.pruneBodies('2099-01-01T00:00:00.000Z');
+  assert.equal(seedRepos.messages.get(message.id).textBody, '');
   seed.exec(`
     DROP TRIGGER IF EXISTS messages_ad_fts;
+    DROP TABLE IF EXISTS messages_fts;
+    CREATE VIRTUAL TABLE messages_fts USING fts5(
+      subject, snippet, from_name, from_email, recipients, text_body,
+      tokenize = 'unicode61 remove_diacritics 2'
+    );
     CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
-      INSERT INTO messages_fts(messages_fts, rowid) VALUES('delete', old.rowid);
+      DELETE FROM messages_fts WHERE rowid = old.rowid;
     END;
   `);
-  assert.throws(() => seed.prepare('DELETE FROM messages WHERE id = ?').run(message.id));
+  seed.prepare(`INSERT INTO messages_fts(
+    rowid, subject, snippet, from_name, from_email, recipients, text_body
+  ) VALUES (?, 'Hello', 'Hello', 'Sender', 'sender@example.test', 'Owner owner@example.test', 'legacy-token')`).run(rowid);
   seedRepos.close();
 
   const db = createDatabase(config);
@@ -220,6 +232,11 @@ test('reopening a database with the earlier FTS delete trigger repairs it', (t) 
     db.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
+  assert.match(
+    String(db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`).get()?.sql || ''),
+    /content\s*=\s*''/,
+  );
+  assert.equal(ftsHits(db, 'legacy-token'), 1);
   db.prepare('DELETE FROM messages WHERE id = ?').run(message.id);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get().count, 0);
 });
