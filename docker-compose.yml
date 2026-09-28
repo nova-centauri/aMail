@@ -91,8 +91,14 @@ services:
       - no-new-privileges:true
     networks:
       - app-net
+    # The published image is Ubuntu plus the server binary and CA certs. It has
+    # bash, not curl, so a curl healthcheck never becomes healthy.
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8108/health"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/8108 && printf "GET /health HTTP/1.0\r\n\r\n" >&3 && grep -q "\"ok\":true" <&3'
       interval: 10s
       timeout: 5s
       start_period: 15s
