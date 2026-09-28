@@ -96,6 +96,9 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_TRUST_PROXY`, `AMAIL_COOKIE_SECURE` | Reverse-proxy and cookie hardening |
 | `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, 60s minimum interval, IMAP pool idle, background polling |
 | `AMAIL_RETAIN_DAYS` | Drop stored bodies of mail older than N days (0 keeps them forever) |
+| `AMAIL_SEARCH_ENGINE` | `auto` (default), `off`/`fts`, or `typesense`. `auto` uses Typesense when it is configured and the database is not encrypted |
+| `AMAIL_TYPESENSE_URL`, `AMAIL_TYPESENSE_API_KEY` | Typesense listen URL and API key. Compose sets both; the service is not published on the host |
+| `TYPESENSE_API_KEY`, `TYPESENSE_MEMORY_LIMIT` | Key and memory cap for the Compose Typesense container (default `768m`) |
 | `REMOTE_CONTENT_PROXY_URL` | Set by `deploy/launch.sh` to route remote images via Tor/Privoxy |
 | `AMAIL_METERING_URL`, `AMAIL_METERING_TOKEN`, `AMAIL_TENANT_ID` | Hosted only: POST analyzed-mark counts to a metering endpoint. Inert when unset |
 | `AMAIL_KEY_MODE` | `env` (default) or `keyslot`; see [Keyslot mode](#keyslot-mode-hosted-tenants) |
@@ -129,7 +132,7 @@ To update an existing account, open **Quick settings → Accounts → Edit** (or
 
 ## Search and smart views
 
-Search uses SQLite FTS5 plus Gmail-style operators: `from:`, `to:`, `subject:`, `has:attachment`, `after:`/`before:YYYY-MM-DD`, `newer_than:7d`, `older_than:2w`, `is:unread`, `is:starred`, `is:unanalyzed`, `is:analyzed`, `in:sent`. Explicit searches also surface the quiet ops digests that the default inbox hides.
+Search runs on the server. With Typesense configured (the Compose default when the database is plaintext), leftover text is ranked across subject, people, snippet, attachment names, and body, with typo tolerance, and threads are paginated without a 100/500/1000 clip. `from:`, `to:`, and `subject:` match words and email parts; `has:attachment`, `after:`/`before:YYYY-MM-DD`, `newer_than:7d`, `older_than:2w`, `is:unread`, `is:starred`, `is:unanalyzed`, `is:analyzed`, and `in:` still apply. SQLite FTS5 is the fallback, and it is the only index when the database is encrypted unless `AMAIL_SEARCH_ENGINE=typesense` (that index is plaintext). Human leftover-text search can also ask the provider about mail that was never imported. `is:analyzed` / `is:unanalyzed` and the review queue stay on the local cache. Explicit searches also surface the quiet ops digests that the default inbox hides.
 
 Smart classification runs locally and is versioned; when rules or `AMAIL_OPS_SOURCES` change, existing mail is reclassified on the next start. `GET /api/messages?category=github_ci` (or `primary`, `logs`, `status`, `ops_error`) filters by view and returns per-view counts.
 

@@ -59,4 +59,14 @@ test('analyzed filters require imported source and extra IMAP thread ids bypass 
   });
   assert.match(withHits.pageSql, /stats.thread_id IN \(@extraThread0\)/);
   assert.equal(withHits.params.extraThread0, 'thread-envelope');
+
+  const restricted = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    restrictThreadIds: ['thread-envelope'],
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.match(restricted.pageSql, /stats.thread_id IN \(@restrict0\)/);
+  assert.equal(restricted.params.restrict0, 'thread-envelope');
+  assert.doesNotMatch(restricted.pageSql, /messages_fts MATCH/);
 });

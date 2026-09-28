@@ -59,6 +59,66 @@ const emptyCategoryCounts = () => Object.fromEntries(
 
 const emptyFolderCounts = () => ({ inbox: 0, starred: 0, snoozed: 0, drafts: 0, unanalyzed: 0 });
 
+/**
+ * Typesense ranks leftover text. Provider hits that never matched locally are
+ * prefixed onto the page. Any engine failure falls back to SQLite FTS.
+ */
+async function conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds }) {
+  const engine = repos.searchEngine;
+  if (engine?.enabled && listArgs.parsed?.text) {
+    try {
+      const eligibleExtras = extraThreadIds.length
+        ? repos.messages.searchConversations({
+          ...listArgs,
+          ftsQuery: '',
+          extraThreadIds: [],
+          restrictThreadIds: extraThreadIds,
+          limit: extraThreadIds.length,
+          offset: 0,
+        }).threadIds
+        : [];
+      const matchedExtras = eligibleExtras.length
+        ? await engine.matchingThreadIds({
+          accountIds: listArgs.accountIds,
+          folder: listArgs.folder,
+          mailbox: listArgs.mailbox,
+          parsed: listArgs.parsed,
+          category: listArgs.category,
+          personEmails: listArgs.personEmails,
+          hideQuiet: listArgs.hideQuiet,
+          threadIds: eligibleExtras,
+        })
+        : new Set();
+      const extraOnly = eligibleExtras.filter((id) => !matchedExtras.has(id));
+      const start = (page - 1) * pageSize;
+      const prefix = extraOnly.slice(start, start + pageSize);
+      const rankedOffset = Math.max(0, start - extraOnly.length);
+      const rankedLimit = pageSize - prefix.length;
+      const ranked = await engine.searchConversations({
+        accountIds: listArgs.accountIds,
+        folder: listArgs.folder,
+        mailbox: listArgs.mailbox,
+        parsed: listArgs.parsed,
+        category: listArgs.category,
+        personEmails: listArgs.personEmails,
+        hideQuiet: listArgs.hideQuiet,
+        offset: rankedLimit > 0 ? rankedOffset : 0,
+        limit: rankedLimit > 0 ? rankedLimit : 1,
+      });
+      if (rankedLimit <= 0) ranked.threadIds = [];
+      const seen = new Set(prefix);
+      return {
+        threadIds: [...prefix, ...ranked.threadIds.filter((id) => !seen.has(id))],
+        total: (ranked.total || 0) + extraOnly.length,
+        categoryCounts: ranked.categoryCounts || [],
+      };
+    } catch {
+      // The cache listing below is the same path used when Typesense is off.
+    }
+  }
+  return repos.messages.searchConversations(listArgs);
+}
+
 export const sumFolderCounts = (accounts, repos) => accounts.reduce((totals, account) => {
   const counts = repos.messages.folderCounts(account.id);
   return {
@@ -180,7 +240,7 @@ export async function listConversations(repos, {
     };
   }
 
-  const search = repos.messages.searchConversations({
+  const listArgs = {
     accountIds: accounts.map((account) => account.id),
     folder,
     mailbox: String(mailbox || 'INBOX'),
@@ -192,7 +252,8 @@ export async function listConversations(repos, {
     extraThreadIds,
     limit: pageSize,
     offset: (page - 1) * pageSize,
-  });
+  };
+  const search = await conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds });
   const byThread = new Map();
   for (const message of repos.messages.forThreads(search.threadIds, {
     folder,

@@ -9,6 +9,7 @@ import {
   serializeAccountInput,
 } from '../services/account-input.js';
 import { listConversations, parseNumber } from '../services/inbox.js';
+import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
 import {
@@ -114,6 +115,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       locked: status.locked,
       initialized: status.initialized,
       remoteContentProxyConfigured: Boolean(config.remoteContentProxyUrl),
+      searchEngine: resolveSearchBackend(config).name,
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,
       webauthnOrigins: config.webauthnOrigins || [],
