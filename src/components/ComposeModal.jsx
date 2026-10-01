@@ -34,7 +34,7 @@ function initialHtmlBody(initialReply) {
   return '';
 }
 
-export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose, onSent, onDraftSaved, onDraftRemoved, initialReply }) {
+export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose, onSent, onDraftSaved, onDraftRemoved, initialReply, closing = false }) {
   const [to, setTo] = useState(() => parseRecipientList(initialReply?.to || ''));
   const [cc, setCc] = useState(() => parseRecipientList(initialReply?.cc || ''));
   const [bcc, setBcc] = useState(() => parseRecipientList(initialReply?.bcc || ''));
@@ -149,7 +149,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
   };
   useEffect(() => {
     const handleEscape = (event) => {
-      if (event.key !== 'Escape') return;
+      if (closing || event.key !== 'Escape') return;
       event.preventDefault();
       event.stopPropagation();
       if (isExpanded) {
@@ -244,7 +244,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
     }
   };
   return (
-    <div className={`compose-window ${isMinimized ? 'is-minimized' : ''} ${isExpanded ? 'is-expanded' : ''}`} role="dialog" aria-modal="true" aria-label="New message">
+    <div className={`compose-window ${closing ? 'is-closing' : ''} ${isMinimized ? 'is-minimized' : ''} ${isExpanded ? 'is-expanded' : ''}`} role="dialog" aria-modal="true" aria-label="New message">
       <div className="compose-titlebar">
         <span>{draftId ? 'Draft' : initialReply?.mode === 'reply' || initialReply?.mode === 'reply-all' ? 'Reply' : initialReply?.mode === 'forward' ? 'Forward' : 'New Message'}</span>
         <div>

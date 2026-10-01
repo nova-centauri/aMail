@@ -17,7 +17,7 @@ the tokens in `tokens.css`; nothing else hard-codes colors.
 ## Layout rules
 
 - `.mail-app` is a two-column, two-row CSS grid. `--sidebar-current` switches between `--sidebar-w` and `--sidebar-w-compact` when `.sidebar-compact` is set.
-- `.mail-split` is one column by default. Only `.mail-app.thread-open` adds the reader column (`var(--list-w) minmax(0, 1fr)`). Below 1000px the reader replaces the list.
+- `.mail-split` is one column by default. `.mail-app.reader-mounted` reserves a second column and `.mail-app.thread-open` eases it open to `var(--list-w) minmax(0, 1fr)`. Below 1000px the reader overlays the list. `prefers-reduced-motion` collapses those transitions.
 - The 840px breakpoint turns the sidebar into a drawer. `App.jsx` uses the same number to decide whether the menu button toggles compact mode or the drawer, so change both together.
 - `.mail-list-panel` is a container (`container-type: inline-size`); row layout switches at 640px and 400px of panel width via `grid-template-areas`, with no DOM changes.
 

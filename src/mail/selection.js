@@ -43,6 +43,28 @@ export function mergeOpenThread(current, incoming) {
  * overlapping loads used to do that when the closure was stale or the row
  * had fallen off the current list page.
  */
+/**
+ * After spam or delete of the open conversation, the reader should land on the
+ * next row that is still in the list. No next row means the reader closes.
+ * Drafts are not a reader target. Actions that do not include the open row
+ * leave the selection alone (`advance: false`).
+ */
+export function nextThreadAfterRemoval(visibleThreads, openThread, removedIds) {
+  const removed = new Set((removedIds || []).map((id) => String(id)));
+  const openId = openThread?.id != null ? String(openThread.id) : '';
+  if (!openId || !removed.has(openId)) return { advance: false, next: null };
+  const list = Array.isArray(visibleThreads) ? visibleThreads : [];
+  const index = list.findIndex((thread) => String(thread?.id) === openId);
+  if (index < 0) return { advance: true, next: null };
+  for (let cursor = index + 1; cursor < list.length; cursor += 1) {
+    const candidate = list[cursor];
+    if (!candidate || removed.has(String(candidate.id))) continue;
+    if (candidate.folder === 'drafts' || candidate.draftId) continue;
+    return { advance: true, next: candidate };
+  }
+  return { advance: true, next: null };
+}
+
 export function reconcileSelectedThread(current, loadedThreads = [], { keepSelection = true } = {}) {
   if (!keepSelection) return null;
   if (!current) return current;

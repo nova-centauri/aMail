@@ -7,8 +7,12 @@
   display: flex; flex-direction: column; overflow: hidden;
   border: 1px solid var(--line-strong); border-bottom: 0; border-radius: var(--r-lg) var(--r-lg) 0 0;
   background: var(--bg-1); box-shadow: var(--shadow-3);
+  animation: compose-in var(--t-med) var(--ease);
   transition: width var(--t-med) var(--ease), height var(--t-med) var(--ease), inset var(--t-med) var(--ease);
 }
+@keyframes compose-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.compose-window.is-closing { animation: compose-out var(--t-med) var(--ease) forwards; }
+@keyframes compose-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(10px); } }
 .compose-window.is-minimized { height: 44px; }
 .compose-window.is-expanded { top: calc(var(--topbar-h) + 12px); right: 24px; left: 24px; width: auto; height: auto; }
 .compose-titlebar {

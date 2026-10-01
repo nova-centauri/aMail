@@ -1181,6 +1181,83 @@ test('attachment download re-fetches the original IMAP source and returns one pa
   assert.equal(cached.body.equals(first.body), true);
 });
 
+test('concurrent attachment downloads share one IMAP fetch', async () => {
+  const pdf = Buffer.from('%PDF-1.4 attachment-bytes');
+  const source = Buffer.from([
+    'From: Billing <billing@example.test>',
+    'To: Owner <owner@example.test>',
+    'Subject: Invoice',
+    'Message-ID: <invoice@example.test>',
+    'Date: Thu, 13 Aug 2026 12:00:00 +0000',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="bound"',
+    '',
+    '--bound',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Invoice attached.',
+    '--bound',
+    'Content-Type: application/pdf',
+    'Content-Disposition: attachment; filename="invoice.pdf"',
+    'Content-Transfer-Encoding: base64',
+    '',
+    pdf.toString('base64'),
+    '--bound--',
+    '',
+  ].join('\r\n'));
+  let connects = 0;
+  let fetches = 0;
+  let releaseFetch;
+  const fetchGate = new Promise((resolve) => { releaseFetch = resolve; });
+  class FakeImapClient {
+    async connect() { connects += 1; }
+    async getMailboxLock() { return { release() {} }; }
+    async fetchOne() {
+      fetches += 1;
+      await fetchGate;
+      return { uid: 42, source };
+    }
+    async logout() {}
+  }
+  const account = {
+    id: 'account-1',
+    email: 'owner@example.test',
+    credential_ciphertext: encryptJson({ username: 'owner@example.test', password: 'app-password' }, config.credentialKey),
+    imap_host: 'imap.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    provider: 'custom',
+  };
+  const service = createMailService({
+    config,
+    repos: {
+      accounts: { getRaw: (id) => id === account.id ? account : null },
+      messages: {
+        get: () => ({
+          id: 'msg-1',
+          accountId: account.id,
+          mailbox: 'INBOX',
+          uid: 42,
+          attachments: [{ index: 0, filename: 'invoice.pdf', contentType: 'application/pdf', size: pdf.length }],
+        }),
+      },
+    },
+    logger: { info() {}, warn() {} },
+    ImapClient: FakeImapClient,
+  });
+  const pending = Promise.all([
+    service.fetchAttachment('msg-1', 0),
+    service.fetchAttachment('msg-1', 0),
+    service.fetchAttachment('msg-1', 0),
+  ]);
+  releaseFetch();
+  const results = await pending;
+  assert.equal(connects, 1);
+  assert.equal(fetches, 1);
+  assert.equal(results[0].body.equals(results[1].body), true);
+  assert.equal(results[1].body.equals(results[2].body), true);
+});
+
 function strictAttachmentHarness({ messageOverrides = {}, metadataOverrides = {}, sourceParts, sourceId = '<strict@example.test>', sourceUid = 42, uidValidity = 7, syncUidValidity = 7, sourceLimit = 64 * 1024 * 1024, rawAttachments, failureAt, failure } = {}) {
   const content = Buffer.from([0, 255, 1, 128, 13, 10]);
   const metadata = { index: 0, filename: 'sample.bin', contentType: 'application/octet-stream', size: content.length, contentId: 'part-0', ...metadataOverrides };

@@ -177,7 +177,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible, [contentedita
 @keyframes shimmer { to { background-position: -200% 0; } }
 
 /* ---- Scrims and modal layer ---- */
-.settings-scrim, .profile-scrim, .sidebar-scrim, .modal-scrim { position: fixed; inset: 0; background: rgba(4, 6, 10, .55); }
+.settings-scrim, .profile-scrim, .sidebar-scrim, .modal-scrim { position: fixed; inset: 0; background: rgba(4, 6, 10, .55); animation: scrim-in var(--t-med) var(--ease); }
+@keyframes scrim-in { from { opacity: 0; } to { opacity: 1; } }
+.settings-scrim.is-closing, .profile-scrim.is-closing, .sidebar-scrim.is-closing { animation: scrim-out var(--t-med) var(--ease) forwards; }
+@keyframes scrim-out { from { opacity: 1; } to { opacity: 0; } }
 .settings-scrim { z-index: calc(var(--z-drawer) - 1); }
 .profile-scrim { z-index: calc(var(--z-popover) - 1); }
 .sidebar-scrim { z-index: calc(var(--z-drawer) + 4); }

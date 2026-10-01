@@ -440,6 +440,7 @@ export function createMailService({
   };
   const newSmtpTransport = (account, credentials) => createSmtpTransport(buildSmtpOptions(account, credentials, config));
   const attachmentCache = new Map();
+  const attachmentFetches = new Map();
   const imapPool = new Map();
   const accountGenerations = new Map();
   const accountGeneration = (accountId) => accountGenerations.get(accountId) || 0;
@@ -1159,10 +1160,30 @@ export function createMailService({
     for (const key of accountLastSync.keys()) if (key.startsWith(`${accountId}\u0000`)) accountLastSync.delete(key);
     // Small transient caches contain message ids, so clear them conservatively.
     attachmentCache.clear();
+    attachmentFetches.clear();
     lastFullSync = null;
   }
 
-  async function fetchAttachment(messageId, index, { strict = false } = {}) {
+  async function fetchAttachment(messageId, index, options = {}) {
+    const resolvedIndex = Number(index);
+    const strict = Boolean(options?.strict);
+    // Browser downloads share one IMAP fetch per attachment. A second click
+    // that arrives before the first parse finishes waits instead of opening
+    // another mailbox session. Strict callers still verify on their own.
+    if (!strict && Number.isInteger(resolvedIndex) && resolvedIndex >= 0) {
+      const cacheKey = `${messageId}:${resolvedIndex}`;
+      const pending = attachmentFetches.get(cacheKey);
+      if (pending) return pending;
+      const work = fetchAttachmentOnce(messageId, index, options).finally(() => {
+        if (attachmentFetches.get(cacheKey) === work) attachmentFetches.delete(cacheKey);
+      });
+      attachmentFetches.set(cacheKey, work);
+      return work;
+    }
+    return fetchAttachmentOnce(messageId, index, options);
+  }
+
+  async function fetchAttachmentOnce(messageId, index, { strict = false } = {}) {
     const resolvedIndex = Number(index);
     if (!Number.isInteger(resolvedIndex) || resolvedIndex < 0) {
       throw new ValidationError('Attachment index is invalid.');

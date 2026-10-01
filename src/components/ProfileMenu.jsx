@@ -1,13 +1,15 @@
 import { UNIFIED_ACCOUNT } from '../mail/constants.js';
+import { usePresence } from '../mail/presence.js';
 import { Icon } from './Icon.jsx';
 import { Avatar } from './ui.jsx';
 
 export function ProfileMenu({ open, onClose, account, accounts, setActiveAccount, onSelectUnified, onOpenSettings, onLogout, showUnified }) {
-  if (!open) return null;
+  const presence = usePresence(open);
+  if (!presence.mounted) return null;
   return (
     <>
-      <button type="button" className="profile-scrim" onClick={onClose} aria-label="Close account menu" />
-      <section className="profile-menu" aria-label="Account menu">
+      <button type="button" className={`profile-scrim ${presence.closing ? 'is-closing' : ''}`} onClick={onClose} aria-label="Close account menu" />
+      <section className={`profile-menu ${presence.closing ? 'is-closing' : ''}`} aria-label="Account menu">
         <button type="button" className="profile-close" onClick={onClose}><Icon name="close" size={18} /></button>
         <Avatar person={account} size="hero" />
         <strong className="profile-name">{account?.name}</strong>

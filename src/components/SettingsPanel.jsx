@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { usePresence } from '../mail/presence.js';
 import { FLAG_COLORS, UNIFIED_ACCOUNT } from '../mail/constants.js';
 import { writeUiPrefs } from '../storage.js';
 import { Icon } from './Icon.jsx';
@@ -34,12 +35,13 @@ export function SettingsPanel({
 }) {
   const [signature, setSignature] = useState('');
   const [passkeyBusy, setPasskeyBusy] = useState(false);
+  const presence = usePresence(open);
   useEffect(() => setSignature(activeAccount?.signature || ''), [activeAccount?.id, activeAccount?.signature]);
-  if (!open) return null;
+  if (!presence.mounted) return null;
   return (
     <>
-      <button type="button" className="settings-scrim" onClick={onClose} aria-label="Close settings" />
-      <aside className="settings-panel" aria-label="Quick settings">
+      <button type="button" className={`settings-scrim ${presence.closing ? 'is-closing' : ''}`} onClick={onClose} aria-label="Close settings" />
+      <aside className={`settings-panel ${presence.closing ? 'is-closing' : ''}`} aria-label="Quick settings">
         <div className="settings-header">
           <div className="settings-header-copy">
             <h2>Quick settings</h2>

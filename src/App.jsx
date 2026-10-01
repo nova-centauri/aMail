@@ -22,7 +22,8 @@ import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.
 import { quotedComposeHtml } from './mail/html.js';
 import { formatMessageDate, getArray, normalizeAccount, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
 import { collectKnownPeople } from './mail/people.js';
-import { mergeOpenThread, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
+import { PANEL_EASE_MS, prefersReducedMotion, usePresence } from './mail/presence.js';
+import { mergeOpenThread, nextThreadAfterRemoval, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
 import { sanitizeSignatureHtml } from './mail/signature.js';
 import { syncResultStatus, syncSkippedMessageCount } from './mail/sync.js';
 import { authenticateWithPasskey, passkeysSupported, registerPasskey } from './passkeys.js';
@@ -58,6 +59,11 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeContext, setComposeContext] = useState(null);
+  const composePresence = usePresence(composeOpen);
+  const readerThreadRef = useRef(null);
+  const [readerMounted, setReaderMounted] = useState(false);
+  const [readerOpen, setReaderOpen] = useState(false);
+  if (selectedThread) readerThreadRef.current = selectedThread;
   const [notice, setNotice] = useState('');
   const [privacy, setPrivacy] = useState({ privateImages: initialPrefs.privateImages !== false });
   const [density, setDensity] = useState(['Default', 'Comfortable', 'Compact'].includes(initialPrefs.density) ? initialPrefs.density : 'Default');
@@ -106,6 +112,32 @@ export default function App() {
     document.title = unread > 0 ? `(${unread}) aMail` : 'aMail';
   }, [folderCounts.inbox]);
 
+  useEffect(() => {
+    if (!selectedThread) return undefined;
+    setReaderMounted(true);
+    if (prefersReducedMotion()) {
+      setReaderOpen(true);
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(() => setReaderOpen(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [selectedThread]);
+
+  useEffect(() => {
+    if (selectedThread || (!readerMounted && !readerThreadRef.current)) return undefined;
+    setReaderOpen(false);
+    if (prefersReducedMotion()) {
+      readerThreadRef.current = null;
+      setReaderMounted(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      readerThreadRef.current = null;
+      setReaderMounted(false);
+    }, PANEL_EASE_MS);
+    return () => window.clearTimeout(timer);
+  }, [selectedThread, readerMounted]);
+
   const openNewCompose = () => {
     setComposeContext(null);
     setComposeOpen(true);
@@ -113,7 +145,6 @@ export default function App() {
 
   const closeCompose = () => {
     setComposeOpen(false);
-    setComposeContext(null);
   };
 
   const openReplyComposer = (thread, message, { replyAll = false } = {}) => {
@@ -606,8 +637,15 @@ export default function App() {
       setThreads((current) => agentQueueActive && analyzed ? current.filter((item) => !affected.has(item.id)) : current.map(update));
       setSelectedThread((current) => current && affected.has(current.id) ? { ...current, ...patch } : current);
     } else if (['archive', 'trash', 'spam', 'snooze'].includes(action)) {
+      const removingOpen = Boolean(selectedThread && affected.has(selectedThread.id));
+      const advance = removingOpen && (action === 'trash' || action === 'spam')
+        ? nextThreadAfterRemoval(visibleThreads, selectedThread, [...affected])
+        : null;
       setThreads((current) => current.filter((item) => !affected.has(item.id)));
-      if (selectedThread && affected.has(selectedThread.id)) setSelectedThread(null);
+      if (removingOpen) {
+        if (advance?.next) void openThread(advance.next);
+        else setSelectedThread(null);
+      }
     }
     setSelectedIds([]);
     const labels = {
@@ -660,7 +698,7 @@ export default function App() {
       if (event.target?.closest?.('[role="menu"]')) return;
       const action = shortcutAction(event);
       if (!action) return;
-      if (composeOpen && action !== 'escape' && action !== 'help') return;
+      if (composePresence.mounted && action !== 'escape' && action !== 'help') return;
       event.preventDefault();
       const focused = cursorThread || selectedThread || visibleThreads[0] || null;
       if (action === 'compose') openNewCompose();
@@ -668,7 +706,7 @@ export default function App() {
       if (action === 'help') setShortcutsOpen((value) => !value);
       if (action === 'escape') {
         if (shortcutsOpen) { setShortcutsOpen(false); return; }
-        if (composeOpen) return;
+        if (composePresence.mounted) return;
         setSettingsOpen(false);
         setProfileOpen(false);
         setMobileSidebarOpen(false);
@@ -701,7 +739,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeys);
     return () => window.removeEventListener('keydown', handleKeys);
-  }, [composeOpen, editingAccount, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds]);
+  }, [composePresence.mounted, editingAccount, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds]);
 
   const loadRemoteContent = async (message) => {
     try {
@@ -995,9 +1033,11 @@ export default function App() {
   );
 
   const densityClass = density === 'Comfortable' ? 'density-comfortable-ui' : density === 'Compact' ? 'density-compact-ui' : '';
+  const readerThread = selectedThread || (readerMounted ? readerThreadRef.current : null);
+  const readerClass = `${readerMounted || selectedThread ? 'reader-mounted' : ''} ${readerOpen && selectedThread ? 'thread-open' : ''}`.trim();
 
   return (
-    <div className={`mail-app ${sidebarCompact ? 'sidebar-compact' : ''} ${selectedThread ? 'thread-open' : ''} ${densityClass}`.trim()}>
+    <div className={`mail-app ${sidebarCompact ? 'sidebar-compact' : ''} ${readerClass} ${densityClass}`.trim()}>
       <Topbar
         onToggleSidebar={() => (window.innerWidth <= 840 ? setMobileSidebarOpen((value) => !value) : toggleSidebarCompact())}
         onGoHome={goHome}
@@ -1078,10 +1118,10 @@ export default function App() {
             onForward={(thread) => openForwardComposer(thread, thread.messages?.at(-1) || thread)}
             onNotice={setNotice}
           />
-          {selectedThread ? <ThreadView key={selectedThread.id} thread={selectedThread} activeFolder={activeFolder} onBack={() => setSelectedThread(null)} onAction={applyAction} onLoadRemote={loadRemoteContent} onReply={openReplyComposer} onReplyAll={(thread, message) => openReplyComposer(thread, message, { replyAll: true })} onForward={openForwardComposer} onToggleStar={toggleStar} onNotice={setNotice} allowPrivateImages={privacy.privateImages} /> : null}
+          {readerThread ? <ThreadView key={readerThread.id} thread={readerThread} activeFolder={activeFolder} onBack={() => setSelectedThread(null)} onAction={applyAction} onLoadRemote={loadRemoteContent} onReply={openReplyComposer} onReplyAll={(thread, message) => openReplyComposer(thread, message, { replyAll: true })} onForward={openForwardComposer} onToggleStar={toggleStar} onNotice={setNotice} allowPrivateImages={privacy.privateImages} /> : null}
         </div>
       </main>
-      {composeOpen && <ComposeModal key={composeContext?.draftId || composeContext?.mode || 'compose'} account={composeAccount} accounts={identityAccounts} contacts={composeContacts} isDemo={isDemo} initialReply={composeContext} onClose={closeCompose} onSent={sendMessage} onDraftSaved={draftSaved} onDraftRemoved={draftRemoved} />}
+      {composePresence.mounted && <ComposeModal key={composeContext?.draftId || composeContext?.mode || 'compose'} closing={composePresence.closing} account={composeAccount} accounts={identityAccounts} contacts={composeContacts} isDemo={isDemo} initialReply={composeContext} onClose={closeCompose} onSent={sendMessage} onDraftSaved={draftSaved} onDraftRemoved={draftRemoved} />}
       <SettingsPanel
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -1110,7 +1150,7 @@ export default function App() {
       />
       <ProfileMenu open={profileOpen} onClose={() => setProfileOpen(false)} account={displayAccount} accounts={identityAccounts} setActiveAccount={setActiveAccount} onSelectUnified={() => setActiveAccount(null)} onOpenSettings={() => setSettingsOpen(true)} onLogout={lockSession} showUnified={hasConnectedAccounts} />
       {addAccountOpen && <AddAccountModal onClose={() => setAddAccountOpen(false)} onAdded={accountAdded} />}
-      {editingAccount && authenticated && !authRequired && <EditAccountModal key={editingAccount.id} account={editingAccount} onClose={() => setEditingAccount(null)} onUpdated={accountUpdated} onRemoved={accountRemoved} removalBlockedReason={composeOpen ? 'Close the open draft before removing an account.' : ''} />}
+      {editingAccount && authenticated && !authRequired && <EditAccountModal key={editingAccount.id} account={editingAccount} onClose={() => setEditingAccount(null)} onUpdated={accountUpdated} onRemoved={accountRemoved} removalBlockedReason={composePresence.mounted ? 'Close the open draft before removing an account.' : ''} />}
       {onboardingOpen && authenticated && !authRequired && (
         <OnboardingWizard
           accounts={accounts}
