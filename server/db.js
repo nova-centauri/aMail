@@ -13,6 +13,7 @@ import {
 
 const SMART_FILTER_FINGERPRINT_SETTING = 'smartFilterFingerprint';
 import { ftsDocument } from './services/fts.js';
+import { buildConversationSearch } from './services/conversation-search.js';
 
 const json = (value, fallback = []) => {
   if (value === null || value === undefined || value === '') return fallback;
@@ -490,28 +491,7 @@ function initSchema(db) {
       .run(SMART_FILTER_FINGERPRINT_SETTING, JSON.stringify(fingerprint), now());
   }
 
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-      subject,
-      snippet,
-      from_name,
-      from_email,
-      recipients,
-      text_body,
-      tokenize = 'unicode61 remove_diacritics 2'
-    );
-  `);
-  // messages_fts is a regular (content-bearing) FTS5 table, so the
-  // INSERT ... VALUES('delete', rowid) command is invalid for it: earlier
-  // builds installed a trigger using it, which made every DELETE FROM messages
-  // fail with "SQL logic error". Replace it with a plain DELETE.
-  db.exec(`
-    DROP TRIGGER IF EXISTS messages_ad_fts;
-    CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
-      DELETE FROM messages_fts WHERE rowid = old.rowid;
-    END;
-  `);
-  backfillMessagesFts(db);
+  ensureMessagesFts(db);
 }
 
 const FTS_BACKFILL_BATCH = 100;
@@ -534,29 +514,54 @@ function prepareSqliteTempDir(dataDir) {
   return sqliteTmpDir;
 }
 
-function backfillMessagesFts(db, { batchSize = FTS_BACKFILL_BATCH } = {}) {
-  const ftsCount = db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get()?.count || 0;
-  const messageCount = db.prepare('SELECT COUNT(*) AS count FROM messages').get()?.count || 0;
-  const ftsColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
-  const canIndexFts = ['to_json', 'cc_json', 'bcc_json', 'text_body', 'snippet', 'from_name', 'from_email', 'subject']
-    .every((column) => ftsColumns.has(column));
-  if (!canIndexFts || ftsCount === messageCount) return;
+const FTS_CREATE_SQL = `CREATE VIRTUAL TABLE messages_fts USING fts5(
+      subject,
+      snippet,
+      from_name,
+      from_email,
+      recipients,
+      text_body,
+      attachments,
+      content='',
+      contentless_delete=1,
+      tokenize = 'unicode61 remove_diacritics 2'
+    )`;
 
-  // delete-all is only valid on contentless/external-content FTS5 tables.
-  // This standalone index must be cleared with a normal DELETE.
-  db.exec('DELETE FROM messages_fts');
-  const selectBatch = db.prepare(`
-    SELECT rowid, subject, snippet, from_name, from_email, to_json, cc_json, bcc_json, text_body
-    FROM messages
-    WHERE rowid > ?
-    ORDER BY rowid
-    LIMIT ?
-  `);
-  const insertFts = db.prepare(`INSERT INTO messages_fts(
-    rowid, subject, snippet, from_name, from_email, recipients, text_body
-  ) VALUES (@rowid, @subject, @snippet, @from_name, @from_email, @recipients, @text_body)`);
-  const insertBatch = db.transaction((rows) => {
-    for (const row of rows) {
+const FTS_INSERT_SQL = `INSERT INTO messages_fts(
+    rowid, subject, snippet, from_name, from_email, recipients, text_body, attachments
+  ) VALUES (@rowid, @subject, @snippet, @from_name, @from_email, @recipients, @text_body, @attachments)`;
+
+function messagesFtsSql(db) {
+  return String(db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'`).get()?.sql || '');
+}
+
+function isDesiredMessagesFts(sql) {
+  return /content\s*=\s*''/.test(sql) && /\battachments\b/.test(sql);
+}
+
+function isContentBearingMessagesFts(sql) {
+  return Boolean(sql) && !/content\s*=\s*''/.test(sql) && !/content\s*=/.test(sql);
+}
+
+function createMessagesFtsTable(db) {
+  const triggerSql = `
+    CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
+      DELETE FROM messages_fts WHERE rowid = old.rowid;
+    END;
+  `;
+  db.exec('DROP TRIGGER IF EXISTS messages_ad_fts; DROP TABLE IF EXISTS messages_fts;');
+  try {
+    db.exec(FTS_CREATE_SQL);
+  } catch {
+    db.exec(FTS_CREATE_SQL.replace(/\s*contentless_delete=1,\s*/, '\n      '));
+  }
+  db.exec(triggerSql);
+}
+
+function insertFtsDocuments(db, rows) {
+  const insertFts = db.prepare(FTS_INSERT_SQL);
+  const insertBatch = db.transaction((batch) => {
+    for (const row of batch) {
       try {
         insertFts.run(ftsDocument(row, json));
       } catch {
@@ -564,14 +569,87 @@ function backfillMessagesFts(db, { batchSize = FTS_BACKFILL_BATCH } = {}) {
       }
     }
   });
+  insertBatch(rows);
+}
+
+function backfillMessagesFts(db, { batchSize = FTS_BACKFILL_BATCH } = {}) {
+  const ftsCount = db.prepare('SELECT COUNT(*) AS count FROM messages_fts').get()?.count || 0;
+  const messageCount = db.prepare('SELECT COUNT(*) AS count FROM messages').get()?.count || 0;
+  const ftsColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
+  const canIndexFts = ['to_json', 'cc_json', 'bcc_json', 'text_body', 'snippet', 'from_name', 'from_email', 'subject', 'attachments_json']
+    .every((column) => ftsColumns.has(column));
+  if (!canIndexFts || ftsCount === messageCount) return;
+
+  db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('delete-all')`);
+  const selectBatch = db.prepare(`
+    SELECT rowid, subject, snippet, from_name, from_email, to_json, cc_json, bcc_json, text_body, attachments_json
+    FROM messages
+    WHERE rowid > ?
+    ORDER BY rowid
+    LIMIT ?
+  `);
 
   let lastRowid = 0;
   for (;;) {
     const rows = selectBatch.all(lastRowid, batchSize);
     if (!rows.length) break;
-    insertBatch(rows);
+    insertFtsDocuments(db, rows);
     lastRowid = rows[rows.length - 1].rowid;
   }
+}
+
+function ensureMessagesFts(db) {
+  const existingSql = messagesFtsSql(db);
+  if (isDesiredMessagesFts(existingSql)) {
+    db.exec(`
+      DROP TRIGGER IF EXISTS messages_ad_fts;
+      CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
+        DELETE FROM messages_fts WHERE rowid = old.rowid;
+      END;
+    `);
+    backfillMessagesFts(db);
+    return;
+  }
+
+  // Content-bearing FTS stores a second copy of the body. Copy those documents
+  // before dropping the table so pruneBodies' emptied text_body does not wipe
+  // search tokens that the old index still holds.
+  let preserved = [];
+  if (isContentBearingMessagesFts(existingSql)) {
+    try {
+      preserved = db.prepare(`
+        SELECT fts.rowid AS rowid, fts.subject AS subject, fts.snippet AS snippet,
+          fts.from_name AS from_name, fts.from_email AS from_email, fts.recipients AS recipients,
+          fts.text_body AS text_body, messages.to_json AS to_json, messages.cc_json AS cc_json,
+          messages.bcc_json AS bcc_json, messages.attachments_json AS attachments_json
+        FROM messages_fts fts
+        LEFT JOIN messages ON messages.rowid = fts.rowid
+      `).all();
+    } catch {
+      preserved = [];
+    }
+  }
+
+  createMessagesFtsTable(db);
+  if (preserved.length) {
+    const insertFts = db.prepare(FTS_INSERT_SQL);
+    const insertBatch = db.transaction((rows) => {
+      for (const row of rows) {
+        try {
+          insertFts.run({
+            ...ftsDocument(row, json),
+            text_body: String(row.text_body || '').slice(0, 80_000),
+            recipients: row.recipients || ftsDocument(row, json).recipients,
+          });
+        } catch {
+          // Same as backfill: skip one bad row rather than failing open.
+        }
+      }
+    });
+    insertBatch(preserved);
+    return;
+  }
+  backfillMessagesFts(db);
 }
 
 const SQLITE_HEADER = 'SQLite format 3\0';
@@ -945,30 +1023,8 @@ export function createRepositories(db) {
     settingUpsert: db.prepare(`INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`),
     messageRow: db.prepare('SELECT rowid, * FROM messages WHERE id = ?'),
-    ftsInsert: db.prepare(`INSERT INTO messages_fts(
-      rowid, subject, snippet, from_name, from_email, recipients, text_body
-    ) VALUES (@rowid, @subject, @snippet, @from_name, @from_email, @recipients, @text_body)`),
+    ftsInsert: db.prepare(FTS_INSERT_SQL),
     ftsDelete: db.prepare('DELETE FROM messages_fts WHERE rowid = ?'),
-    searchThreadIds: db.prepare(`SELECT m.thread_id AS threadId
-      FROM messages m
-      JOIN messages_fts fts ON fts.rowid = m.rowid
-      WHERE m.account_id = @accountId AND
-        CASE @folder
-          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-          WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
-          WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
-          WHEN 'drafts' THEN 0
-          WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'trash' THEN m.is_trashed = 1
-          WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
-          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-          ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
-        END
-        AND messages_fts MATCH @ftsQuery
-      GROUP BY m.thread_id
-      ORDER BY MAX(COALESCE(m.sent_at, m.received_at, m.created_at)) DESC
-      LIMIT @limit`),
     passkeyById: db.prepare('SELECT * FROM passkeys WHERE id = ?'),
     passkeyList: db.prepare('SELECT * FROM passkeys ORDER BY created_at DESC'),
     passkeyCount: db.prepare('SELECT COUNT(*) AS count FROM passkeys'),
@@ -1240,16 +1296,47 @@ export function createRepositories(db) {
         queries.messageRelocate.run({ id, mailbox, uid, updated_at: now() });
         return publicMessage(queries.messageById.get(id));
       },
+      searchConversations({
+        accountIds = [],
+        folder = 'inbox',
+        mailbox = 'INBOX',
+        parsed = null,
+        ftsQuery = '',
+        category = '',
+        personEmails = [],
+        hideQuiet = false,
+        limit = 50,
+        offset = 0,
+      } = {}) {
+        const built = buildConversationSearch({
+          accountIds,
+          folder,
+          mailbox,
+          parsed,
+          ftsQuery,
+          category,
+          personEmails,
+          hideQuiet,
+          limit,
+          offset,
+          nowIso: now(),
+        });
+        if (built.empty) return { threadIds: [], total: 0, categoryCounts: [] };
+        const threadIds = db.prepare(built.pageSql).all(built.params).map((row) => row.threadId);
+        const total = Number(db.prepare(built.countSql).get(built.params)?.total) || 0;
+        const categoryCounts = db.prepare(built.categorySql).all(built.params);
+        return { threadIds, total, categoryCounts };
+      },
       searchThreadIds({ accountId, folder = 'inbox', mailbox = 'INBOX', ftsQuery, limit = 500 }) {
         if (!ftsQuery) return [];
-        return queries.searchThreadIds.all({
-          accountId,
+        return this.searchConversations({
+          accountIds: [accountId],
           folder,
           mailbox,
           ftsQuery,
           limit,
-          now: now(),
-        }).map((row) => row.threadId);
+          offset: 0,
+        }).threadIds;
       },
       forThreads(threadIds = [], { folder = '', mailbox = 'INBOX', includeBodies = true } = {}) {
         const ids = [...new Set(threadIds.filter(Boolean))];
@@ -1325,6 +1412,8 @@ export function createRepositories(db) {
       },
     },
     retention: {
+      // Clears stored bodies only. The contentless FTS index keeps tokens until
+      // the next upsert, which is what lets pruned mail stay searchable.
       pruneBodies(cutoffIso) {
         return queries.pruneBodies.run({ cutoff: cutoffIso, updated_at: now() }).changes;
       },

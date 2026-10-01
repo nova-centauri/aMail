@@ -56,8 +56,6 @@ const emptyCategoryCounts = () => Object.fromEntries(
     .map((category) => [category, 0]),
 );
 
-const conversationTouchesPersonFlag = (conversationMessages, flag) => conversationMessages.some((message) => messageMatchesPersonFlag(message, flag));
-
 const emptyFolderCounts = () => ({ inbox: 0, starred: 0, snoozed: 0, drafts: 0, unanalyzed: 0 });
 
 export const sumFolderCounts = (accounts, repos) => accounts.reduce((totals, account) => {
@@ -160,93 +158,69 @@ export function listConversations(repos, {
     };
   }
 
-  const results = accounts.map((account) => {
-    if (ftsQuery) {
-      const threadIds = repos.messages.searchThreadIds({
-        accountId: account.id,
-        folder,
-        mailbox: String(mailbox || 'INBOX'),
-        ftsQuery,
-        limit: Math.min(500, page * pageSize + pageSize),
-      });
-      return { items: repos.messages.forThreads(threadIds, { folder, mailbox: String(mailbox || 'INBOX'), includeBodies: false }) };
-    }
-    return repos.messages.list({
-      accountId: account.id,
-      folder,
-      mailbox: String(mailbox || 'INBOX'),
-      query: '',
-      category: '',
-      limit: 1000,
-      offset: 0,
-      includeBodies: false,
-      includeTotal: false,
-    });
+  const search = repos.messages.searchConversations({
+    accountIds: accounts.map((account) => account.id),
+    folder,
+    mailbox: String(mailbox || 'INBOX'),
+    parsed: searchActive ? parsedQuery : null,
+    ftsQuery,
+    category,
+    personEmails: personFlag?.emails || [],
+    hideQuiet: !searchActive && !category && !personFlag,
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
   });
   const byThread = new Map();
-  for (const message of results.flatMap((result) => result.items)) {
-    const key = `${message.accountId}:${message.threadId}`;
-    const existing = byThread.get(key);
+  for (const message of repos.messages.forThreads(search.threadIds, {
+    folder,
+    mailbox: String(mailbox || 'INBOX'),
+    includeBodies: false,
+  })) {
+    const existing = byThread.get(message.threadId);
     const messageTime = String(message.sentAt || message.receivedAt || message.createdAt);
     const existingTime = String(existing?.latest?.sentAt || existing?.latest?.receivedAt || existing?.latest?.createdAt || '');
     if (!existing) {
-      byThread.set(key, { latest: message, messages: [message] });
+      byThread.set(message.threadId, { latest: message, messages: [message] });
     } else {
       existing.messages.push(message);
       if (messageTime > existingTime) existing.latest = message;
     }
   }
-  const conversations = [...byThread.values()]
-    .filter(({ messages }) => !personFlag || conversationTouchesPersonFlag(messages, personFlag))
-    .filter(({ messages, latest }) => {
-      // Explicit search can still find quiet digests. Unscoped browsing and
-      // smart-category chips hide routine ops noise even when unread.
-      if (searchActive) {
-        return conversationMatchesMailboxQuery({ latest, messages }, parsedQuery, { skipText: Boolean(ftsQuery) });
-      }
-      if (category) return true;
-      if (personFlag) return true;
-      return !isHiddenDefaultCategory(latest.category);
-    }).sort(({ latest: left }, { latest: right }) =>
-      String(right.sentAt || right.receivedAt || right.createdAt).localeCompare(String(left.sentAt || left.receivedAt || left.createdAt)));
   const categoryCounts = emptyCategoryCounts();
-  for (const { latest } of conversations) {
-    if (isHiddenDefaultCategory(latest.category)) continue;
-    if (Object.hasOwn(categoryCounts, latest.category)) categoryCounts[latest.category] += 1;
+  for (const row of search.categoryCounts) {
+    if (Object.hasOwn(categoryCounts, row.category)) categoryCounts[row.category] = Number(row.count) || 0;
   }
-  const all = category
-    ? conversations.filter(({ latest }) => latest.category === category)
-    : conversations;
-  const start = (page - 1) * pageSize;
   // Filtering still uses all candidate messages in each conversation. Only
   // visible rows need their stored, whole-thread unread/analyzed aggregates.
-  const pageItems = all.slice(start, start + pageSize)
-    .map(({ latest: latestMessage, messages }) => {
-      const thread = repos.threads.get(latestMessage.threadId);
-      const latestAt = latestMessage.sentAt || latestMessage.receivedAt || latestMessage.createdAt;
-      return {
-        ...latestMessage,
-        // Gmail's list is made of conversations. The thread id is intentionally
-        // the row id so every toolbar action can target all messages in it.
-        id: latestMessage.threadId,
-        threadId: latestMessage.threadId,
-        latestMessageId: latestMessage.id,
-        messageCount: thread?.messageCount || 1,
-        unreadCount: thread?.unreadCount || 0,
-        unanalyzedCount: thread ? thread.unanalyzedCount : messages.filter((message) => !message.isAnalyzed).length,
-        participants: thread?.participants || [latestMessage.from],
-        latestAt,
-        snippet: latestMessage.snippet,
-        hasAttachments: Boolean(latestMessage.attachments?.length) || messages.some((message) => message.attachments?.length),
-        isRead: (thread?.unreadCount || 0) === 0,
-        isAnalyzed: thread ? thread.unanalyzedCount === 0 : messages.every((message) => message.isAnalyzed),
-        isStarred: thread?.isStarred ?? latestMessage.isStarred,
-        ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
-      };
-    });
+  const pageItems = search.threadIds.map((threadId) => {
+    const grouped = byThread.get(threadId);
+    if (!grouped) return null;
+    const { latest: latestMessage, messages } = grouped;
+    const thread = repos.threads.get(latestMessage.threadId);
+    const latestAt = latestMessage.sentAt || latestMessage.receivedAt || latestMessage.createdAt;
+    return {
+      ...latestMessage,
+      // Gmail's list is made of conversations. The thread id is intentionally
+      // the row id so every toolbar action can target all messages in it.
+      id: latestMessage.threadId,
+      threadId: latestMessage.threadId,
+      latestMessageId: latestMessage.id,
+      messageCount: thread?.messageCount || 1,
+      unreadCount: thread?.unreadCount || 0,
+      unanalyzedCount: thread ? thread.unanalyzedCount : messages.filter((message) => !message.isAnalyzed).length,
+      participants: thread?.participants || [latestMessage.from],
+      latestAt,
+      snippet: latestMessage.snippet,
+      hasAttachments: Boolean(latestMessage.attachments?.length) || messages.some((message) => message.attachments?.length),
+      isRead: (thread?.unreadCount || 0) === 0,
+      isAnalyzed: thread ? thread.unanalyzedCount === 0 : messages.every((message) => message.isAnalyzed),
+      isStarred: thread?.isStarred ?? latestMessage.isStarred,
+      ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
+    };
+  }).filter(Boolean);
   return {
     messages: pageItems,
-    total: all.length,
+    total: search.total,
     page,
     pageSize,
     categoryCounts,
