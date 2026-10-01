@@ -214,6 +214,15 @@ create an empty database next to the encrypted one; turn it back on with the
 original key. `/api/health` reports `databaseEncrypted` so you can confirm the
 state after the restart.
 
+Typesense keeps its own volume (`typesense-data`) so ranking does not have to
+scan SQLite on each keystroke. That volume is **not** covered by SQLCipher.
+`AMAIL_SEARCH_ENGINE=auto` therefore leaves Typesense unused while the database
+is encrypted (or the process is in keyslot mode) and answers from the FTS index
+inside the database. Set `AMAIL_SEARCH_ENGINE=typesense` only when a plaintext
+copy of indexed mail on that volume is acceptable. `/api/health` reports
+`searchEngine` as `typesense` or `fts`. The Typesense port is not published;
+only the aMail container holds the API key.
+
 ## Keyslot mode (hosted tenants)
 
 `AMAIL_KEY_MODE=keyslot` runs the same image with **no key material in the

@@ -184,7 +184,18 @@ export function loadConfig(env = process.env) {
     // a backup job, ...). Matching mail is hidden from the default inbox unless it
     // reports a failure, which surfaces under "Ops errors".
     opsSources: parseOpsSources(env.AMAIL_OPS_SOURCES ?? env.GIGAMAIL_OPS_SOURCES),
+    // auto uses Typesense when AMAIL_TYPESENSE_URL is set and the SQLite file
+    // is not encrypted. off/fts keeps FTS inside the database. typesense forces
+    // the external index even next to SQLCipher (the index is plaintext).
+    searchEngine: normalizeSearchEngine(readEnv(env, 'SEARCH_ENGINE')),
+    typesenseUrl: parseHttpUrl(readEnv(env, 'TYPESENSE_URL')),
+    typesenseApiKey: readEnv(env, 'TYPESENSE_API_KEY') || null,
   });
+}
+
+function normalizeSearchEngine(value) {
+  const mode = String(value || 'auto').trim().toLowerCase();
+  return ['auto', 'typesense', 'off', 'fts'].includes(mode) ? mode : 'auto';
 }
 
 /** Accept only absolute http(s) URLs; anything else disables the feature. */

@@ -251,3 +251,135 @@ test('IMAP envelope hits join leftover-text pages and stay out of analyzed filte
   assert.equal((await listConversations(repos, { query: 'bodyonlyword is:analyzed' })).total, 0);
 });
 
+test('Typesense rank order is kept and a dead engine falls back to FTS', async (t) => {
+  const { repos, add, thread } = fixture(t);
+  const older = thread('Older');
+  add(older, {
+    text_body: 'alpha report',
+    snippet: 'alpha report',
+    sent_at: '2020-01-01T00:00:00.000Z',
+    received_at: '2020-01-01T00:00:00.000Z',
+  });
+  const newer = thread('Newer');
+  add(newer, {
+    text_body: 'alpha report',
+    snippet: 'alpha report',
+    sent_at: '2026-01-01T00:00:00.000Z',
+    received_at: '2026-01-01T00:00:00.000Z',
+  });
+  repos.searchEngine = {
+    enabled: true,
+    async searchConversations() {
+      return {
+        threadIds: [older.id, newer.id],
+        total: 2,
+        categoryCounts: [{ category: 'primary', count: 2 }],
+      };
+    },
+  };
+  const ranked = await listConversations(repos, { query: 'alpha report', pageSize: 10 });
+  assert.deepEqual(ranked.messages.map((item) => item.id), [older.id, newer.id]);
+  assert.equal(ranked.categoryCounts.primary, 2);
+
+  repos.searchEngine = {
+    enabled: true,
+    async searchConversations() {
+      throw new Error('typesense down');
+    },
+  };
+  const fallback = await listConversations(repos, { query: 'alpha report', pageSize: 10 });
+  assert.equal(fallback.total, 2);
+  assert.equal(fallback.messages[0].id, newer.id);
+});
+
+test('Typesense pages are not clipped and analyzed text stays off IMAP', async (t) => {
+  const { repos } = fixture(t);
+  let paging = null;
+  const providerCalls = [];
+  repos.searchEngine = {
+    enabled: true,
+    async searchConversations(args) {
+      paging = args;
+      return { threadIds: [], total: 1200, categoryCounts: [] };
+    },
+  };
+  const mailService = {
+    async searchAndMaterialize(args) {
+      providerCalls.push(args);
+      return { threadIds: [] };
+    },
+  };
+  const page = await listConversations(repos, { query: 'invoice', page: 21, pageSize: 50, mailService, searchSource: 'human' });
+  assert.equal(page.total, 1200);
+  assert.equal(paging.offset, 1000);
+  assert.equal(paging.limit, 50);
+  assert.equal(providerCalls.length, 1);
+
+  providerCalls.length = 0;
+  paging = null;
+  await listConversations(repos, { query: 'invoice is:unanalyzed', mailService, searchSource: 'human' });
+  assert.equal(providerCalls.length, 0);
+  assert.equal(paging.parsed.isAnalyzed, false);
+  await listConversations(repos, { query: 'from:ada@example.test', mailService, searchSource: 'human' });
+  assert.equal(providerCalls.length, 0);
+});
+
+test('Typesense results still include IMAP hits that are not in the index', async (t) => {
+  const { repos, account, thread } = fixture(t);
+  const conversation = thread('Old invoice');
+  repos.searchEngine = {
+    enabled: true,
+    async searchConversations() {
+      return { threadIds: [], total: 0, categoryCounts: [] };
+    },
+    async matchingThreadIds() {
+      return new Set();
+    },
+  };
+  const mailService = {
+    async searchAndMaterialize() {
+      repos.messages.upsert({
+        account_id: account.id,
+        thread_id: conversation.id,
+        mailbox: 'INBOX',
+        uid: 9001,
+        rfc_message_id: '<envelope-hit@example.test>',
+        in_reply_to: null,
+        references_json: '[]',
+        subject: 'Old invoice',
+        from_name: 'Vendor',
+        from_email: 'accounts@vendor.test',
+        to_json: '[]',
+        cc_json: '[]',
+        bcc_json: '[]',
+        reply_to_json: null,
+        sent_at: '2019-01-01T00:00:00.000Z',
+        received_at: '2019-01-01T00:00:00.000Z',
+        html_body: '',
+        text_body: '',
+        snippet: 'Old invoice',
+        attachments_json: '[]',
+        labels_json: '[]',
+        is_read: 0,
+        is_starred: 0,
+        is_archived: 0,
+        is_trashed: 0,
+        is_spam: 0,
+        snoozed_until: null,
+        is_sent: 0,
+        source_imported: 0,
+      });
+      return { threadIds: [conversation.id] };
+    },
+  };
+  const page = await listConversations(repos, {
+    query: 'bodyonlyword',
+    mailService,
+    searchSource: 'human',
+  });
+  assert.equal(page.total, 1);
+  assert.equal(page.messages[0].id, conversation.id);
+  assert.equal(page.messages[0].sourceImported, false);
+  assert.equal((await listConversations(repos, { query: 'bodyonlyword is:unanalyzed' })).total, 0);
+});
+

@@ -8,6 +8,7 @@ import { createAuthenticator } from './middleware/auth.js';
 import { createVault } from './vault.js';
 import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
+import { createSearchEngine } from './services/search-engine.js';
 
 const BACKLOG_DRAIN_DELAY_MS = 5_000;
 
@@ -59,12 +60,17 @@ export function createHarness({ config, logger }) {
     const repos = createRepositories(database);
     const remoteContent = createRemoteContentService({ config: runtimeConfig, repos, logger });
     const mailService = createMailService({ config: runtimeConfig, repos, logger, metering });
+    const searchEngine = createSearchEngine({ config: runtimeConfig, repos, logger });
+    repos.setSearchIndexer((event) => searchEngine.noteWrite(event));
+    repos.searchEngine = searchEngine;
     return {
       config: runtimeConfig,
       repos,
       remoteContent,
       mailService,
+      searchEngine,
       async close() {
+        searchEngine.stop();
         await mailService.close?.().catch(() => {});
         remoteContent.close().catch(() => {});
         repos.close();
@@ -83,6 +89,7 @@ export function createHarness({ config, logger }) {
       metering,
       vault: null,
       async start() {
+        runtime.searchEngine.start();
         startPolling(runtime.mailService);
       },
       async stop() {
@@ -102,6 +109,7 @@ export function createHarness({ config, logger }) {
     logger,
     buildRuntime: (keys) => buildRuntime({ ...config, ...keys }),
     onUnlock(runtime) {
+      runtime.searchEngine?.start();
       startPolling(runtime.mailService);
       handoff?.start().catch((error) => logger.error({ err: error }, 'DEK handoff listener failed to start'));
     },

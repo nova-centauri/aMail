@@ -71,6 +71,7 @@ export function buildConversationSearch(input = {}) {
     personEmails = [],
     hideQuiet = false,
     extraThreadIds = [],
+    restrictThreadIds = [],
     limit = 50,
     offset = 0,
     nowIso,
@@ -180,6 +181,14 @@ export function buildConversationSearch(input = {}) {
   }
 
   if (hideQuiet) filters.push("stats.latest_category <> 'ops_quiet'");
+
+  const restrict = [...new Set((restrictThreadIds || []).filter(Boolean))];
+  if (restrict.length) {
+    filters.push(`stats.thread_id IN (${restrict.map((id, index) => {
+      params[`restrict${index}`] = id;
+      return `@restrict${index}`;
+    }).join(', ')})`);
+  }
 
   const whereSql = filters.length ? `WHERE ${filters.join('\n      AND ')}` : '';
   const pageWhere = [

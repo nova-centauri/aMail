@@ -505,6 +505,10 @@ function initSchema(db) {
 }
 
 const FTS_BACKFILL_BATCH = 100;
+const SEARCH_INDEX_COLUMNS = `id, account_id, thread_id, mailbox, subject, from_name, from_email,
+  to_json, cc_json, bcc_json, reply_to_json, sent_at, received_at, created_at, text_body, snippet,
+  attachments_json, is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent,
+  analyzed_at, smart_category, source_imported`;
 const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 const WAL_AUTOCHECKPOINT_PAGES = 1000;
 const SQLITE_CACHE_KIB = -16000;
@@ -1056,6 +1060,8 @@ export function createRepositories(db) {
     queries.ftsInsert.run(ftsDocument(row, json));
   };
 
+  let queueSearch = () => {};
+
   const recomputeThread = db.transaction((threadId) => {
     const thread = queries.threadById.get(threadId);
     if (!thread) return null;
@@ -1098,7 +1104,10 @@ export function createRepositories(db) {
     for (const threadId of threadIds) {
       if (threadId) recomputeThread(threadId);
     }
-    if (messageId) syncFts(messageId);
+    if (messageId) {
+      syncFts(messageId);
+      queueSearch({ messageIds: [messageId] });
+    }
   };
 
   const insertMessageRow = (row) => {
@@ -1118,21 +1127,28 @@ export function createRepositories(db) {
 
   return {
     runWriteBatch(fn) {
-      return db.transaction(() => {
+      let indexedIds = [];
+      const result = db.transaction(() => {
         writeBatchDepth += 1;
         try {
-          const result = fn();
+          const batched = fn();
           if (writeBatchDepth === 1) {
             for (const threadId of pendingThreadIds) recomputeThread(threadId);
             for (const id of pendingFtsIds) syncFts(id);
+            indexedIds = [...pendingFtsIds];
             pendingThreadIds.clear();
             pendingFtsIds.clear();
           }
-          return result;
+          return batched;
         } finally {
           writeBatchDepth -= 1;
         }
       })();
+      if (indexedIds.length) queueSearch({ messageIds: indexedIds });
+      return result;
+    },
+    setSearchIndexer(fn) {
+      queueSearch = typeof fn === 'function' ? fn : () => {};
     },
     checkpointWal() {
       db.pragma('wal_checkpoint(TRUNCATE)');
@@ -1165,7 +1181,10 @@ export function createRepositories(db) {
         queries.accountUpdate.run({ ...existing, ...input, id, updated_at: now() });
         return publicAccount(queries.accountById.get(id));
       },
-      remove: (id) => queries.accountDelete.run(id).changes > 0,
+      remove: (id) => {
+        queueSearch({ accountRemoved: id });
+        return queries.accountDelete.run(id).changes > 0;
+      },
       markSynced(id) {
         const timestamp = now();
         queries.accountSynced.run(timestamp, timestamp, id);
@@ -1309,12 +1328,14 @@ export function createRepositories(db) {
           analyzed_by: state.isAnalyzed ? String(state.analyzedBy || '').slice(0, 120) : '',
         });
         recomputeThread(row.thread_id);
+        queueSearch({ messageIds: [id] });
         return publicMessage(queries.messageById.get(id));
       },
       relocate(id, { mailbox, uid }) {
         const row = queries.messageById.get(id);
         if (!row) return null;
         queries.messageRelocate.run({ id, mailbox, uid, updated_at: now() });
+        queueSearch({ messageIds: [id] });
         return publicMessage(queries.messageById.get(id));
       },
       searchConversations({
@@ -1360,6 +1381,24 @@ export function createRepositories(db) {
           limit,
           offset: 0,
         }).threadIds;
+      },
+      searchThreadPage({ after = '', limit = 20 } = {}) {
+        return db.prepare('SELECT id FROM threads WHERE id > ? ORDER BY id ASC LIMIT ?')
+          .all(String(after || ''), limit)
+          .map((row) => row.id);
+      },
+      searchThreadIdsForMessages(messageIds = []) {
+        const ids = [...new Set(messageIds.filter(Boolean))];
+        if (!ids.length) return [];
+        return db.prepare(`SELECT DISTINCT thread_id AS id FROM messages WHERE id IN (${ids.map(() => '?').join(',')})`)
+          .all(...ids)
+          .map((row) => row.id);
+      },
+      searchRowsForThreads(threadIds = []) {
+        const ids = [...new Set(threadIds.filter(Boolean))];
+        if (!ids.length) return [];
+        return db.prepare(`SELECT ${SEARCH_INDEX_COLUMNS} FROM messages WHERE thread_id IN (${ids.map(() => '?').join(',')})`)
+          .all(...ids);
       },
       forThreads(threadIds = [], { folder = '', mailbox = 'INBOX', includeBodies = true } = {}) {
         const ids = [...new Set(threadIds.filter(Boolean))];
