@@ -452,7 +452,10 @@ function initSchema(db) {
 
   // Sidebar polling must count compact index entries rather than visit message
   // rows carrying bodies and inline attachment data on every refresh.
-  db.exec(`
+  const badgeColumns = ['is_read', 'is_spam', 'is_starred', 'snoozed_until'];
+  // Older partial schemas can still run classification migrations without the
+  // mail-state columns needed by these optional polling indexes.
+  if (badgeColumns.every((column) => columnsAfterRebuild.has(column))) db.exec(`
     CREATE INDEX IF NOT EXISTS idx_messages_badge_inbox
       ON messages(account_id, thread_id, is_read, snoozed_until, analyzed_at, source_imported)
       WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
