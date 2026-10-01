@@ -92,6 +92,18 @@ test('conversation pages omit large bodies, avoid candidate totals, and enrich o
   assert.equal(repos.messages.forThread(message.threadId)[0].htmlBody, `<p>${body}</p>`);
 });
 
+test('attachment filters preserve empty and malformed cases with large inline payloads', async (t) => {
+  const { repos, add, thread } = fixture(t);
+  const withAttachment = thread('Large inline attachment');
+  add(withAttachment, { attachments_json: JSON.stringify([{ filename: 'image.png', content: 'x'.repeat(512 * 1024) }]) });
+  const empty = thread('Empty attachment list');
+  add(empty, { attachments_json: '[  ]' });
+  const malformed = thread('Malformed legacy metadata');
+  add(malformed, { attachments_json: 'invalid' });
+  assert.deepEqual((await listConversations(repos, { query: 'has:attachment' })).messages.map((m) => m.id), [withAttachment.id]);
+  assert.deepEqual(new Set((await listConversations(repos, { query: '-has:attachment' })).messages.map((m) => m.id)), new Set([empty.id, malformed.id]));
+});
+
 test('pagination preserves matching against older messages and whole-thread state aggregates', async (t) => {
   const { repos, executed, add, thread } = fixture(t);
   const mixed = thread('Mixed state');
@@ -382,4 +394,3 @@ test('Typesense results still include IMAP hits that are not in the index', asyn
   assert.equal(page.messages[0].sourceImported, false);
   assert.equal((await listConversations(repos, { query: 'bodyonlyword is:unanalyzed' })).total, 0);
 });
-

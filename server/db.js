@@ -450,6 +450,20 @@ function initSchema(db) {
     db.exec('ALTER TABLE messages ADD COLUMN source_imported INTEGER NOT NULL DEFAULT 1');
   }
 
+  // Sidebar polling must count compact index entries rather than visit message
+  // rows carrying bodies and inline attachment data on every refresh.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_badge_inbox
+      ON messages(account_id, thread_id, is_read, snoozed_until, analyzed_at, source_imported)
+      WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
+        AND smart_category <> 'ops_quiet';
+    CREATE INDEX IF NOT EXISTS idx_messages_badge_starred
+      ON messages(account_id, thread_id) WHERE is_starred = 1 AND is_trashed = 0;
+    CREATE INDEX IF NOT EXISTS idx_messages_badge_snoozed
+      ON messages(account_id, thread_id, snoozed_until)
+      WHERE snoozed_until IS NOT NULL AND is_trashed = 0 AND is_spam = 0;
+  `);
+
   // Review pages seek directly through pending messages, both across all
   // accounts and within one account. Install after any legacy table rebuild.
   db.exec(`

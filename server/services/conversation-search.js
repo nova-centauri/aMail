@@ -204,7 +204,8 @@ export function buildConversationSearch(input = {}) {
         m.is_read AS is_read,
         m.is_starred AS is_starred,
         m.analyzed_at AS analyzed_at,
-        m.attachments_json AS attachments_json,
+        CASE WHEN json_valid(m.attachments_json) AND json_array_length(m.attachments_json) > 0
+          THEN 1 ELSE 0 END AS has_attachment,
         m.smart_category AS smart_category,
         COALESCE(m.source_imported, 1) AS source_imported,
         COALESCE(m.sent_at, m.received_at, m.created_at) AS ts,
@@ -225,7 +226,7 @@ export function buildConversationSearch(input = {}) {
         MAX(is_starred) AS has_starred,
         MAX(CASE WHEN COALESCE(source_imported, 1) = 1 AND analyzed_at IS NULL THEN 1 ELSE 0 END) AS has_unanalyzed,
         SUM(CASE WHEN COALESCE(source_imported, 1) = 1 THEN 1 ELSE 0 END) AS imported_count,
-        MAX(CASE WHEN json_valid(attachments_json) AND json_array_length(attachments_json) > 0 THEN 1 ELSE 0 END) AS has_attachment,
+        MAX(has_attachment) AS has_attachment,
         MAX(CASE WHEN rk = 1 THEN smart_category END) AS latest_category
       FROM ranked
       GROUP BY account_id, thread_id
