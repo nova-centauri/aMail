@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { usePresence } from '../mail/presence.js';
 import { folders, UNIFIED_ACCOUNT } from '../mail/constants.js';
 import { accountContextMenu, flagContextMenu } from '../mail/context-menu.js';
 import { demoAccounts } from '../mail/demo.js';
@@ -8,6 +9,7 @@ import { Avatar, IconButton } from './ui.jsx';
 
 export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setActiveFolder, counts, onCompose, accounts, activeAccount, setActiveAccount, onSelectUnified, onOpenSettings, isDemo, onAddAccount, onEditAccount, activePersonFlag, onSelectPersonFlag, personFlags = [], onManageFlags, agentQueueActive = false, onSelectAgentQueue, onSyncAccount }) {
   const [showMore, setShowMore] = useState(false);
+  const drawer = usePresence(mobileOpen);
   const displayAccounts = accounts.length ? accounts : isDemo ? demoAccounts : [];
   const items = showMore
     ? [...folders, { id: 'all', label: 'All mail', icon: 'mail' }, { id: 'spam', label: 'Spam', icon: 'spam' }, { id: 'trash', label: 'Trash', icon: 'trash' }]
@@ -33,7 +35,7 @@ export function Sidebar({ compact, mobileOpen, onCloseMobile, activeFolder, setA
   }));
   return (
     <>
-      {mobileOpen && <button type="button" className="sidebar-scrim" aria-label="Close navigation" onClick={onCloseMobile} />}
+      {drawer.mounted && <button type="button" className={`sidebar-scrim ${drawer.closing ? 'is-closing' : ''}`} aria-label="Close navigation" onClick={onCloseMobile} />}
       <aside className={`sidebar ${compact ? 'is-compact' : ''} ${mobileOpen ? 'is-mobile-open' : ''}`}>
         <div className="sidebar-top">
           <button type="button" className="compose-button" onClick={onCompose} title="Compose" aria-label="Compose">

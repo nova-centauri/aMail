@@ -21,7 +21,9 @@
   display: flex; flex-direction: column; border-left: 1px solid var(--line-strong); background: var(--bg-1); box-shadow: var(--shadow-3);
   animation: slide-in var(--t-med) var(--ease);
 }
-@keyframes slide-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.settings-panel.is-closing { animation: slide-out var(--t-med) var(--ease) forwards; }
+@keyframes slide-in { from { transform: translateX(16px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes slide-out { from { transform: none; opacity: 1; } to { transform: translateX(16px); opacity: 0; } }
 .settings-header { min-height: 68px; flex: 0 0 auto; padding: var(--sp-4) var(--sp-3) var(--sp-4) var(--sp-6); display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); border-bottom: 1px solid var(--line); }
 .settings-header-copy { min-width: 0; display: grid; gap: 2px; }
 .settings-header h2 { font-size: var(--fs-xl); font-weight: 650; letter-spacing: -.02em; }
@@ -85,7 +87,9 @@
   border: 1px solid var(--line-strong); border-radius: var(--r-xl); color: var(--ink); background: var(--bg-2); box-shadow: var(--shadow-3);
   animation: pop var(--t-med) var(--ease);
 }
+.profile-menu.is-closing { animation: pop-out var(--t-med) var(--ease) forwards; }
 @keyframes pop { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes pop-out { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-4px); } }
 .profile-close { position: absolute; top: 10px; right: 10px; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; color: var(--ink-3); }
 .profile-close:hover { background: var(--bg-3); color: var(--ink); }
 .profile-menu .avatar-hero { margin: 4px 0 10px; box-shadow: 0 0 0 3px var(--bg-2), 0 0 0 5px var(--accent-line); }

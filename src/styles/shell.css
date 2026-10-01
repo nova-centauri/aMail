@@ -161,19 +161,31 @@
 .mail-split {
   min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr);
   gap: var(--gutter); padding: var(--gutter) var(--gutter) var(--gutter) 0; overflow: hidden;
+  transition: grid-template-columns var(--t-med) var(--ease);
 }
+/* Reader mounted but not yet open (or closing): keep a zero-width column so the split can ease. */
+.mail-app.reader-mounted .mail-split { grid-template-columns: minmax(0, 1fr) minmax(0, 0fr); }
 /* Reader open: the list keeps a comfortable fixed share and the reader takes the rest. */
 .mail-app.thread-open .mail-split { grid-template-columns: var(--list-w) minmax(0, 1fr); }
 .mail-list-panel, .thread-panel {
   min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
   border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--bg-1); box-shadow: var(--shadow-1);
 }
+.thread-panel {
+  opacity: 0; transform: translateX(12px);
+  transition: opacity var(--t-med) var(--ease), transform var(--t-med) var(--ease);
+}
+.mail-app.thread-open .thread-panel { opacity: 1; transform: none; }
+.mail-app.reader-mounted:not(.thread-open) .thread-panel { pointer-events: none; }
 
 /* ---- Responsive ---- */
 /* Medium windows: a split would be cramped, so the reader replaces the list. */
 @media (max-width: 1000px) {
+  .mail-split { position: relative; }
+  .mail-app.reader-mounted .mail-split,
   .mail-app.thread-open .mail-split { grid-template-columns: minmax(0, 1fr); }
-  .mail-app.thread-open .mail-list-panel { display: none; }
+  .mail-app.reader-mounted .thread-panel { position: absolute; inset: 0; z-index: 2; }
+  .mail-app.thread-open .mail-list-panel { visibility: hidden; }
 }
 /* Sidebar becomes a drawer (matches the JS breakpoint used for the menu button). */
 @media (max-width: 840px) {

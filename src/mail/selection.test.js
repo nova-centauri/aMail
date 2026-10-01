@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mergeOpenThread, reconcileSelectedThread, sameOpenThread } from './selection.js';
+import { mergeOpenThread, nextThreadAfterRemoval, reconcileSelectedThread, sameOpenThread } from './selection.js';
 
 const openThread = {
   id: 'thread-1',
@@ -57,6 +57,35 @@ describe('reconcileSelectedThread', () => {
     expect(next.unread).toBe(true);
     expect(next.starred).toBe(true);
     expect(next.messages[0].bodyHtml).toContain('full write-up');
+  });
+});
+
+describe('nextThreadAfterRemoval', () => {
+  const threads = [
+    { id: 'a', subject: 'First' },
+    { id: 'b', subject: 'Second' },
+    { id: 'c', subject: 'Third' },
+    { id: 'draft', folder: 'drafts', draftId: 'd1', subject: 'Draft' },
+  ];
+
+  it('opens the next message when the open one is deleted or marked spam', () => {
+    expect(nextThreadAfterRemoval(threads, threads[0], ['a'])).toEqual({ advance: true, next: threads[1] });
+    expect(nextThreadAfterRemoval(threads, threads[1], ['b']).next.id).toBe('c');
+  });
+
+  it('skips other rows removed in the same action and drafts', () => {
+    expect(nextThreadAfterRemoval(threads, threads[0], ['a', 'b']).next.id).toBe('c');
+    expect(nextThreadAfterRemoval(threads, threads[2], ['c'])).toEqual({ advance: true, next: null });
+  });
+
+  it('closes when the open message is last or missing from the list', () => {
+    expect(nextThreadAfterRemoval(threads, { id: 'missing' }, ['missing'])).toEqual({ advance: true, next: null });
+    expect(nextThreadAfterRemoval([], threads[0], ['a'])).toEqual({ advance: true, next: null });
+  });
+
+  it('does not move the reader when a different row was removed', () => {
+    expect(nextThreadAfterRemoval(threads, threads[0], ['b'])).toEqual({ advance: false, next: null });
+    expect(nextThreadAfterRemoval(threads, null, ['a'])).toEqual({ advance: false, next: null });
   });
 });
 
