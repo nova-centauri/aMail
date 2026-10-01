@@ -877,6 +877,7 @@ export function createRepositories(db) {
       is_starred = @is_starred, labels_json = @labels_json, updated_at = @updated_at
       WHERE id = @id`),
     messageById: db.prepare('SELECT * FROM messages WHERE id = ?'),
+    messageAnalysisById: db.prepare('SELECT id, account_id, analyzed_at, analyzed_by FROM messages WHERE id = ?'),
     // This queue filters before LIMIT and spans all cached folders. Do not route
     // it through the conversation UI's bounded list/search candidate window.
     unanalyzedMessages: db.prepare(reviewQueueSql(false, false)),
@@ -1210,6 +1211,12 @@ export function createRepositories(db) {
     },
     messages: {
       get: (id) => publicMessage(queries.messageById.get(id)),
+      analysisStatus: db.transaction((ids) => ids.map((id) => {
+        const row = queries.messageAnalysisById.get(id);
+        return row ? { id: row.id, accountId: row.account_id,
+          isAnalyzed: Boolean(row.analyzed_at), analyzedAt: row.analyzed_at || null,
+          analyzedBy: row.analyzed_by || null } : null;
+      })),
       getRaw: (id) => queries.messageById.get(id) || null,
       listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null } = {}) => {
         if (!Number.isInteger(limit) || limit < 1 || limit > 200) {

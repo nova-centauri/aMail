@@ -305,6 +305,7 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     'list_messages',
     'list_unanalyzed_messages',
     'get_message',
+    'get_analysis_status',
     'get_attachment',
     'get_thread',
     'send_message',
@@ -400,6 +401,25 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
   }
   assert.equal(repos.messages.get(firstMessage.id).isRead, false);
   assert.equal(repos.messages.get(firstMessage.id).isAnalyzed, false);
+
+  const statusCall = (ids, token = accessToken) => mcpRpc(origin, {
+    token, method: 'tools/call', params: { name: 'get_analysis_status', arguments: { ids } },
+  });
+  const changesBeforeStatus = database.prepare('SELECT total_changes() AS count').get().count;
+  const statuses = JSON.parse((await statusCall([thirdMessage.id, secondMessage.id])).body.result.content[0].text);
+  assert.deepEqual(statuses.messages, [
+    { id: thirdMessage.id, accountId: account.id, isAnalyzed: false, analyzedAt: null, analyzedBy: null },
+    { id: secondMessage.id, accountId: account.id, isAnalyzed: true,
+      analyzedAt: repos.messages.get(secondMessage.id).analyzedAt, analyzedBy: 'test' },
+  ]);
+  for (const ids of [[], Array(201).fill(firstMessage.id), [firstMessage.id, firstMessage.id],
+    [firstMessage.id, thread.id], [firstMessage.id, 'missing'], [''], ['   ']]) {
+    const rejected = await statusCall(ids);
+    assert.ok(rejected.body.result?.isError || rejected.body.error);
+  }
+  assert.equal((await statusCall([firstMessage.id], 'wrong-token')).response.status, 401);
+  assert.equal(database.prepare('SELECT total_changes() AS count').get().count, changesBeforeStatus,
+    'status reads must not mutate state or trigger provider hydration');
 
   const cookieAuth = await fetch(`${origin}/mcp`, {
     method: 'POST',

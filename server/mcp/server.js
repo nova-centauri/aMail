@@ -243,6 +243,20 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     };
   }));
 
+  server.registerTool('get_analysis_status', {
+    title: 'Get individual analysis flags',
+    description: 'Read only the local analysis flags for 1-200 exact individual message ids, in request order. Returns id, accountId, isAnalyzed, analyzedAt and analyzedBy. No bodies, attachments, thread expansion, hydration, IMAP connection or state changes. Use to reconcile uncertain analysis-marker writes without rereading email.',
+    inputSchema: { ids: z.array(z.string().min(1).max(128).refine((id) => id.trim() === id && id.trim().length > 0)).min(1).max(200) },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ ids }) => runTool(async () => {
+    if (new Set(ids).size !== ids.length) throw new ValidationError('Duplicate message ids are not allowed.');
+    const messages = repos.messages.analysisStatus(ids);
+    if (messages.some((message, index) => !message || message.id !== ids[index])) {
+      throw new NotFoundError('Individual message not found.');
+    }
+    return { messages };
+  }));
+
   server.registerTool('get_message', {
     title: 'Get message',
     description: 'Fetch one message by id (sanitized body/snippet as stored by aMail).',
