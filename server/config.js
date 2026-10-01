@@ -103,6 +103,10 @@ export function loadConfig(env = process.env) {
     // the operator. Trusting arbitrary forwarded headers is unsafe by default.
     trustProxy: boolean(readEnv(env, 'TRUST_PROXY')),
     allowInsecureTls: boolean(readEnv(env, 'ALLOW_INSECURE_TLS')),
+    // Protected accounts may be reviewed and marked analyzed locally, but
+    // message flags, moves and sending (including Sent APPEND) are forbidden.
+    imapWriteProtectedAccounts: (readEnv(env, 'IMAP_WRITE_PROTECTED_ACCOUNTS') || '')
+      .split(',').map((email) => email.trim().toLowerCase()).filter(Boolean),
     cookieSecure: boolean(readEnv(env, 'COOKIE_SECURE'), true),
     // Hosted (keyslot) defaults are the density profile: a smaller first-sync
     // window, a 5 MiB parse cap, a 15-minute unattended poll, and error-only

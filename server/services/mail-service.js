@@ -610,6 +610,16 @@ export function createMailService({
     return { account, credentials: decryptJson(account.credential_ciphertext, config.credentialKey) };
   }
 
+  function assertImapWritesAllowed(accountId) {
+    const account = repos.accounts.getRaw(accountId);
+    if (!account) throw new NotFoundError('Mail account not found.');
+    const email = String(account.email || '').trim().toLowerCase();
+    if (!email) throw new ValidationError('Cannot verify the account identity for an IMAP write.');
+    if ((config.imapWriteProtectedAccounts || []).includes(email)) {
+      throw new ValidationError('IMAP writes are disabled for this protected mail account.');
+    }
+  }
+
   function resolveThread({ accountId, subject, inReplyTo, references, threadId }) {
     if (threadId) {
       const direct = repos.threads.get(threadId);
@@ -1474,6 +1484,7 @@ export function createMailService({
   }
 
   async function sendMessage(input) {
+    assertImapWritesAllowed(input.accountId);
     const { account, credentials } = accountAndCredentials(input.accountId);
     const to = recipientList(input.to, 'To');
     const cc = recipientList(input.cc, 'Cc');
@@ -1858,6 +1869,11 @@ export function createMailService({
   async function updateMessageState(id, state) {
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
+    if (['isRead', 'isStarred', 'isArchived', 'isTrashed', 'isSpam'].some((key) => state[key] !== undefined)) {
+      // Reject before local state, metering, credentials or a pooled IMAP
+      // connection are touched, including mixed analyzed + provider changes.
+      assertImapWritesAllowed(existing.accountId);
+    }
     const updated = repos.messages.setState(id, state);
     // Only the transition into "analyzed" is metered, so re-marking an already
     // analyzed message (or toggling it back) never inflates the count.

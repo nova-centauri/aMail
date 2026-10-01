@@ -46,7 +46,7 @@ async function runTool(fn) {
   }
 }
 
-function publicAccountSummary(account) {
+function publicAccountSummary(account, config = {}) {
   return {
     id: account.id,
     email: account.email,
@@ -55,6 +55,8 @@ function publicAccountSummary(account) {
     syncEnabled: account.syncEnabled,
     lastSyncedAt: account.lastSyncedAt,
     color: account.color,
+    imapWriteProtected: (config.imapWriteProtectedAccounts || [])
+      .includes(String(account.email || '').trim().toLowerCase()),
   };
 }
 
@@ -136,7 +138,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     title: 'List mail accounts',
     description: 'List connected mail accounts (id, email, provider, sync status). Never returns secrets.',
   }, async () => runTool(async () => ({
-    accounts: repos.accounts.list().map(publicAccountSummary),
+    accounts: repos.accounts.list().map((account) => publicAccountSummary(account, config)),
   })));
 
   server.registerTool('list_providers', {
@@ -409,6 +411,33 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     return { message: messages[0], messages };
   }));
 
+  server.registerTool('mark_messages_analyzed', {
+    title: 'Mark reviewed individual messages analyzed',
+    description: 'Mark 1-200 exact individual message ids analyzed using local bookkeeping only. No thread expansion, provider flags, IMAP connection, moves or deletion. Call only after each listed message has actually been reviewed. Returns bounded individual receipts. Safe to reconcile and repeat; analyzed transitions are metered once.',
+    inputSchema: {
+      ids: z.array(z.string().min(1).max(128)).min(1).max(200),
+      by: z.string().max(128).optional(),
+    },
+  }, async ({ ids, by }) => runTool(async () => {
+    if (new Set(ids).size !== ids.length) throw new ValidationError('Duplicate message ids are not allowed.');
+    // Validate the whole selection before making any changes. Thread ids and
+    // unknown ids cannot silently expand or partially apply a malformed batch.
+    const selected = ids.map((id) => {
+      const message = repos.messages.get(id);
+      if (!message || message.id !== id) throw new NotFoundError('Individual message not found.');
+      return message;
+    });
+    const receipts = [];
+    for (const message of selected) {
+      const updated = await mailService.updateMessageState(message.id, {
+        isAnalyzed: true, analyzedBy: String(by || ''),
+      });
+      receipts.push({ id: updated.id, accountId: updated.accountId,
+        isAnalyzed: updated.isAnalyzed, remoteSync: updated.remoteSync });
+    }
+    return { messages: receipts };
+  }));
+
   server.registerTool('sync_mail', {
     title: 'Sync mail',
     description: 'Sync one account (accountId) or all accounts when accountId is omitted.',
@@ -479,7 +508,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     const connection = await mailService.testSettings(accountTestInput(input, config));
     const account = repos.accounts.create(input);
     return {
-      account: sanitizeAccountPayload(publicAccountSummary(account)),
+      account: sanitizeAccountPayload(publicAccountSummary(account, config)),
       connection,
     };
   }));
@@ -517,7 +546,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     const account = repos.accounts.update(existing.id, input);
     if (connectionChanged || input.sync_enabled !== existing.sync_enabled) mailService.invalidateAccount?.(existing.id);
     return {
-      account: sanitizeAccountPayload(publicAccountSummary(account)),
+      account: sanitizeAccountPayload(publicAccountSummary(account, config)),
       ...(connection ? { connection } : {}),
     };
   }));

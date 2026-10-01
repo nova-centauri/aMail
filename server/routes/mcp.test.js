@@ -228,8 +228,10 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     async sendMessage() {
       throw new Error('not used');
     },
-    async updateMessageState() {
-      throw new Error('not used');
+    async updateMessageState(id, state) {
+      assert.deepEqual(Object.keys(state).sort(), ['analyzedBy', 'isAnalyzed']);
+      return { ...repos.messages.setState(id, state),
+        remoteSync: { attempted: false, status: 'local-only', reason: 'analyzed-flag-is-local' } };
     },
   };
   const remoteContent = { canIssueTokens: false };
@@ -414,6 +416,25 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     }),
   });
   assert.equal(cookieAuth.status, 200);
+
+  const mark = (ids) => mcpRpc(origin, {
+    token: accessToken, method: 'tools/call',
+    params: { name: 'mark_messages_analyzed', arguments: { ids, by: 'bounded-test' } },
+  });
+  for (const ids of [[firstMessage.id, firstMessage.id], [firstMessage.id, thread.id],
+    [firstMessage.id, 'missing-message'], [], Array(201).fill(firstMessage.id)]) {
+    const rejected = await mark(ids);
+    assert.ok(rejected.body.result?.isError || rejected.body.error);
+    assert.equal(repos.messages.get(firstMessage.id).isAnalyzed, false,
+      'invalid batch must not partially mark its valid member');
+  }
+  const marked = JSON.parse((await mark([firstMessage.id, thirdMessage.id])).body.result.content[0].text);
+  assert.deepEqual(marked.messages.map((m) => m.id), [firstMessage.id, thirdMessage.id]);
+  assert.ok(marked.messages.every((m) => m.isAnalyzed === true &&
+    m.remoteSync.attempted === false && m.remoteSync.status === 'local-only'));
+  assert.equal(repos.messages.get(firstMessage.id).isRead, false);
+  const repeatedMark = JSON.parse((await mark([firstMessage.id])).body.result.content[0].text);
+  assert.equal(repeatedMark.messages[0].isAnalyzed, true);
 });
 
 test('get_attachment authenticates and returns bounded exact bytes for one verified attachment', async (t) => {
