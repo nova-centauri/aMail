@@ -59,7 +59,7 @@ function fixture(t) {
   return { repos, executed, account, add, thread };
 }
 
-test('conversation pages omit large bodies, avoid candidate totals, and enrich only visible threads', (t) => {
+test('conversation pages omit large bodies, avoid candidate totals, and enrich only visible threads', async (t) => {
   const { repos, executed, add, thread } = fixture(t);
   const body = `bodyonlyneedle ${'x'.repeat(256 * 1024)}`;
   const ids = [];
@@ -69,9 +69,9 @@ test('conversation pages omit large bodies, avoid candidate totals, and enrich o
     ids.push(conversation.id);
     message = add(conversation, { text_body: body, html_body: `<p>${body}</p>` });
   }
-  const assertPage = (query) => {
+  const assertPage = async (query) => {
     executed.length = 0;
-    const page = listConversations(repos, { page: 2, pageSize: 2, query });
+    const page = await listConversations(repos, { page: 2, pageSize: 2, query });
     assert.equal(page.total, 6);
     assert.equal(page.categoryCounts.primary, 6);
     assert.deepEqual(page.messages.map((item) => item.id), [ids[3], ids[2]]);
@@ -86,13 +86,13 @@ test('conversation pages omit large bodies, avoid candidate totals, and enrich o
     }
     assert.ok(JSON.stringify(page).length < 10_000);
   };
-  assertPage('');
-  assertPage('bodyonlyneedle'); // FTS finds content even though candidates omit it.
+  await assertPage('');
+  await assertPage('bodyonlyneedle'); // FTS finds content even though candidates omit it.
   assert.equal(repos.messages.get(message.id).textBody, body);
   assert.equal(repos.messages.forThread(message.threadId)[0].htmlBody, `<p>${body}</p>`);
 });
 
-test('pagination preserves matching against older messages and whole-thread state aggregates', (t) => {
+test('pagination preserves matching against older messages and whole-thread state aggregates', async (t) => {
   const { repos, executed, add, thread } = fixture(t);
   const mixed = thread('Mixed state');
   add(mixed, { from_email: 'older@example.test', is_starred: 1 });
@@ -102,7 +102,7 @@ test('pagination preserves matching against older messages and whole-thread stat
   add(thread('Other thread'));
   for (const query of ['from:older@example.test is:unread', 'from:older@example.test is:unanalyzed', 'from:older@example.test is:starred']) {
     executed.length = 0;
-    const page = listConversations(repos, { query, pageSize: 1 });
+    const page = await listConversations(repos, { query, pageSize: 1 });
     assert.equal(page.total, 1);
     assert.equal(page.messages[0].id, mixed.id);
     assert.equal(page.messages[0].latestMessageId, latest.id);
@@ -114,10 +114,10 @@ test('pagination preserves matching against older messages and whole-thread stat
     assert.equal(page.messages[0].isStarred, true);
     assert.equal(executed.filter((sql) => sql === 'SELECT * FROM threads WHERE id = ?').length, 1);
   }
-  assert.equal(listConversations(repos, { query: 'from:older@example.test is:analyzed' }).total, 0);
+  assert.equal((await listConversations(repos, { query: 'from:older@example.test is:analyzed' })).total, 0);
 });
 
-test('operator and FTS search paginate through the whole cached corpus', (t) => {
+test('operator and FTS search paginate through the whole cached corpus', async (t) => {
   const { repos, add, thread } = fixture(t);
   const oldFrom = thread('Ancient invoice');
   add(oldFrom, {
@@ -140,23 +140,23 @@ test('operator and FTS search paginate through the whole cached corpus', (t) => 
       rfc_message_id: `<recent-${index}@example.test>`,
     });
   }
-  const fromPage = listConversations(repos, { query: 'from:accounts@vendor.test', pageSize: 10 });
+  const fromPage = await listConversations(repos, { query: 'from:accounts@vendor.test', pageSize: 10 });
   assert.equal(fromPage.total, 1);
   assert.equal(fromPage.messages[0].id, oldFrom.id);
 
-  const ftsPage = listConversations(repos, { query: 'unique-corpus-token', page: 1, pageSize: 5 });
+  const ftsPage = await listConversations(repos, { query: 'unique-corpus-token', page: 1, pageSize: 5 });
   assert.equal(ftsPage.total, 1);
   assert.equal(ftsPage.messages[0].id, oldFrom.id);
 
-  const newest = listConversations(repos, { page: 1, pageSize: 50 });
+  const newest = await listConversations(repos, { page: 1, pageSize: 50 });
   assert.equal(newest.total, 1101);
   assert.equal(newest.messages.length, 50);
-  const later = listConversations(repos, { page: 23, pageSize: 50 });
+  const later = await listConversations(repos, { page: 23, pageSize: 50 });
   assert.equal(later.total, 1101);
   assert.ok(later.messages.some((item) => item.id === oldFrom.id));
 });
 
-test('attachment filenames are indexed and pruneBodies keeps existing FTS tokens', (t) => {
+test('attachment filenames are indexed and pruneBodies keeps existing FTS tokens', async (t) => {
   const { repos, add, thread } = fixture(t);
   const conversation = thread('Catering');
   const message = add(conversation, {
@@ -164,15 +164,90 @@ test('attachment filenames are indexed and pruneBodies keeps existing FTS tokens
     snippet: 'please find the winter menu attached',
     attachments_json: JSON.stringify([{ index: 0, filename: 'wintermenu.pdf', contentType: 'application/pdf', size: 2048 }]),
   });
-  const byName = listConversations(repos, { query: 'wintermenu' });
+  const byName = await listConversations(repos, { query: 'wintermenu' });
   assert.equal(byName.total, 1);
   assert.equal(byName.messages[0].id, conversation.id);
 
   const pruned = repos.retention.pruneBodies('2099-01-01T00:00:00.000Z');
   assert.equal(pruned, 1);
   assert.equal(repos.messages.get(message.id).textBody, '');
-  const stillFound = listConversations(repos, { query: 'winter menu attached' });
+  const stillFound = await listConversations(repos, { query: 'winter menu attached' });
   assert.equal(stillFound.total, 1);
   assert.equal(stillFound.messages[0].id, conversation.id);
+});
+
+test('human leftover text searches the provider; MCP and analyzed filters stay cache-only', async (t) => {
+  const { repos, add, thread } = fixture(t);
+  add(thread('Cached'));
+  const calls = [];
+  const mailService = {
+    async searchAndMaterialize(args) {
+      calls.push(args);
+      return { threadIds: [] };
+    },
+  };
+  await listConversations(repos, { query: 'invoice', mailService, searchSource: 'human' });
+  assert.equal(calls.length, 1);
+  calls.length = 0;
+  await listConversations(repos, { query: 'invoice', mailService, searchSource: 'mcp' });
+  assert.equal(calls.length, 0);
+  await listConversations(repos, { query: 'invoice is:unanalyzed', mailService, searchSource: 'human' });
+  assert.equal(calls.length, 0);
+  await listConversations(repos, { query: 'from:ada@example.test', mailService, searchSource: 'human' });
+  assert.equal(calls.length, 0);
+  await listConversations(repos, { query: 'in:anywhere invoice', mailService, searchSource: 'mcp' });
+  assert.equal(calls.length, 1);
+});
+
+test('IMAP envelope hits join leftover-text pages and stay out of analyzed filters', async (t) => {
+  const { repos, account, thread } = fixture(t);
+  const conversation = thread('Old invoice');
+  const mailService = {
+    async searchAndMaterialize() {
+      repos.messages.upsert({
+        account_id: account.id,
+        thread_id: conversation.id,
+        mailbox: 'INBOX',
+        uid: 9001,
+        rfc_message_id: '<envelope-hit@example.test>',
+        in_reply_to: null,
+        references_json: '[]',
+        subject: 'Old invoice',
+        from_name: 'Vendor',
+        from_email: 'accounts@vendor.test',
+        to_json: '[]',
+        cc_json: '[]',
+        bcc_json: '[]',
+        reply_to_json: null,
+        sent_at: '2019-01-01T00:00:00.000Z',
+        received_at: '2019-01-01T00:00:00.000Z',
+        html_body: '',
+        text_body: '',
+        snippet: 'Old invoice',
+        attachments_json: '[]',
+        labels_json: '[]',
+        is_read: 0,
+        is_starred: 0,
+        is_archived: 0,
+        is_trashed: 0,
+        is_spam: 0,
+        snoozed_until: null,
+        is_sent: 0,
+        source_imported: 0,
+      });
+      return { threadIds: [conversation.id] };
+    },
+  };
+  const page = await listConversations(repos, {
+    query: 'bodyonlyword',
+    mailService,
+    searchSource: 'human',
+  });
+  assert.equal(page.total, 1);
+  assert.equal(page.messages[0].id, conversation.id);
+  assert.equal(page.messages[0].sourceImported, false);
+  assert.equal(page.folderCounts.unanalyzed, 0);
+  assert.equal((await listConversations(repos, { query: 'bodyonlyword is:unanalyzed' })).total, 0);
+  assert.equal((await listConversations(repos, { query: 'bodyonlyword is:analyzed' })).total, 0);
 });
 

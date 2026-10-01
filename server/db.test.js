@@ -432,3 +432,39 @@ test('retention prune clears old bodies and keeps headers, and a change stamp mo
   repos.sync.recordSkip({ account_id: account.id, mailbox: 'INBOX', uid: 5, reason: 'UNIQUE messages.account_id, mailbox, uid' });
   repos.checkpointWal();
 });
+
+test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {
+  const db = createDatabase(tempConfig(t));
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id, subject: 'Envelope', normalized_subject: 'envelope', latest_at: '2020-01-01T00:00:00.000Z',
+  });
+  const imported = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 1, rfc_message_id: '<imported-review@example.test>',
+  }));
+  const envelope = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 2,
+    rfc_message_id: '<envelope-review@example.test>',
+    html_body: '',
+    text_body: '',
+    snippet: 'Envelope',
+    source_imported: 0,
+  }));
+  assert.equal(envelope.sourceImported, false);
+  const queued = repos.messages.listUnanalyzed({ accountId: account.id, limit: 50 });
+  assert.equal(queued.total, 1);
+  assert.deepEqual(queued.items.map((item) => item.id), [imported.id]);
+  assert.equal(repos.messages.folderCounts(account.id).unanalyzed, 1);
+  const overwritten = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 1,
+    rfc_message_id: '<imported-review@example.test>',
+    html_body: '',
+    text_body: '',
+    source_imported: 0,
+  }));
+  assert.equal(overwritten.id, imported.id);
+  assert.equal(overwritten.sourceImported, true);
+  assert.equal(overwritten.textBody, 'old body');
+});

@@ -70,6 +70,7 @@ export function buildConversationSearch(input = {}) {
     category = '',
     personEmails = [],
     hideQuiet = false,
+    extraThreadIds = [],
     limit = 50,
     offset = 0,
     nowIso,
@@ -97,14 +98,21 @@ export function buildConversationSearch(input = {}) {
   const filters = [];
   if (ftsQuery) {
     params.ftsQuery = ftsQuery;
-    filters.push(`EXISTS (
+    const extra = [...new Set((extraThreadIds || []).filter(Boolean))];
+    const extraSql = extra.length
+      ? ` OR stats.thread_id IN (${extra.map((id, index) => {
+        params[`extraThread${index}`] = id;
+        return `@extraThread${index}`;
+      }).join(', ')})`
+      : '';
+    filters.push(`(EXISTS (
       SELECT 1 FROM messages fts_m
       JOIN messages_fts fts ON fts.rowid = fts_m.rowid
       WHERE fts_m.thread_id = stats.thread_id
         AND fts_m.account_id = stats.account_id
         AND ${folderPredicate('fts_m')}
         AND messages_fts MATCH @ftsQuery
-    )`);
+    )${extraSql})`);
   }
 
   const query = parsed && mailboxQueryIsActive(parsed) ? parsed : null;
@@ -153,7 +161,7 @@ export function buildConversationSearch(input = {}) {
     if (query.isUnread === false) filters.push('stats.has_unread = 0');
     if (query.isStarred === true) filters.push('stats.has_starred = 1');
     if (query.isStarred === false) filters.push('stats.has_starred = 0');
-    if (query.isAnalyzed === true) filters.push('stats.has_unanalyzed = 0');
+    if (query.isAnalyzed === true) filters.push('stats.has_unanalyzed = 0 AND stats.imported_count > 0');
     if (query.isAnalyzed === false) filters.push('stats.has_unanalyzed = 1');
   }
 
@@ -189,6 +197,7 @@ export function buildConversationSearch(input = {}) {
         m.analyzed_at AS analyzed_at,
         m.attachments_json AS attachments_json,
         m.smart_category AS smart_category,
+        COALESCE(m.source_imported, 1) AS source_imported,
         COALESCE(m.sent_at, m.received_at, m.created_at) AS ts,
         ROW_NUMBER() OVER (
           PARTITION BY m.account_id, m.thread_id
@@ -205,7 +214,8 @@ export function buildConversationSearch(input = {}) {
         MAX(ts) AS latest_at,
         MAX(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS has_unread,
         MAX(is_starred) AS has_starred,
-        MAX(CASE WHEN analyzed_at IS NULL THEN 1 ELSE 0 END) AS has_unanalyzed,
+        MAX(CASE WHEN COALESCE(source_imported, 1) = 1 AND analyzed_at IS NULL THEN 1 ELSE 0 END) AS has_unanalyzed,
+        SUM(CASE WHEN COALESCE(source_imported, 1) = 1 THEN 1 ELSE 0 END) AS imported_count,
         MAX(CASE WHEN json_valid(attachments_json) AND json_array_length(attachments_json) > 0 THEN 1 ELSE 0 END) AS has_attachment,
         MAX(CASE WHEN rk = 1 THEN smart_category END) AS latest_category
       FROM ranked

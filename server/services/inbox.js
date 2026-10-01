@@ -12,6 +12,7 @@ import {
 } from '../mail/search-query.js';
 import { publicAttachmentMeta } from './compose-attachments.js';
 import { NotFoundError, ValidationError } from '../errors.js';
+import { shouldSearchProvider } from '../mail/imap-search.js';
 
 export const parseNumber = (value, fallback, min, max) => {
   const number = Number.parseInt(value, 10);
@@ -114,7 +115,7 @@ export function draftListItem(draft, account) {
  * Unified conversation listing used by the REST API and MCP tools.
  * Returns the same shape as GET /api/messages.
  */
-export function listConversations(repos, {
+export async function listConversations(repos, {
   accountId = null,
   folder: folderInput = 'inbox',
   category: categoryInput = '',
@@ -123,6 +124,9 @@ export function listConversations(repos, {
   pageSize: pageSizeInput = 50,
   query: queryInput = '',
   mailbox = 'INBOX',
+  mailService = null,
+  searchSource = 'cache',
+  signal = null,
 } = {}) {
   const parsedQuery = parseMailboxQuery(String(queryInput || '').trim().slice(0, 800));
   const folder = normalizeFolder(parsedQuery.folder || folderInput);
@@ -135,6 +139,24 @@ export function listConversations(repos, {
   const ftsQuery = parsedQuery.text ? toFtsMatchQuery(parsedQuery.text) : '';
   const accounts = accountId ? [repos.accounts.get(accountId)].filter(Boolean) : repos.accounts.list();
   if (accountId && !accounts.length) throw new NotFoundError('Mail account not found.');
+
+  let extraThreadIds = [];
+  if (
+    mailService?.searchAndMaterialize
+    && shouldSearchProvider(parsedQuery, { source: searchSource, folder })
+  ) {
+    try {
+      const provider = await mailService.searchAndMaterialize({
+        accounts,
+        parsed: parsedQuery,
+        folder,
+        signal,
+      });
+      extraThreadIds = provider?.threadIds || [];
+    } catch {
+      // Local cache results are still returned if provider search fails.
+    }
+  }
 
   if (folder === 'drafts') {
     const drafts = accounts.flatMap((account) => repos.drafts.list(account.id)
@@ -167,6 +189,7 @@ export function listConversations(repos, {
     category,
     personEmails: personFlag?.emails || [],
     hideQuiet: !searchActive && !category && !personFlag,
+    extraThreadIds,
     limit: pageSize,
     offset: (page - 1) * pageSize,
   });

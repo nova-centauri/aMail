@@ -30,3 +30,33 @@ test('conversation search SQL paginates in SQLite and pushes operators into pred
   assert.equal(built.params.offset, 50);
   assert.equal(built.params.from0, '%ada@example.com%');
 });
+
+test('analyzed filters require imported source and extra IMAP thread ids bypass FTS', () => {
+  const analyzed = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    parsed: parseMailboxQuery('is:analyzed'),
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.match(analyzed.pageSql, /imported_count > 0/);
+  assert.match(analyzed.pageSql, /has_unanalyzed = 0/);
+
+  const unanalyzed = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    parsed: parseMailboxQuery('is:unanalyzed'),
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.match(unanalyzed.pageSql, /has_unanalyzed = 1/);
+
+  const withHits = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    parsed: parseMailboxQuery('invoice'),
+    ftsQuery: '"invoice"*',
+    extraThreadIds: ['thread-envelope'],
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.match(withHits.pageSql, /stats.thread_id IN \(@extraThread0\)/);
+  assert.equal(withHits.params.extraThread0, 'thread-envelope');
+});
