@@ -7,6 +7,7 @@ import {
   classifyMailConnectionError,
   compileRfc822Message,
   createMailService,
+  discoverSyncMailboxes,
   sqliteConstraintReason,
 } from './mail-service.js';
 import { encryptJson } from './crypto.js';
@@ -148,7 +149,7 @@ test('TLS failures point to certificate hostnames without returning raw errors',
 function syncHarness({
   maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false, connectDelayMs = 0,
   imapPoolIdleMs, syncMinIntervalMs, connectFailure = false, fetchHangs = false, syncPassBudgetMs, syncAccountTimeoutMs,
-  threadsBySubject = new Map(),
+  threadsBySubject = new Map(), folders = null, messagesByMailbox = null,
 }) {
   const account = {
     id: 'sync-account',
@@ -179,7 +180,10 @@ function syncHarness({
     checkpoints: 0,
     logs: [],
   };
-  const latestUid = Math.max(0, ...messages.map((message) => message.uid));
+  const mailboxMessages = messagesByMailbox
+    ? Object.values(messagesByMailbox).flat()
+    : [];
+  const latestUid = Math.max(0, ...messages.map((message) => message.uid), ...mailboxMessages.map((message) => message.uid));
   class FakeImapClient extends EventEmitter {
     constructor() {
       super();
@@ -198,7 +202,7 @@ function syncHarness({
     }
     async list() {
       state.listCalls += 1;
-      return [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }];
+      return folders || [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }];
     }
     // ImapFlow's fetch() holds the connection while the caller's loop body
     // runs; any command issued from inside that loop waits forever. Fail
@@ -207,19 +211,23 @@ function syncHarness({
       if (this.fetching) throw new Error(`${command} issued while a FETCH is being iterated (deadlock)`);
     }
     async mailboxOpen() { this.assertIdle('SELECT'); }
-    async getMailboxLock() {
+    async getMailboxLock(path) {
       this.assertIdle('SELECT');
+      this.lockedMailbox = path;
       this.mailbox = { uidValidity, uidNext: latestUid + 1 };
       return { release() {} };
     }
     async *fetch(range, query, options) {
       this.assertIdle('FETCH');
-      state.fetchCalls.push({ range, query, options });
+      state.fetchCalls.push({ range, query, options, mailbox: this.lockedMailbox });
       const wanted = String(range).split(',').map((part) => {
         const [start, end = start] = part.split(':').map(Number);
         return [start, end];
       });
-      const matches = messages.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
+      const pool = messagesByMailbox
+        ? (messagesByMailbox[this.lockedMailbox] || [])
+        : messages;
+      const matches = pool.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
       if (fetchHangs) {
         this.fetching = true;
         // A real stuck socket is a live handle; without one the event loop
@@ -1669,5 +1677,63 @@ test('a newer leftover-text search cancels the in-flight IMAP SEARCH', async () 
   assert.equal(firstResult.cancelled, true);
   assert.equal(secondResult.cancelled, false);
   assert.ok(state.searchQueries.some((query) => query.text === 'secondquery'));
+  await service.close();
+});
+
+test('discoverSyncMailboxes imports Drafts before All Mail', () => {
+  const descriptors = discoverSyncMailboxes([
+    { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
+    { path: '[Gmail]/All Mail', name: 'All Mail', specialUse: '\\All' },
+    { path: 'Brouillons', name: 'Brouillons', specialUse: '\\Drafts' },
+  ]);
+  assert.deepEqual(descriptors.map((item) => item.role), ['inbox', 'drafts', 'archive']);
+  assert.equal(descriptors.find((item) => item.role === 'drafts').mailbox, 'Brouillons');
+  assert.equal(descriptors.find((item) => item.role === 'archive').allMailMirror, true);
+
+  const byName = discoverSyncMailboxes([
+    { path: 'INBOX', name: 'INBOX' },
+    { path: 'Drafts', name: 'Drafts' },
+  ]);
+  assert.equal(byName.find((item) => item.role === 'drafts').mailbox, 'Drafts');
+});
+
+test('IMAP sync stores provider Drafts as drafts and keeps them out of the inbox', async () => {
+  const source = Buffer.from([
+    'From: Finance Lab <finance@lab.example>',
+    'To: Finance <finance@lab.example>',
+    'Subject: Q3 budget notes',
+    'Message-ID: <q3-budget@lab.example>',
+    'Date: Thu, 01 Oct 2026 12:00:00 +0000',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Hold the numbers.',
+  ].join('\r\n'));
+  const draft = {
+    uid: 4,
+    size: source.length,
+    flags: new Set(['\\Seen', '\\Draft']),
+    internalDate: new Date('2026-10-01T12:00:00Z'),
+  };
+  const { service, state } = syncHarness({
+    maxMessageBytes: 4096,
+    messages: [],
+    sources: new Map([[4, source]]),
+    folders: [
+      { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
+      { path: 'Brouillons', name: 'Brouillons', specialUse: '\\Drafts' },
+    ],
+    messagesByMailbox: { Brouillons: [draft] },
+  });
+
+  const result = await service.syncAccount('sync-account');
+  const draftsMailbox = result.mailboxes.find((item) => item.role === 'drafts');
+  const inboxMailbox = result.mailboxes.find((item) => item.role === 'inbox');
+  assert.equal(draftsMailbox.mailbox, 'Brouillons');
+  assert.equal(draftsMailbox.imported, 1);
+  assert.equal(inboxMailbox.imported, 0);
+  assert.equal(state.savedMessages.length, 1);
+  assert.equal(state.savedMessages[0].is_draft, 1);
+  assert.equal(state.savedMessages[0].mailbox, 'Brouillons');
+  assert.equal(state.savedMessages[0].subject, 'Q3 budget notes');
   await service.close();
 });

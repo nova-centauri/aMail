@@ -99,6 +99,7 @@ export function mailboxesForSearch(descriptors, folder) {
   if (folder === 'archive') return list.filter((item) => item.role === 'archive').slice(0, 1);
   if (folder === 'trash') return list.filter((item) => item.role === 'trash').slice(0, 1);
   if (folder === 'spam') return list.filter((item) => item.role === 'spam').slice(0, 1);
+  if (folder === 'drafts') return list.filter((item) => item.role === 'drafts').slice(0, 1);
   if (folder === 'starred' || folder === 'all') {
     const allMail = list.find((item) => item.allMailMirror);
     if (folder === 'all' && allMail) return [allMail];
