@@ -130,6 +130,45 @@ export const sumFolderCounts = (accounts, repos) => accounts.reduce((totals, acc
   };
 }, emptyFolderCounts());
 
+export function listStoredDrafts(repos, accountIds = null) {
+  const accounts = accountIds
+    ? accountIds.map((id) => repos.accounts.get(id)).filter(Boolean)
+    : repos.accounts.list();
+  const seen = new Set();
+  const items = [];
+  const push = (draft, account) => {
+    const id = String(draft?.id || '');
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    items.push({ draft, account });
+  };
+  for (const account of accounts) {
+    for (const draft of repos.drafts.list(account.id)) push(draft, account);
+  }
+  for (const account of accounts) {
+    const messages = typeof repos.messages.listDrafts === 'function'
+      ? repos.messages.listDrafts(account.id)
+      : [];
+    for (const message of messages) {
+      push({
+        id: message.id,
+        accountId: message.accountId,
+        threadId: message.threadId,
+        to: message.to || [],
+        cc: message.cc || [],
+        bcc: message.bcc || [],
+        subject: message.subject === '(no subject)' ? '' : (message.subject || ''),
+        htmlBody: message.htmlBody || '',
+        textBody: message.textBody || '',
+        attachments: message.attachments || [],
+        updatedAt: message.receivedAt || message.sentAt || message.updatedAt,
+        createdAt: message.createdAt || message.receivedAt || message.sentAt,
+      }, account);
+    }
+  }
+  return items;
+}
+
 export function draftListItem(draft, account) {
   const id = `draft:${draft.id}`;
   return {
@@ -219,14 +258,14 @@ export async function listConversations(repos, {
   }
 
   if (folder === 'drafts') {
-    const drafts = accounts.flatMap((account) => repos.drafts.list(account.id)
-      .map((draft) => draftListItem(draft, account))
+    const drafts = listStoredDrafts(repos, accounts.map((account) => account.id))
+      .map(({ draft, account }) => draftListItem(draft, account))
       .filter((draft) => {
         if (personFlag && !messageMatchesPersonFlag(draft, personFlag)) return false;
         if (!searchActive) return true;
         return conversationMatchesMailboxQuery(draft, parsedQuery);
       })
-    ).sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
+      .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
     const start = (page - 1) * pageSize;
     return {
       messages: category ? [] : drafts.slice(start, start + pageSize),

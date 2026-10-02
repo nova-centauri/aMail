@@ -8,7 +8,7 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { listConversations, parseNumber } from '../services/inbox.js';
+import { listConversations, listStoredDrafts, parseNumber } from '../services/inbox.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
@@ -486,13 +486,35 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json({ thread: { ...thread, messages: hydrated }, messages: hydrated });
   });
 
+  const storedDrafts = (accountId) => {
+    const accounts = accountId
+      ? [repos.accounts.get(accountId)].filter(Boolean)
+      : repos.accounts.list();
+    return listStoredDrafts(repos, accounts.map((account) => account.id))
+      .map(({ draft }) => draft)
+      .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  };
+  const providerDraft = (id) => {
+    const message = repos.messages.get(id);
+    if (!message?.isDraft || message.isTrashed || message.isSpam) return null;
+    return {
+      id: message.id,
+      accountId: message.accountId,
+      threadId: message.threadId,
+      to: message.to || [],
+      cc: message.cc || [],
+      bcc: message.bcc || [],
+      subject: message.subject === '(no subject)' ? '' : (message.subject || ''),
+      htmlBody: message.htmlBody || '',
+      textBody: message.textBody || '',
+      attachments: message.attachments || [],
+      updatedAt: message.receivedAt || message.sentAt || message.updatedAt,
+      createdAt: message.createdAt || message.receivedAt || message.sentAt,
+    };
+  };
   router.get('/drafts', (request, response) => {
     const accountId = String(request.query.accountId || '');
-    if (accountId) {
-      response.json({ drafts: repos.drafts.list(accountId) });
-      return;
-    }
-    response.json({ drafts: repos.drafts.listAll() });
+    response.json({ drafts: storedDrafts(accountId) });
   });
   router.post('/drafts', (request, response) => {
     const body = request.body || {};
@@ -511,13 +533,33 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.status(201).json({ draft });
   });
   router.get('/drafts/:id', (request, response) => {
-    const draft = repos.drafts.get(request.params.id);
+    const draft = repos.drafts.get(request.params.id) || providerDraft(request.params.id);
     if (!draft) throw new NotFoundError('Draft not found.');
     response.json({ draft });
   });
   router.patch('/drafts/:id', (request, response) => {
     const existing = repos.drafts.get(request.params.id);
-    if (!existing) throw new NotFoundError('Draft not found.');
+    if (!existing) {
+      const synced = providerDraft(request.params.id);
+      if (!synced) throw new NotFoundError('Draft not found.');
+      const body = request.body || {};
+      const accountId = body.accountId || synced.accountId;
+      if (!repos.accounts.get(accountId)) throw new NotFoundError('Mail account not found.');
+      const threadId = [body.threadId, synced.threadId].find((id) => id && repos.threads.get(id)) || null;
+      const draft = repos.drafts.create({
+        account_id: accountId,
+        thread_id: threadId,
+        to_json: JSON.stringify(body.to || synced.to || []),
+        cc_json: JSON.stringify(body.cc || synced.cc || []),
+        bcc_json: JSON.stringify(body.bcc || synced.bcc || []),
+        subject: String(body.subject ?? synced.subject ?? '').slice(0, 998),
+        html_body: sanitizeComposeHtml(body.htmlBody ?? synced.htmlBody).slice(0, 1_000_000),
+        text_body: String(body.textBody ?? synced.textBody ?? '').slice(0, 1_000_000),
+        attachments_json: JSON.stringify(normalizeComposeAttachments(body.attachments || synced.attachments || [])),
+      });
+      response.status(201).json({ draft });
+      return;
+    }
     const body = request.body || {};
     const draft = repos.drafts.update(existing.id, {
       thread_id: body.threadId ?? existing.threadId,
@@ -531,8 +573,15 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     });
     response.json({ draft });
   });
-  router.delete('/drafts/:id', (request, response) => {
-    if (!repos.drafts.remove(request.params.id)) throw new NotFoundError('Draft not found.');
+  router.delete('/drafts/:id', async (request, response) => {
+    if (repos.drafts.remove(request.params.id)) {
+      response.status(204).end();
+      return;
+    }
+    const synced = providerDraft(request.params.id);
+    if (!synced) throw new NotFoundError('Draft not found.');
+    if (mailService?.updateMessageState) await mailService.updateMessageState(synced.id, { isTrashed: true });
+    else repos.messages.setState(synced.id, { isTrashed: true });
     response.status(204).end();
   });
 

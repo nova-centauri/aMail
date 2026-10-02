@@ -7,12 +7,12 @@ import { mailboxQueryIsActive } from '../mail/search-query.js';
 export function folderPredicate(alias) {
   const a = alias;
   return `CASE @folder
-          WHEN 'inbox' THEN ${a}.mailbox = 'INBOX' AND ${a}.is_archived = 0 AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0 AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)
+          WHEN 'inbox' THEN ${a}.mailbox = 'INBOX' AND ${a}.is_archived = 0 AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0 AND ${a}.is_draft = 0 AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)
           WHEN 'starred' THEN ${a}.is_starred = 1 AND ${a}.is_trashed = 0
           WHEN 'sent' THEN ${a}.is_sent = 1 AND ${a}.is_trashed = 0
-          WHEN 'drafts' THEN 0
+          WHEN 'drafts' THEN ${a}.is_draft = 1 AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0
           WHEN 'snoozed' THEN ${a}.snoozed_until > @now AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0
-          WHEN 'all' THEN ${a}.is_trashed = 0 AND ${a}.is_spam = 0
+          WHEN 'all' THEN ${a}.is_trashed = 0 AND ${a}.is_spam = 0 AND ${a}.is_draft = 0
           WHEN 'trash' THEN ${a}.is_trashed = 1
           WHEN 'spam' THEN ${a}.is_spam = 1 AND ${a}.is_trashed = 0
           WHEN 'archive' THEN ${a}.is_archived = 1 AND ${a}.is_trashed = 0 AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)

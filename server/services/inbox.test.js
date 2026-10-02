@@ -394,3 +394,42 @@ test('Typesense results still include IMAP hits that are not in the index', asyn
   assert.equal(page.messages[0].sourceImported, false);
   assert.equal((await listConversations(repos, { query: 'bodyonlyword is:unanalyzed' })).total, 0);
 });
+
+test('provider Drafts messages list with local drafts and stay out of the inbox', async (t) => {
+  const { repos, account, add, thread } = fixture(t);
+  add(thread('Lab standup notes'), {
+    subject: 'Lab standup notes',
+    from_email: 'ops@lab.example',
+  });
+  add(thread('Q3 budget notes'), {
+    mailbox: '[Gmail]/Drafts',
+    is_draft: 1,
+    is_read: 1,
+    subject: 'Q3 budget notes',
+    from_email: 'finance@lab.example',
+    to_json: JSON.stringify([{ name: 'Finance', email: 'finance@lab.example' }]),
+    text_body: 'Hold the numbers.',
+  });
+  repos.drafts.create({
+    account_id: account.id,
+    thread_id: null,
+    to_json: '[]',
+    cc_json: '[]',
+    bcc_json: '[]',
+    subject: 'Local compose',
+    html_body: '',
+    text_body: 'local',
+    attachments_json: '[]',
+  });
+
+  const drafts = await listConversations(repos, { folder: 'drafts' });
+  assert.equal(drafts.total, 2);
+  const provider = drafts.messages.find((message) => message.subject === 'Q3 budget notes');
+  assert.equal(provider.isDraft, true);
+  assert.ok(provider.draftId);
+  assert.ok(drafts.messages.some((message) => message.subject === 'Local compose'));
+  const inbox = await listConversations(repos, { folder: 'inbox' });
+  assert.equal(inbox.messages.some((message) => message.subject === 'Q3 budget notes'), false);
+  assert.ok(inbox.messages.some((message) => message.subject === 'Lab standup notes'));
+  assert.equal(inbox.folderCounts.drafts, 2);
+});

@@ -252,6 +252,34 @@ test('message API filters unified mail by smart category and account creation is
   const loadedDraft = await fetch(`${origin}/api/drafts/${createdDraftBody.draft.id}`);
   assert.equal((await loadedDraft.json()).draft.attachments[0].content, draftContent);
 
+  const providerDraft = repos.messages.upsert({
+    ...messageInput({
+      accountId: account.id,
+      threadId: threadIds[0],
+      uid: 90,
+      subject: 'Q3 budget notes',
+      fromEmail: 'owner@example.test',
+      timestamp: '2026-02-01T00:00:00.000Z',
+    }),
+    mailbox: '[Gmail]/Drafts',
+    is_draft: 1,
+    is_read: 1,
+    to_json: JSON.stringify([{ name: 'Finance', email: 'finance@lab.example' }]),
+    text_body: 'Hold the numbers.',
+    html_body: '<p>Hold the numbers.</p>',
+  });
+  const withProvider = await (await fetch(`${origin}/api/messages?folder=drafts`)).json();
+  assert.equal(withProvider.total, 2);
+  assert.equal(withProvider.folderCounts.drafts, 2);
+  const providerRow = withProvider.messages.find((message) => message.subject === 'Q3 budget notes');
+  assert.equal(providerRow.folder, 'drafts');
+  assert.equal(providerRow.draftId, providerDraft.id);
+  assert.equal(providerRow.isDraft, true);
+  const providerApi = await (await fetch(`${origin}/api/drafts/${providerDraft.id}`)).json();
+  assert.equal(providerApi.draft.subject, 'Q3 budget notes');
+  assert.equal(providerApi.draft.textBody, 'Hold the numbers.');
+  assert.equal((await (await fetch(`${origin}/api/drafts`)).json()).drafts.some((draft) => draft.id === providerDraft.id), true);
+
   const allResponse = await fetch(`${origin}/api/messages?folder=inbox`);
   const all = await allResponse.json();
   assert.equal(all.total, 5);
@@ -260,7 +288,8 @@ test('message API filters unified mail by smart category and account creation is
   // active folder view. All five seeded messages are unread inbox mail.
   assert.equal(all.folderCounts.inbox, 5);
   assert.equal(all.folderCounts.starred, 0);
-  assert.equal(all.folderCounts.drafts, 1);
+  assert.equal(all.folderCounts.drafts, 2);
+  assert.equal(all.messages.some((message) => message.subject === 'Q3 budget notes'), false);
 
   // Routine ops digests stay out of the default inbox even when unread. Errors
   // surface in the dedicated Ops errors smart view.

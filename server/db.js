@@ -93,6 +93,7 @@ function publicMessage(row) {
     isSpam: Boolean(row.is_spam),
     snoozedUntil: row.snoozed_until,
     isSent: Boolean(row.is_sent),
+    isDraft: Boolean(row.is_draft),
     // Agent-facing counterpart of read/unread: set when an agent (or person)
     // has processed this message. Stored locally; never pushed to IMAP.
     isAnalyzed: Boolean(row.analyzed_at),
@@ -271,6 +272,7 @@ function initSchema(db) {
       is_spam INTEGER NOT NULL DEFAULT 0,
       snoozed_until TEXT,
       is_sent INTEGER NOT NULL DEFAULT 0,
+      is_draft INTEGER NOT NULL DEFAULT 0,
       analyzed_at TEXT,
       analyzed_by TEXT NOT NULL DEFAULT '',
       smart_category TEXT NOT NULL DEFAULT 'primary' CHECK (smart_category IN ('primary', 'github_ci', 'logs', 'status', 'ops_error', 'ops_quiet')),
@@ -349,6 +351,7 @@ function initSchema(db) {
   if (!messageColumns.has('analyzed_at')) db.exec('ALTER TABLE messages ADD COLUMN analyzed_at TEXT');
   if (!messageColumns.has('analyzed_by')) db.exec("ALTER TABLE messages ADD COLUMN analyzed_by TEXT NOT NULL DEFAULT ''");
   if (!messageColumns.has('source_imported')) db.exec('ALTER TABLE messages ADD COLUMN source_imported INTEGER NOT NULL DEFAULT 1');
+  if (!messageColumns.has('is_draft')) db.exec('ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_smart_category ON messages(account_id, smart_category, sent_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_analyzed ON messages(account_id, analyzed_at)');
   const threadColumns = new Set(db.prepare('PRAGMA table_info(threads)').all().map((column) => column.name));
@@ -448,6 +451,9 @@ function initSchema(db) {
   const columnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
   if (!columnsAfterRebuild.has('source_imported')) {
     db.exec('ALTER TABLE messages ADD COLUMN source_imported INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!columnsAfterRebuild.has('is_draft')) {
+    db.exec('ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0');
   }
 
   // Sidebar polling must count compact index entries rather than visit message
@@ -815,12 +821,12 @@ export function createRepositories(db) {
   const messageListSql = (projection) => `SELECT ${projection} FROM messages m
       WHERE m.account_id = @accountId AND
         CASE @folder
-          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
           WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
-          WHEN 'drafts' THEN 0
+          WHEN 'drafts' THEN m.is_draft = 1 AND m.is_trashed = 0 AND m.is_spam = 0
           WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
+          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
           WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
@@ -894,12 +900,12 @@ export function createRepositories(db) {
     messageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages m
       WHERE m.account_id = @accountId AND
         CASE @folder
-          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
           WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
-          WHEN 'drafts' THEN 0
+          WHEN 'drafts' THEN m.is_draft = 1 AND m.is_trashed = 0 AND m.is_spam = 0
           WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
+          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
           WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
@@ -913,12 +919,12 @@ export function createRepositories(db) {
       FROM messages m
       WHERE m.account_id = @accountId AND
         CASE @folder
-          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'inbox' THEN m.mailbox = 'INBOX' AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           WHEN 'starred' THEN m.is_starred = 1 AND m.is_trashed = 0
           WHEN 'sent' THEN m.is_sent = 1 AND m.is_trashed = 0
-          WHEN 'drafts' THEN 0
+          WHEN 'drafts' THEN m.is_draft = 1 AND m.is_trashed = 0 AND m.is_spam = 0
           WHEN 'snoozed' THEN m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
-          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0
+          WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
           WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
@@ -965,7 +971,10 @@ export function createRepositories(db) {
           GROUP BY thread_id
         )
       ) AS snoozed,
-      (SELECT COUNT(*) FROM drafts WHERE account_id = @accountId) AS drafts,
+      (
+        (SELECT COUNT(*) FROM drafts WHERE account_id = @accountId)
+        + (SELECT COUNT(*) FROM messages WHERE account_id = @accountId AND is_draft = 1 AND is_trashed = 0 AND is_spam = 0)
+      ) AS drafts,
       (
         SELECT COUNT(*) FROM (
           SELECT thread_id FROM messages
@@ -984,14 +993,14 @@ export function createRepositories(db) {
       id, account_id, thread_id, mailbox, uid, rfc_message_id, in_reply_to, references_json,
       subject, from_name, from_email, to_json, cc_json, bcc_json, reply_to_json,
       sent_at, received_at, html_body, text_body, snippet, attachments_json, labels_json,
-      is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent,
+      is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent, is_draft,
       smart_category, smart_category_reason, smart_category_rule, smart_category_version,
       source_imported, created_at, updated_at
     ) VALUES (
       @id, @account_id, @thread_id, @mailbox, @uid, @rfc_message_id, @in_reply_to, @references_json,
       @subject, @from_name, @from_email, @to_json, @cc_json, @bcc_json, @reply_to_json,
       @sent_at, @received_at, @html_body, @text_body, @snippet, @attachments_json, @labels_json,
-      @is_read, @is_starred, @is_archived, @is_trashed, @is_spam, @snoozed_until, @is_sent,
+      @is_read, @is_starred, @is_archived, @is_trashed, @is_spam, @snoozed_until, @is_sent, @is_draft,
       @smart_category, @smart_category_reason, @smart_category_rule, @smart_category_version,
       @source_imported, @created_at, @updated_at
     )`),
@@ -1004,7 +1013,7 @@ export function createRepositories(db) {
       attachments_json = @attachments_json, labels_json = @labels_json, is_read = @is_read,
       is_starred = @is_starred, is_archived = @is_archived, is_trashed = @is_trashed,
       is_spam = @is_spam, snoozed_until = @snoozed_until,
-      is_sent = @is_sent, smart_category = @smart_category,
+      is_sent = @is_sent, is_draft = @is_draft, smart_category = @smart_category,
       smart_category_reason = @smart_category_reason, smart_category_rule = @smart_category_rule,
       smart_category_version = @smart_category_version,
       source_imported = COALESCE(@source_imported, source_imported), updated_at = @updated_at
@@ -1041,6 +1050,9 @@ export function createRepositories(db) {
     draftById: db.prepare('SELECT * FROM drafts WHERE id = ?'),
     draftList: db.prepare('SELECT * FROM drafts WHERE account_id = ? ORDER BY updated_at DESC'),
     draftListAll: db.prepare('SELECT * FROM drafts ORDER BY updated_at DESC'),
+    providerDraftMessages: db.prepare(`SELECT * FROM messages
+      WHERE account_id = ? AND is_draft = 1 AND is_trashed = 0 AND is_spam = 0
+      ORDER BY COALESCE(received_at, sent_at, created_at) DESC`),
     draftInsert: db.prepare(`INSERT INTO drafts (
       id, account_id, thread_id, to_json, cc_json, bcc_json, subject, html_body,
       text_body, attachments_json, created_at, updated_at
@@ -1264,6 +1276,7 @@ export function createRepositories(db) {
         }
         return counts;
       },
+      listDrafts: (accountId) => queries.providerDraftMessages.all(accountId).map(publicMessage),
       folderCounts(accountId) {
         const row = queries.folderBadgeCounts.get({ accountId, now: now() }) || {};
         return {
@@ -1297,7 +1310,12 @@ export function createRepositories(db) {
           ? queries.messageByRfcId.get(classifiedInput.account_id, classifiedInput.rfc_message_id)
           : null;
         const timestamp = now();
-        const row = { ...classifiedInput, uid, updated_at: timestamp };
+        const row = {
+          ...classifiedInput,
+          uid,
+          is_draft: classifiedInput.is_draft ? 1 : 0,
+          updated_at: timestamp,
+        };
 
         if (byUid) {
           row.id = byUid.id;
@@ -1429,12 +1447,12 @@ export function createRepositories(db) {
         if (!ids.length) return [];
         const sql = `SELECT ${includeBodies ? '*' : MESSAGE_METADATA_COLUMNS} FROM messages WHERE thread_id IN (${ids.map(() => '?').join(',')})
           ${folder ? `AND CASE ?
-            WHEN 'inbox' THEN mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+            WHEN 'inbox' THEN mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND is_draft = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
             WHEN 'starred' THEN is_starred = 1 AND is_trashed = 0
             WHEN 'sent' THEN is_sent = 1 AND is_trashed = 0
-            WHEN 'drafts' THEN 0
+            WHEN 'drafts' THEN is_draft = 1 AND is_trashed = 0 AND is_spam = 0
             WHEN 'snoozed' THEN snoozed_until > ? AND is_trashed = 0 AND is_spam = 0
-            WHEN 'all' THEN is_trashed = 0 AND is_spam = 0
+            WHEN 'all' THEN is_trashed = 0 AND is_spam = 0 AND is_draft = 0
             WHEN 'trash' THEN is_trashed = 1
             WHEN 'spam' THEN is_spam = 1 AND is_trashed = 0
             WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)

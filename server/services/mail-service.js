@@ -353,6 +353,7 @@ function mappedUid(moveResult, sourceUid) {
 const SYNC_FOLDER_FALLBACKS = {
   inbox: ['inbox'],
   sent: ['sent', 'sent mail', 'sent items', 'sent messages'],
+  drafts: ['drafts', 'draft'],
   archive: ['archive', 'archives'],
   all: ['all mail', 'all messages'],
   trash: ['trash', 'bin', 'deleted items', 'deleted messages'],
@@ -396,10 +397,15 @@ export function discoverSyncMailboxes(folders) {
     || conventionalFolder(folders, SYNC_FOLDER_FALLBACKS.trash);
   const spam = folders.find((folder) => hasSpecialUse(folder, ['\\Junk']))
     || conventionalFolder(folders, SYNC_FOLDER_FALLBACKS.spam);
+  const drafts = folders.find((folder) => hasSpecialUse(folder, ['\\Drafts']))
+    || conventionalFolder(folders, SYNC_FOLDER_FALLBACKS.drafts);
 
   const candidates = [
     { role: 'inbox', mailbox: inbox?.path || 'INBOX', allMailMirror: false },
     sent && { role: 'sent', mailbox: sent.path, allMailMirror: false },
+    // Drafts are imported before All Mail so a Gmail mirror copy does not
+    // become the canonical row and hide the real Drafts mailbox.
+    drafts && { role: 'drafts', mailbox: drafts.path, allMailMirror: false },
     archive && { role: 'archive', mailbox: archive.path, allMailMirror },
     trash && { role: 'trash', mailbox: trash.path, allMailMirror: false },
     spam && { role: 'spam', mailbox: spam.path, allMailMirror: false },
@@ -665,6 +671,7 @@ export function createMailService({
     const labels = setValues(message.labels).map(String);
     const mailboxRole = role || folderForMailbox(mailbox);
     const isSent = mailboxRole === 'sent';
+    const isDraft = mailboxRole === 'drafts';
     const sanitized = parsed.html
       ? sanitizeEmailHtml(parsed.html)
       : sanitizeEmailHtml(toSafeHtmlFromText(parsed.text || ''));
@@ -708,6 +715,7 @@ export function createMailService({
       is_spam: mailboxRole === 'spam' ? 1 : 0,
       snoozed_until: null,
       is_sent: isSent ? 1 : 0,
+      is_draft: isDraft ? 1 : 0,
       source_imported: 1,
     };
   }
@@ -722,6 +730,7 @@ export function createMailService({
     const labels = setValues(message.labels).map(String);
     const mailboxRole = role || folderForMailbox(mailbox);
     const isSent = mailboxRole === 'sent';
+    const isDraft = mailboxRole === 'drafts';
     if (allMailMirror && messageId) {
       const existing = repos.messages.findByRfcId(account.id, messageId);
       if (existing && existing.mailbox !== mailbox) return null;
@@ -766,6 +775,7 @@ export function createMailService({
       is_spam: mailboxRole === 'spam' ? 1 : 0,
       snoozed_until: null,
       is_sent: isSent ? 1 : 0,
+      is_draft: isDraft ? 1 : 0,
       source_imported: 0,
     };
   }
@@ -1007,7 +1017,7 @@ export function createMailService({
     const { account, credentials } = accountAndCredentials(accountId);
     const explicitMailbox = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : null;
     // Existing UI clients ask to sync "INBOX". Treat that as the normal account
-    // bundle so Sent/Archive/Trash/Spam arrive too; another mailbox is an
+    // bundle so Sent/Drafts/Archive/Trash/Spam arrive too; another mailbox is an
     // intentional targeted synchronization request.
     const singleMailbox = explicitMailbox && explicitMailbox.toLowerCase() !== 'inbox';
     if (!account.sync_enabled) {
@@ -1728,7 +1738,7 @@ export function createMailService({
       const payload = await ingestImapMessage({
         account,
         mailbox: message.mailbox || 'INBOX',
-        role: folderForMailbox(message.mailbox),
+        role: message.isDraft ? 'drafts' : folderForMailbox(message.mailbox),
         generation,
         message: { ...sourceMessage, source },
       });
