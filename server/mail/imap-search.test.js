@@ -4,8 +4,11 @@ import { parseMailboxQuery } from './search-query.js';
 import {
   bodyStructureFilenames,
   canUseGmraw,
+  imapSearchIsSelective,
+  mailboxesForDeepSearch,
   mailboxesForSearch,
   newestUids,
+  shouldDeepSearchProvider,
   shouldSearchProvider,
   toGmailRawQuery,
   toImapSearchQuery,
@@ -17,17 +20,22 @@ test('in:anywhere is the MCP opt-in and still means All Mail locally', () => {
   assert.equal(parsed.folder, 'all');
   assert.equal(parsed.text, 'invoice');
   assert.equal(shouldSearchProvider(parsed, { source: 'mcp', folder: 'all' }), true);
-  assert.equal(shouldSearchProvider(parsed, { source: 'human', folder: 'inbox' }), true);
+  assert.equal(shouldSearchProvider(parsed, { source: 'human', folder: 'inbox' }), false);
+  assert.equal(shouldSearchProvider(parsed, { source: 'deep', folder: 'all' }), true);
 });
 
-test('human leftover text searches the provider; MCP and analyzed filters do not', () => {
+test('fast listing stays local; deep search covers leftover text and operators', () => {
   const leftover = parseMailboxQuery('invoice from:ada@example.com');
-  assert.equal(shouldSearchProvider(leftover, { source: 'human', folder: 'inbox' }), true);
+  assert.equal(shouldSearchProvider(leftover, { source: 'human', folder: 'inbox' }), false);
   assert.equal(shouldSearchProvider(leftover, { source: 'mcp', folder: 'inbox' }), false);
-  assert.equal(shouldSearchProvider(parseMailboxQuery('from:ada@example.com'), { source: 'human' }), false);
+  assert.equal(shouldSearchProvider(leftover, { source: 'deep', folder: 'inbox' }), true);
+  assert.equal(shouldDeepSearchProvider(parseMailboxQuery('from:ada@example.com')), true);
+  assert.equal(imapSearchIsSelective(parseMailboxQuery('from:ada@example.com')), true);
+  assert.equal(shouldDeepSearchProvider(parseMailboxQuery('has:attachment')), true);
+  assert.equal(imapSearchIsSelective(parseMailboxQuery('has:attachment')), false);
   assert.equal(shouldSearchProvider(parseMailboxQuery('invoice is:unanalyzed'), { source: 'human' }), false);
-  assert.equal(shouldSearchProvider(parseMailboxQuery('invoice is:analyzed'), { source: 'human' }), false);
-  assert.equal(shouldSearchProvider(parseMailboxQuery('invoice'), { source: 'human', folder: 'drafts' }), false);
+  assert.equal(shouldSearchProvider(parseMailboxQuery('invoice is:analyzed'), { source: 'deep' }), false);
+  assert.equal(shouldDeepSearchProvider(parseMailboxQuery('invoice'), { folder: 'drafts' }), false);
 });
 
 test('portable IMAP SEARCH and Gmail gmraw omit is:analyzed', () => {
@@ -68,4 +76,21 @@ test('search mailboxes follow sync folders and cap All Mail on Gmail mirrors', (
     }),
     ['invoice.pdf'],
   );
+});
+
+test('deep search covers inbox plus archive, sent, and custom folders', () => {
+  const descriptors = [
+    { role: 'inbox', mailbox: 'INBOX', allMailMirror: false },
+    { role: 'sent', mailbox: 'Sent', allMailMirror: false },
+    { role: 'archive', mailbox: '[Gmail]/All Mail', allMailMirror: true },
+    { role: 'inbox', mailbox: 'Receipts', allMailMirror: false },
+    { role: 'trash', mailbox: 'Trash', allMailMirror: false },
+  ];
+  assert.deepEqual(
+    mailboxesForDeepSearch(descriptors, 'inbox').map((item) => item.mailbox),
+    ['INBOX', '[Gmail]/All Mail', 'Sent', 'Receipts'],
+  );
+  assert.deepEqual(mailboxesForDeepSearch(descriptors, 'all').map((item) => item.mailbox), ['[Gmail]/All Mail']);
+  assert.deepEqual(mailboxesForDeepSearch(descriptors, 'sent').map((item) => item.mailbox), ['Sent']);
+  assert.equal(mailboxesForDeepSearch(descriptors, 'inbox').some((item) => item.mailbox === 'Trash'), false);
 });

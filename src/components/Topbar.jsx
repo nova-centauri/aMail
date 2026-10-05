@@ -15,6 +15,9 @@ export function Topbar({
   searchRef,
   account,
   isDemo,
+  onCommitSearch,
+  deepSearchAvailable = false,
+  deepSearchRunning = false,
 }) {
   const [optionsOpen, setOptionsOpen] = useState(false);
   const searchWrapRef = useRef(null);
@@ -53,6 +56,12 @@ export function Topbar({
             type="search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                onCommitSearch?.();
+              }
+            }}
             placeholder="Search mail"
             aria-label="Search mail"
           />
@@ -60,6 +69,18 @@ export function Topbar({
             <IconButton label="Clear search" onClick={() => setQuery('')} className="search-clear">
               <Icon name="close" size={18} />
             </IconButton>
+          )}
+          {deepSearchAvailable && (
+            <Tooltip text="Search every account and folder, including mail that is not downloaded yet">
+              <IconButton
+                label="Deep search"
+                className="search-deep"
+                active={deepSearchRunning}
+                onClick={() => onCommitSearch?.()}
+              >
+                <Icon name="sparkles" size={18} />
+              </IconButton>
+            </Tooltip>
           )}
           <Tooltip text="Search options">
             <IconButton

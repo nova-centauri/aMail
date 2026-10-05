@@ -51,6 +51,7 @@
 .search-shell input::placeholder { color: var(--ink-3); }
 .search-shell input::-webkit-search-cancel-button { display: none; }
 .search-shell .icon-button { width: 34px; height: 34px; }
+.search-shell .search-deep.is-active { color: var(--accent); }
 
 .top-actions { margin-left: auto; display: flex; align-items: center; gap: 2px; }
 .account-trigger { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 50%; }

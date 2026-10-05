@@ -1,15 +1,17 @@
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { accessGate } from '../middleware/auth.js';
 import { createAmailMcpServer } from '../mcp/server.js';
+import { createDeepSearchService } from '../services/deep-search.js';
 
 /**
  * Mount a Cursor-compatible Streamable HTTP MCP endpoint at /mcp.
  * Auth reuses the same Bearer token / session cookie gate as /api.
  */
-export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config }) {
+export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, deepSearch = null }) {
+  const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const gate = accessGate(auth);
   const handleMcp = async (request, response) => {
-    const server = createAmailMcpServer({ config, repos, mailService, remoteContent });
+    const server = createAmailMcpServer({ config, repos, mailService, remoteContent, deepSearch: searchJobs });
     let transport;
     let closed = false;
     const cleanup = async () => {

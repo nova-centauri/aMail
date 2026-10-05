@@ -117,6 +117,20 @@
 .row-meta { grid-area: meta; display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding-left: 8px; color: var(--ink-3); font-size: var(--fs-xs); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .thread-row.is-unread .row-meta { color: var(--ink); font-weight: 600; }
 .thread-count { min-width: 18px; padding: 0 5px; display: inline-grid; place-items: center; border-radius: var(--r-pill); background: var(--bg-4); color: var(--ink-2); font-size: var(--fs-2xs); font-weight: 700; }
+.provider-hit { color: var(--accent); }
+
+.deep-search-progress {
+  flex: 0 0 auto; padding: 8px var(--sp-3) 10px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: center;
+  border-bottom: 1px solid var(--line); background: var(--bg-1);
+}
+.deep-search-copy { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--ink-2); }
+.deep-search-copy > span { min-width: 0; display: grid; gap: 1px; }
+.deep-search-copy strong { font-size: var(--fs-xs); font-weight: 650; }
+.deep-search-copy small { color: var(--ink-3); font-size: var(--fs-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.deep-search-track { grid-column: 1 / -1; height: 6px; border-radius: var(--r-pill); background: var(--bg-4); overflow: hidden; }
+.deep-search-fill { height: 100%; border-radius: inherit; background: var(--accent); transition: width 160ms linear; }
+.deep-search-cancel { justify-self: end; color: var(--ink-2); font-size: var(--fs-xs); font-weight: 650; }
+.deep-search-progress.is-running .deep-search-copy { color: var(--accent); }
 
 .thread-category {
   --category-color: var(--cat-primary);

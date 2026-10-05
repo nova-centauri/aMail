@@ -3,6 +3,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as z from 'zod/v4';
 import { accountTestInput, serializeAccountInput } from '../services/account-input.js';
 import { listConversations, parseNumber } from '../services/inbox.js';
+import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { discoverAccountProvider, mailProviderCatalog } from '../utils/mail.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
 import { configuredOpsSources } from '../services/smart-filter.js';
@@ -126,7 +127,8 @@ const recipientSchema = z.union([
  * Build a fresh MCP server instance wired to aMail services.
  * Stateless Streamable HTTP creates one of these per request.
  */
-export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter }) {
+export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter, deepSearch = null }) {
+  const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const server = new McpServer({
     name: 'amail',
     version: '0.1.0',
@@ -191,7 +193,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       folder: z.string().optional().describe('inbox, starred, snoozed, sent, drafts, all, trash, spam, or archive'),
       accountId: z.string().optional().describe('Limit to one account id'),
       category: z.string().optional().describe('Smart filter: primary, github_ci, logs, status, ops_error'),
-      q: z.string().optional().describe('Search query. Gmail-style operators work: from:, to:, subject:, has:attachment, after:, before:, is:unread, is:starred, is:unanalyzed, is:analyzed, in:. Cache-only unless q includes in:anywhere, which also searches the provider. is:analyzed / is:unanalyzed never search IMAP.'),
+      q: z.string().optional().describe('Search query. Gmail-style operators work: from:, to:, subject:, has:attachment, after:, before:, is:unread, is:starred, is:unanalyzed, is:analyzed, in:. Cache-only and fast unless q includes in:anywhere, which also searches the provider (blocking). Prefer start_deep_search for thorough IMAP search with progress. is:analyzed / is:unanalyzed never search IMAP.'),
       page: z.number().int().optional().describe('Page number (1-based)'),
       pageSize: z.number().int().optional().describe('Results per page (1-200)'),
       flag: z.string().optional().describe('Person flag id (see list_flags)'),
@@ -207,6 +209,48 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     mailService,
     searchSource: 'mcp',
   })));
+
+  server.registerTool('start_deep_search', {
+    title: 'Start a deep mailbox search',
+    description: 'Start a thorough search across connected accounts. Returns a job immediately with the local-index page, then searches IMAP for mail that was never imported. Poll get_deep_search until status is complete, cancelled, or error. is:analyzed / is:unanalyzed stay cache-only. Does not hammer providers: one mailbox at a time with pacing.',
+    inputSchema: {
+      q: z.string().min(1).describe('Search query. Gmail-style operators work.'),
+      folder: z.string().optional().describe('inbox, starred, sent, all, trash, spam, or archive'),
+      accountId: z.string().optional().describe('Limit to one account id'),
+      category: z.string().optional(),
+      flag: z.string().optional().describe('Person flag id'),
+      pageSize: z.number().int().min(1).max(200).optional(),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async (args) => runTool(async () => {
+    const job = searchJobs.start({
+      query: args.q,
+      folder: args.folder,
+      accountId: args.accountId,
+      category: args.category,
+      personFlag: args.flag,
+      pageSize: args.pageSize,
+    }, { owner: 'mcp' });
+    return jobSnapshot(job);
+  }));
+
+  server.registerTool('get_deep_search', {
+    title: 'Poll a deep search job',
+    description: 'Read the current deep-search job: status, real progress (folders/accounts done), and conversations found so far. Repeat until status is complete, cancelled, or error.',
+    inputSchema: {
+      jobId: z.string().min(1).describe('Job id from start_deep_search'),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ jobId }) => runTool(async () => searchJobs.snapshot(jobId)));
+
+  server.registerTool('cancel_deep_search', {
+    title: 'Cancel a deep search job',
+    description: 'Stop an in-flight deep search. Conversations already found stay in the snapshot.',
+    inputSchema: {
+      jobId: z.string().min(1).describe('Job id from start_deep_search'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ jobId }) => runTool(async () => searchJobs.cancel(jobId)));
 
   server.registerTool('list_unanalyzed_messages', {
     title: 'List unanalyzed messages',

@@ -29,10 +29,19 @@ import {
   storedAttachmentRecords,
 } from './compose-attachments.js';
 import {
+  IMAP_DEEP_ACCOUNT_GAP_MS,
+  IMAP_DEEP_BATCH_GAP_MS,
+  IMAP_DEEP_ENVELOPE_BATCH,
+  IMAP_DEEP_MAILBOX_CAP,
+  IMAP_DEEP_MAILBOX_GAP_MS,
+  IMAP_DEEP_SEARCH_UID_CAP,
   IMAP_ENVELOPE_FETCH_CAP,
   IMAP_SEARCH_MAILBOX_CAP,
+  IMAP_SEARCH_UID_CAP,
   bodyStructureFilenames,
   canUseGmraw,
+  imapSearchIsSelective,
+  mailboxesForDeepSearch,
   mailboxesForSearch,
   newestUids,
   toGmailRawQuery,
@@ -416,6 +425,51 @@ export function discoverSyncMailboxes(folders) {
     if (seen.has(candidate.mailbox)) return false;
     seen.add(candidate.mailbox);
     return true;
+  });
+}
+
+function folderIsNoSelect(folder) {
+  const flags = folder?.flags;
+  if (flags && typeof flags.has === 'function' && (flags.has('\\Noselect') || flags.has('\\NonExistent'))) return true;
+  return ['\\Noselect', '\\NonExistent'].includes(String(folder?.specialUse || ''));
+}
+
+/**
+ * Special-use folders first, then every selectable mailbox the provider lists.
+ * Deep search uses this so custom folders (Receipts, Lists) are not skipped.
+ */
+export function discoverSearchMailboxes(folders) {
+  const list = Array.isArray(folders) ? folders.filter(Boolean) : [];
+  const special = discoverSyncMailboxes(list);
+  const seen = new Set(special.map((item) => item.mailbox));
+  const extra = [];
+  for (const folder of list) {
+    const mailbox = folder.path || folder.name;
+    if (!mailbox || seen.has(mailbox) || folderIsNoSelect(folder)) continue;
+    extra.push({
+      role: folderForMailbox(mailbox),
+      mailbox,
+      allMailMirror: false,
+    });
+    seen.add(mailbox);
+  }
+  return [...special, ...extra];
+}
+
+export function delay(ms, abort) {
+  const wait = Math.max(0, Number(ms) || 0);
+  if (!wait) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, wait);
+    const finish = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    if (abort?.aborted) {
+      finish();
+      return;
+    }
+    abort?.addEventListener?.('abort', finish, { once: true });
   });
 }
 
@@ -1754,26 +1808,60 @@ export function createMailService({
     }
   }
 
-  async function searchAccountMailboxes({ account, credentials, parsed, folder, abort }) {
+  function storeSearchPayloads(pending, threadIds, accountId) {
+    if (!pending.length) return;
+    const write = () => {
+      for (const payload of pending) {
+        try {
+          const saved = repos.messages.upsert(payload);
+          if (saved?.threadId) threadIds.add(saved.threadId);
+        } catch (error) {
+          logger.warn({ accountId, err: cleanupError(error) }, 'IMAP SEARCH hit could not be stored');
+        }
+      }
+    };
+    if (typeof repos.runWriteBatch === 'function') repos.runWriteBatch(write);
+    else write();
+  }
+
+  async function searchAccountMailboxes({
+    account,
+    credentials,
+    parsed,
+    folder,
+    abort,
+    mode = 'shallow',
+    onProgress = null,
+    onHits = null,
+    paceMs = null,
+  }) {
+    const deep = mode === 'deep';
     const generation = accountGeneration(account.id);
     const entry = await acquirePooledClient(account, credentials);
     const client = entry.client;
-    const pending = [];
     const threadIds = new Set();
+    const mailboxGap = paceMs == null ? (deep ? IMAP_DEEP_MAILBOX_GAP_MS : 0) : paceMs;
+    const batchGap = paceMs == null ? (deep ? IMAP_DEEP_BATCH_GAP_MS : 0) : paceMs;
     try {
       const folders = await pooledList(entry);
-      const descriptors = mailboxesForSearch(discoverSyncMailboxes(folders), folder).slice(0, IMAP_SEARCH_MAILBOX_CAP);
+      const discovered = deep ? discoverSearchMailboxes(folders) : discoverSyncMailboxes(folders);
+      const mailboxCap = deep ? IMAP_DEEP_MAILBOX_CAP : IMAP_SEARCH_MAILBOX_CAP;
+      const descriptors = (deep ? mailboxesForDeepSearch : mailboxesForSearch)(discovered, folder).slice(0, mailboxCap);
       const useGmraw = canUseGmraw(account, client);
+      if (!useGmraw && !imapSearchIsSelective(parsed)) return { threadIds: [...threadIds], mailboxes: descriptors };
       const raw = useGmraw ? toGmailRawQuery(parsed) : '';
       const imapQuery = useGmraw ? (raw ? { gmraw: raw } : null) : toImapSearchQuery(parsed);
-      if (!imapQuery) return [];
-      for (const descriptor of descriptors) {
-        if (abort?.aborted) return [...threadIds];
+      if (!imapQuery) return { threadIds: [...threadIds], mailboxes: descriptors };
+      const uidCap = deep ? IMAP_DEEP_SEARCH_UID_CAP : IMAP_SEARCH_UID_CAP;
+      const fetchCap = deep ? IMAP_DEEP_SEARCH_UID_CAP : IMAP_ENVELOPE_FETCH_CAP;
+      const batchSize = deep ? IMAP_DEEP_ENVELOPE_BATCH : IMAP_ENVELOPE_FETCH_CAP;
+      for (const [index, descriptor] of descriptors.entries()) {
+        if (abort?.aborted) return { threadIds: [...threadIds], mailboxes: descriptors };
         let lock;
         try {
           lock = await client.getMailboxLock(descriptor.mailbox, { readOnly: true });
-          const uids = newestUids(await client.search(imapQuery, { uid: true }) || []);
-          if (abort?.aborted) return [...threadIds];
+          const uids = newestUids(await client.search(imapQuery, { uid: true }) || [], uidCap);
+          if (abort?.aborted) return { threadIds: [...threadIds], mailboxes: descriptors };
           const missing = [];
           for (const uid of uids) {
             const existing = repos.messages.findByUid?.(account.id, descriptor.mailbox, uid);
@@ -1782,75 +1870,91 @@ export function createMailService({
               continue;
             }
             missing.push(uid);
-            if (missing.length >= IMAP_ENVELOPE_FETCH_CAP) break;
+            if (missing.length >= fetchCap) break;
           }
-          if (!missing.length) continue;
-          for await (const message of client.fetch(missing.join(','), {
-            uid: true,
-            envelope: true,
-            flags: true,
-            labels: true,
-            internalDate: true,
-            bodyStructure: true,
-          }, { uid: true })) {
-            if (abort?.aborted) return [...threadIds];
-            if (parsed.hasAttachment != null && !canUseGmraw(account, client)) {
-              const filenames = bodyStructureFilenames(message.bodyStructure);
-              if (parsed.hasAttachment === true && !filenames.length) continue;
-              if (parsed.hasAttachment === false && filenames.length) continue;
+          for (let offset = 0; offset < missing.length; offset += batchSize) {
+            if (abort?.aborted) return { threadIds: [...threadIds], mailboxes: descriptors };
+            const batch = missing.slice(offset, offset + batchSize);
+            const pending = [];
+            for await (const message of client.fetch(batch.join(','), {
+              uid: true,
+              envelope: true,
+              flags: true,
+              labels: true,
+              internalDate: true,
+              bodyStructure: true,
+            }, { uid: true })) {
+              if (abort?.aborted) return { threadIds: [...threadIds], mailboxes: descriptors };
+              if (parsed.hasAttachment != null && !useGmraw) {
+                const filenames = bodyStructureFilenames(message.bodyStructure);
+                if (parsed.hasAttachment === true && !filenames.length) continue;
+                if (parsed.hasAttachment === false && filenames.length) continue;
+              }
+              const payload = envelopeSearchPayload({
+                account,
+                mailbox: descriptor.mailbox,
+                role: descriptor.role,
+                allMailMirror: descriptor.allMailMirror,
+                message,
+              });
+              if (payload) pending.push(payload);
             }
-            const payload = envelopeSearchPayload({
-              account,
-              mailbox: descriptor.mailbox,
-              role: descriptor.role,
-              allMailMirror: descriptor.allMailMirror,
-              message,
-            });
-            if (payload) pending.push(payload);
+            storeSearchPayloads(pending, threadIds, account.id);
+            assertAccountGeneration(account.id, generation);
+            if (pending.length) {
+              await onHits?.({ accountId: account.id, mailbox: descriptor.mailbox, threadIds: [...threadIds] });
+            }
+            if (offset + batchSize < missing.length) await delay(batchGap, abort);
           }
         } catch (error) {
           logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH failed for a mailbox');
         } finally {
           lock?.release();
         }
+        onProgress?.({
+          accountId: account.id,
+          email: account.email,
+          mailbox: descriptor.mailbox,
+          folderIndex: index,
+          folderCount: descriptors.length,
+          threadIds: [...threadIds],
+        });
+        if (index < descriptors.length - 1) await delay(mailboxGap, abort);
       }
-      if (!pending.length || abort?.aborted) return [...threadIds];
-      const write = () => {
-        for (const payload of pending) {
-          try {
-            const saved = repos.messages.upsert(payload);
-            if (saved?.threadId) threadIds.add(saved.threadId);
-          } catch (error) {
-            logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH hit could not be stored');
-          }
-        }
-      };
-      if (typeof repos.runWriteBatch === 'function') repos.runWriteBatch(write);
-      else write();
-      assertAccountGeneration(account.id, generation);
-      return [...threadIds];
+      return { threadIds: [...threadIds], mailboxes: descriptors };
     } finally {
       if (imapPool.get(account.id) === entry) releasePooledClient(account.id);
     }
   }
 
-  async function searchAndMaterialize({ accounts = [], parsed, folder = 'inbox', signal } = {}) {
-    const generation = ++searchGeneration;
-    activeSearchAbort?.abort();
+  async function searchAndMaterialize({
+    accounts = [],
+    parsed,
+    folder = 'inbox',
+    signal,
+    mode = 'shallow',
+    onProgress = null,
+    onHits = null,
+    paceMs = null,
+  } = {}) {
+    const deep = mode === 'deep';
+    const generation = deep ? searchGeneration : ++searchGeneration;
+    if (!deep) activeSearchAbort?.abort();
     const abort = new AbortController();
-    activeSearchAbort = abort;
+    if (!deep) activeSearchAbort = abort;
     if (signal) {
       if (signal.aborted) abort.abort();
       else signal.addEventListener?.('abort', () => abort.abort(), { once: true });
     }
     const run = async () => {
       const threadIds = [];
-      if (generation !== searchGeneration || abort.aborted) return { cancelled: true, threadIds };
+      if ((!deep && generation !== searchGeneration) || abort.aborted) return { cancelled: true, threadIds };
       // Search uses the accounts already in this list request. Disabled background
       // sync must not hide provider SEARCH for leftover-text human queries.
       const list = (accounts || []).filter(Boolean);
-      for (const account of list) {
-        if (generation !== searchGeneration || abort.aborted) return { cancelled: true, threadIds };
+      const accountGap = paceMs == null ? (deep ? IMAP_DEEP_ACCOUNT_GAP_MS : 0) : paceMs;
+      for (const [index, account] of list.entries()) {
+        if ((!deep && generation !== searchGeneration) || abort.aborted) return { cancelled: true, threadIds };
         try {
           const raw = repos.accounts.getRaw(account.id) || account;
           const credentials = decryptJson(raw.credential_ciphertext, config.credentialKey);
@@ -1860,14 +1964,34 @@ export function createMailService({
             parsed,
             folder,
             abort,
+            mode,
+            onProgress: (progress) => {
+              onProgress?.({
+                ...progress,
+                accountIndex: index,
+                accountCount: list.length,
+              });
+            },
+            onHits,
+            paceMs,
           });
-          if (Array.isArray(found)) threadIds.push(...found);
+          const ids = Array.isArray(found) ? found : found?.threadIds;
+          if (Array.isArray(ids)) threadIds.push(...ids);
         } catch (error) {
           logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP SEARCH fallback failed for an account');
+          onProgress?.({
+            accountId: account.id,
+            email: account.email,
+            mailbox: null,
+            accountIndex: index,
+            accountCount: list.length,
+            error: true,
+          });
         }
+        if (index < list.length - 1) await delay(accountGap, abort);
       }
       return {
-        cancelled: abort.aborted || generation !== searchGeneration,
+        cancelled: abort.aborted || (!deep && generation !== searchGeneration),
         threadIds: [...new Set(threadIds)],
       };
     };

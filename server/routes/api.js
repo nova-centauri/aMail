@@ -9,6 +9,7 @@ import {
   serializeAccountInput,
 } from '../services/account-input.js';
 import { listConversations, listStoredDrafts, parseNumber } from '../services/inbox.js';
+import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
@@ -95,7 +96,44 @@ function updateTargets(repos, mailService, id, state) {
   return Promise.all(repos.messages.forThread(thread.id).map((item) => mailService.updateMessageState(item.id, state)));
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null }) {
+function wantsEventStream(request) {
+  return String(request.headers.accept || '').includes('text/event-stream');
+}
+
+function writeSse(response, event, data) {
+  if (response.writableEnded || response.destroyed) return;
+  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function attachDeepSearchStream(request, response, deepSearch, job) {
+  response.status(200);
+  response.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.flushHeaders?.();
+  const send = (event, data) => writeSse(response, event, data);
+  const unsubscribe = deepSearch.subscribe(job.id, send);
+  send('hello', jobSnapshot(job));
+  if (job.status !== 'running') {
+    unsubscribe();
+    response.end();
+    return;
+  }
+  const onClose = () => {
+    unsubscribe();
+  };
+  request.once('close', onClose);
+  deepSearch.whenSettled(job.id).finally(() => {
+    request.off('close', onClose);
+    unsubscribe();
+    if (!response.writableEnded && !response.destroyed) response.end();
+  });
+}
+
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null }) {
   // In keyslot mode `config` is a proxy whose key material throws while the
   // harness is locked, so health reads only static settings plus vault status.
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
@@ -237,6 +275,18 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     );
     response.send(result.body);
   });
+
+  const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
+  const startDeepSearchJob = (input, owner = 'human') => searchJobs.start({
+    query: input.q ?? input.query,
+    folder: input.folder,
+    accountId: input.accountId,
+    category: input.category,
+    personFlag: input.flag || input.personFlag,
+    mailbox: input.mailbox,
+    pageSize: input.pageSize || input.limit,
+    paceMs: input.paceMs,
+  }, { owner });
 
   const router = express.Router();
   router.use(accessGate(auth));
@@ -405,6 +455,27 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       searchSource: 'human',
       signal: request.signal,
     }));
+  });
+  router.post('/search/deep', (request, response) => {
+    const job = startDeepSearchJob({ ...(request.body || {}), ...request.query }, 'human');
+    if (wantsEventStream(request)) return attachDeepSearchStream(request, response, searchJobs, job);
+    response.status(202).json(jobSnapshot(job));
+  });
+  router.get('/search/deep', (request, response) => {
+    const job = startDeepSearchJob(request.query, 'human');
+    if (wantsEventStream(request)) return attachDeepSearchStream(request, response, searchJobs, job);
+    response.status(202).json(jobSnapshot(job));
+  });
+  router.get('/search/deep/:id', (request, response) => {
+    const job = searchJobs.get(request.params.id);
+    if (wantsEventStream(request)) return attachDeepSearchStream(request, response, searchJobs, job);
+    response.json(jobSnapshot(job));
+  });
+  router.get('/search/deep/:id/events', (request, response) => {
+    attachDeepSearchStream(request, response, searchJobs, searchJobs.get(request.params.id));
+  });
+  router.delete('/search/deep/:id', (request, response) => {
+    response.json(searchJobs.cancel(request.params.id));
   });
   router.get('/messages/:id', async (request, response) => {
     let message = repos.messages.get(request.params.id);

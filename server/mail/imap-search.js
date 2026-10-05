@@ -5,13 +5,49 @@
 export const IMAP_SEARCH_UID_CAP = 200;
 export const IMAP_ENVELOPE_FETCH_CAP = 50;
 export const IMAP_SEARCH_MAILBOX_CAP = 4;
+export const IMAP_DEEP_SEARCH_UID_CAP = 2_000;
+export const IMAP_DEEP_ENVELOPE_BATCH = 40;
+export const IMAP_DEEP_MAILBOX_CAP = 24;
+export const IMAP_DEEP_ACCOUNT_GAP_MS = 400;
+export const IMAP_DEEP_MAILBOX_GAP_MS = 150;
+export const IMAP_DEEP_BATCH_GAP_MS = 80;
+const SKIP_DEEP_ROLES = new Set(['trash', 'spam', 'drafts']);
+
+/** True when leftover text or operators can be sent as IMAP SEARCH / X-GM-RAW. */
+export function imapSearchIsSelective(parsed) {
+  if (!parsed) return false;
+  return Boolean(
+    parsed.text
+    || parsed.from[0]
+    || parsed.to[0]
+    || parsed.subject[0]
+    || parsed.after
+    || parsed.before
+    || parsed.isUnread != null
+    || parsed.isStarred != null
+  );
+}
+
+export function canMapToImapSearch(parsed, { allowAttachmentOnly = false } = {}) {
+  if (!parsed || parsed.isAnalyzed != null) return false;
+  if (imapSearchIsSelective(parsed)) return true;
+  return Boolean(allowAttachmentOnly && parsed.hasAttachment != null);
+}
+
+export function shouldDeepSearchProvider(parsed, { folder = 'inbox' } = {}) {
+  if (folder === 'drafts' || folder === 'snoozed') return false;
+  return canMapToImapSearch(parsed, { allowAttachmentOnly: true });
+}
 
 export function shouldSearchProvider(parsed, { source = 'human', folder = 'inbox' } = {}) {
-  if (!parsed?.text) return false;
-  if (parsed.isAnalyzed != null) return false;
+  if (parsed?.isAnalyzed != null) return false;
   if (folder === 'drafts' || folder === 'snoozed') return false;
+  if (source === 'deep') return shouldDeepSearchProvider(parsed, { folder });
+  if (!parsed?.text) return false;
   if (source === 'mcp') return Boolean(parsed.anywhere);
-  return source === 'human';
+  // Fast human listing stays on the local cache. Provider SEARCH is the
+  // streaming deep-search job so typing does not block or hammer IMAP.
+  return false;
 }
 
 function imapDate(value) {
@@ -106,6 +142,42 @@ export function mailboxesForSearch(descriptors, folder) {
     return list.slice(0, IMAP_SEARCH_MAILBOX_CAP);
   }
   return list.filter((item) => item.role === 'inbox').slice(0, 1);
+}
+
+function uniqueMailboxes(items, cap) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items) {
+    if (!item?.mailbox || seen.has(item.mailbox)) continue;
+    seen.add(item.mailbox);
+    out.push(item);
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+/**
+ * Deep search prefers thoroughness: inbox also covers archive/All Mail, Sent,
+ * and custom folders. Gmail's All Mail mirror still collapses `in:anywhere`.
+ */
+export function mailboxesForDeepSearch(descriptors, folder) {
+  const list = Array.isArray(descriptors) ? descriptors.filter(Boolean) : [];
+  if (!list.length) return [];
+  if (folder === 'sent') return uniqueMailboxes(list.filter((item) => item.role === 'sent'), 1);
+  if (folder === 'archive') return uniqueMailboxes(list.filter((item) => item.role === 'archive'), 2);
+  if (folder === 'trash') return uniqueMailboxes(list.filter((item) => item.role === 'trash'), 1);
+  if (folder === 'spam') return uniqueMailboxes(list.filter((item) => item.role === 'spam'), 1);
+  if (folder === 'drafts') return uniqueMailboxes(list.filter((item) => item.role === 'drafts'), 1);
+  if (folder === 'starred' || folder === 'all') {
+    const allMail = list.find((item) => item.allMailMirror);
+    if (folder === 'all' && allMail) return [allMail];
+    return uniqueMailboxes(list.filter((item) => !SKIP_DEEP_ROLES.has(item.role)), IMAP_DEEP_MAILBOX_CAP);
+  }
+  const inbox = list.filter((item) => item.role === 'inbox');
+  const archive = list.filter((item) => item.role === 'archive' || item.allMailMirror);
+  const sent = list.filter((item) => item.role === 'sent');
+  const custom = list.filter((item) => !['inbox', 'sent', 'archive', ...SKIP_DEEP_ROLES].includes(item.role) && !item.allMailMirror);
+  return uniqueMailboxes([...inbox.slice(0, 1), ...archive, ...sent, ...inbox.slice(1), ...custom], IMAP_DEEP_MAILBOX_CAP);
 }
 
 export function newestUids(uids, cap = IMAP_SEARCH_UID_CAP) {
