@@ -982,21 +982,36 @@ export function createMailService({
       }
       const uidNext = Number(client.mailbox?.uidNext || 0);
       const latestUid = Math.max(0, uidNext - 1);
-      if (latestUid > lastUid) {
+      // Drafts keep the UID they were created with after newer drafts are sent
+      // and expunged. A high-water mark that starts at the newest window, or
+      // that is already caught up to UIDNEXT, never sees those older messages.
+      const scanDrafts = role === 'drafts';
+      if (latestUid > lastUid || scanDrafts) {
         // A mailbox seen for the first time imports only its newest `limit`
         // messages. After that every UID above the high-water mark is imported,
         // oldest first, so a burst larger than one page is drained across pages
-        // and passes instead of being jumped over.
-        const firstUid = lastUid > 0 ? lastUid + 1 : Math.max(1, latestUid - limit + 1);
+        // and passes instead of being jumped over. Drafts are the exception:
+        // every still-present UID is eligible until it is stored.
+        const firstUid = scanDrafts ? 1 : (lastUid > 0 ? lastUid + 1 : Math.max(1, latestUid - limit + 1));
+        const endUid = Math.max(latestUid, firstUid);
         // Size-only scan: a few bytes per message, no bodies, so oversized mail
         // is rejected without transferring it. UIDs arrive in ascending order.
-        const candidates = [];
-        for await (const message of client.fetch(`${firstUid}:${latestUid}`, { uid: true, size: true }, { uid: true })) {
+        const scanned = [];
+        for await (const message of client.fetch(`${firstUid}:${endUid}`, { uid: true, size: true }, { uid: true })) {
           const uid = Number(message.uid || 0);
           // `n:m` can return the last message when nothing newer exists.
-          if (uid <= lastUid || uid > latestUid) continue;
+          if (uid < 1 || uid > latestUid) continue;
+          if (!scanDrafts && uid <= lastUid) continue;
           const size = Number(message.size);
-          candidates.push({ uid, size: Number.isSafeInteger(size) && size >= 0 ? size : null });
+          scanned.push({ uid, size: Number.isSafeInteger(size) && size >= 0 ? size : null });
+        }
+        const candidates = [];
+        for (const candidate of scanned) {
+          if (scanDrafts && candidate.uid <= lastUid) {
+            const existing = repos.messages.findByUid?.(account.id, mailbox, candidate.uid);
+            if (existing) continue;
+          }
+          candidates.push(candidate);
         }
 
         const startedAt = Date.now();

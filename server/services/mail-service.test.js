@@ -288,6 +288,9 @@ function syncHarness({
     },
     messages: {
       findByRfcId: () => null,
+      findByUid: (accountId, mailbox, uid) => state.savedMessages.find((row) => (
+        row.account_id === accountId && row.mailbox === mailbox && row.uid === uid
+      )) || null,
       upsert(value) {
         if (rejectUpsert(value)) throw new Error('UNIQUE constraint failed: messages.account_id, mailbox, uid');
         state.savedMessages.push(value);
@@ -1774,5 +1777,43 @@ test('IMAP sync stores provider Drafts as drafts and keeps them out of the inbox
   assert.equal(state.savedMessages[0].is_draft, 1);
   assert.equal(state.savedMessages[0].mailbox, 'Brouillons');
   assert.equal(state.savedMessages[0].subject, 'Q3 budget notes');
+  await service.close();
+});
+
+test('Drafts sync backfills UIDs below a caught-up high-water mark', async () => {
+  const source = Buffer.from([
+    'From: Steven Barrett <steven@midstatelitho.com>',
+    'To: Steven Barrett <steven@midstatelitho.com>',
+    'Subject: Open quote',
+    'Message-ID: <open-quote@midstatelitho.com>',
+    'Date: Mon, 02 Mar 2026 12:00:00 +0000',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Still in Drafts.',
+  ].join('\r\n'));
+  const { service, state } = syncHarness({
+    maxMessageBytes: 4096,
+    messages: [{
+      uid: 12,
+      size: source.length,
+      flags: new Set(['\\Draft']),
+      internalDate: new Date('2026-03-02T12:00:00Z'),
+    }],
+    sources: new Map([[12, source]]),
+    previousSync: { last_uid: 4048, uid_validity: 41 },
+  });
+
+  const result = await service.syncAccount('sync-account', { mailbox: '[Gmail]/Drafts' });
+  assert.equal(result.imported, 1);
+  assert.equal(result.mailboxes[0].role, 'drafts');
+  assert.equal(state.savedMessages.length, 1);
+  assert.equal(state.savedMessages[0].uid, 12);
+  assert.equal(state.savedMessages[0].is_draft, 1);
+  assert.equal(state.savedMessages[0].mailbox, '[Gmail]/Drafts');
+  assert.equal(state.savedMessages[0].subject, 'Open quote');
+
+  const again = await service.syncAccount('sync-account', { mailbox: '[Gmail]/Drafts', force: true });
+  assert.equal(again.imported, 0);
+  assert.equal(state.savedMessages.length, 1);
   await service.close();
 });
