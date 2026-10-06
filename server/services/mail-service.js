@@ -1852,6 +1852,15 @@ export function createMailService({
       const raw = useGmraw ? toGmailRawQuery(parsed) : '';
       const imapQuery = useGmraw ? (raw ? { gmraw: raw } : null) : toImapSearchQuery(parsed);
       if (!imapQuery) return { threadIds: [...threadIds], mailboxes: descriptors };
+      onProgress?.({
+        accountId: account.id,
+        email: account.email,
+        mailbox: null,
+        phase: 'list',
+        folderIndex: -1,
+        folderCount: descriptors.length,
+        folders: descriptors.map((item) => item.mailbox),
+      });
       const uidCap = deep ? IMAP_DEEP_SEARCH_UID_CAP : IMAP_SEARCH_UID_CAP;
       const fetchCap = deep ? IMAP_DEEP_SEARCH_UID_CAP : IMAP_ENVELOPE_FETCH_CAP;
       const batchSize = deep ? IMAP_DEEP_ENVELOPE_BATCH : IMAP_ENVELOPE_FETCH_CAP;

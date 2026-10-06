@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { createDeepSearchService, planDeepSearchUnits, progressSnapshot } from './deep-search.js';
+import { createDeepSearchService, estimateDeepSearchWork, planDeepSearchUnits, progressSnapshot } from './deep-search.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-deep-search-'));
@@ -96,6 +96,33 @@ test('progress units count accounts and folders, not a fake timer', () => {
   assert.equal(units.length, 1 + 2 + 3);
 });
 
+test('progress estimate keeps unseen accounts on the bar', () => {
+  const firstFolder = estimateDeepSearchWork({
+    accountCount: 3,
+    accountPlans: new Map([
+      ['work', { folderCount: 3, seen: 1 }],
+      ['home', { seen: 0 }],
+      ['studio', { seen: 0 }],
+    ]),
+    completedMailboxes: 1,
+  });
+  assert.equal(firstFolder.total, 1 + 3 + 3 + 3);
+  assert.equal(firstFolder.done, 2);
+  assert.ok(firstFolder.ratio < 0.3);
+  const afterFirstAccount = estimateDeepSearchWork({
+    accountCount: 3,
+    accountPlans: new Map([
+      ['work', { folderCount: 3, seen: 3 }],
+      ['home', { seen: 0 }],
+      ['studio', { seen: 0 }],
+    ]),
+    completedMailboxes: 3,
+  });
+  assert.equal(afterFirstAccount.done, 4);
+  assert.equal(afterFirstAccount.total, 10);
+  assert.ok(afterFirstAccount.ratio < 0.5);
+});
+
 test('deep search streams local hits first then IMAP extras with real progress', async (t) => {
   const { repos, work, home, add } = fixture(t);
   const local = add(work, 'Recent invoice', { text_body: 'pay the recent invoice', sent_at: '2026-02-01T00:00:00.000Z' });
@@ -111,16 +138,29 @@ test('deep search streams local hits first then IMAP extras with real progress',
       onProgress?.({
         accountId: work.id,
         email: work.email,
-        mailbox: 'INBOX',
+        mailbox: null,
+        phase: 'list',
+        folderCount: 3,
         accountIndex: 0,
         accountCount: 2,
       });
+      onProgress?.({
+        accountId: work.id,
+        email: work.email,
+        mailbox: 'INBOX',
+        folderCount: 3,
+        accountIndex: 0,
+        accountCount: 2,
+      });
+      const mid = events.filter((item) => item.event === 'progress').at(-1);
+      assert.ok(mid?.data?.ratio < 1, 'bar must stay below 100% while other accounts remain');
       const threadId = envelopeHit(repos, home, historical, { uid: 77 });
       await onHits?.({ accountId: home.id, mailbox: 'INBOX', threadIds: [threadId] });
       onProgress?.({
         accountId: home.id,
         email: home.email,
         mailbox: 'Sent',
+        folderCount: 3,
         accountIndex: 1,
         accountCount: 2,
       });

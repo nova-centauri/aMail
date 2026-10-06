@@ -11,7 +11,35 @@ import { ValidationError } from '../errors.js';
 
 export const DEEP_SEARCH_PAGE_SIZE = 100;
 export const DEEP_SEARCH_JOB_TTL_MS = 15 * 60_000;
+export const DEFAULT_FOLDERS_PER_ACCOUNT = 3;
 const MAX_JOBS = 8;
+
+/**
+ * Real work remaining: local index + known/estimated folders across accounts.
+ * Unseen accounts are counted at DEFAULT_FOLDERS_PER_ACCOUNT so the bar does
+ * not sit at 100% after the first mailbox list returns.
+ */
+export function estimateDeepSearchWork({
+  accountCount = 0,
+  accountPlans = new Map(),
+  completedMailboxes = 0,
+  defaultFoldersPerAccount = DEFAULT_FOLDERS_PER_ACCOUNT,
+} = {}) {
+  const plannedIds = new Set();
+  let plannedFolders = 0;
+  for (const [accountId, plan] of accountPlans) {
+    plannedIds.add(accountId);
+    const known = Number(plan?.folderCount);
+    const seen = Number(plan?.seen) || 0;
+    plannedFolders += Number.isFinite(known) && known > 0
+      ? known
+      : Math.max(seen, defaultFoldersPerAccount);
+  }
+  plannedFolders += Math.max(0, Number(accountCount) - plannedIds.size) * defaultFoldersPerAccount;
+  const total = Math.max(1, 1 + plannedFolders);
+  const done = Math.min(total, 1 + Math.max(0, Number(completedMailboxes) || 0));
+  return { done, total, ratio: done / total };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -175,10 +203,10 @@ export function createDeepSearchService({ repos, mailService, logger = null } = 
         return;
       }
 
-      const accountUnits = accounts.length;
+      const planned = estimateDeepSearchWork({ accountCount: accounts.length, completedMailboxes: 0 });
       job.progress = {
-        done: 1,
-        total: 1 + accountUnits,
+        done: planned.done,
+        total: planned.total,
         phase: 'imap',
         label: `Searching ${accounts[0]?.email || 'connected accounts'}`,
         accountId: accounts[0]?.id || null,
@@ -186,6 +214,42 @@ export function createDeepSearchService({ repos, mailService, logger = null } = 
       writeEvent(job, 'progress', progressSnapshot(job));
 
       const knownFolders = new Map();
+      const folderCounts = new Map();
+      const applyImapProgress = (progress = {}) => {
+        if (progress.accountId && Number(progress.folderCount) > 0) {
+          folderCounts.set(progress.accountId, Number(progress.folderCount));
+        }
+        if (progress.accountId && progress.mailbox) {
+          if (!knownFolders.has(progress.accountId)) knownFolders.set(progress.accountId, new Set());
+          knownFolders.get(progress.accountId).add(progress.mailbox);
+        } else if (progress.accountId && !knownFolders.has(progress.accountId)) {
+          knownFolders.set(progress.accountId, new Set());
+        }
+        const accountPlans = new Map(accounts.map((account) => [account.id, {
+          folderCount: folderCounts.get(account.id),
+          seen: knownFolders.get(account.id)?.size || 0,
+        }]));
+        const completedMailboxes = [...knownFolders.values()].reduce((sum, set) => sum + set.size, 0);
+        const work = estimateDeepSearchWork({
+          accountCount: accounts.length,
+          accountPlans,
+          completedMailboxes,
+        });
+        const listing = progress.phase === 'list' || !progress.mailbox;
+        job.progress = {
+          done: work.done,
+          total: work.total,
+          phase: 'imap',
+          label: progress.mailbox
+            ? `Searching ${progress.mailbox} on ${progress.email || 'account'}`
+            : listing
+              ? `Listing folders on ${progress.email || 'account'}`
+              : `Searching ${progress.email || 'account'}`,
+          accountId: progress.accountId || null,
+          mailbox: progress.mailbox || null,
+        };
+        writeEvent(job, 'progress', progressSnapshot(job));
+      };
       await mailService.searchAndMaterialize({
         accounts,
         parsed,
@@ -209,35 +273,7 @@ export function createDeepSearchService({ repos, mailService, logger = null } = 
             });
           }
         },
-        onProgress: (progress) => {
-          if (progress.mailbox && progress.accountId) {
-            const key = `${progress.accountId}:${progress.mailbox}`;
-            if (!knownFolders.has(progress.accountId)) knownFolders.set(progress.accountId, new Set());
-            knownFolders.get(progress.accountId).add(progress.mailbox);
-            const folderTotal = [...knownFolders.values()].reduce((sum, set) => sum + set.size, 0);
-            const listed = knownFolders.size;
-            job.progress = {
-              done: 1 + folderTotal,
-              total: Math.max(1 + folderTotal, 1 + listed + (accounts.length - listed)),
-              phase: 'imap',
-              label: progress.mailbox
-                ? `Searching ${progress.mailbox} on ${progress.email || 'account'}`
-                : `Searching ${progress.email || 'account'}`,
-              accountId: progress.accountId,
-              mailbox: progress.mailbox,
-            };
-          } else {
-            job.progress = {
-              ...job.progress,
-              done: 1 + (progress.accountIndex || 0) + 1,
-              total: 1 + (progress.accountCount || accounts.length),
-              phase: 'imap',
-              label: `Searching ${progress.email || 'account'}`,
-              accountId: progress.accountId,
-            };
-          }
-          writeEvent(job, 'progress', progressSnapshot(job));
-        },
+        onProgress: applyImapProgress,
       });
       if (job.abort.signal.aborted) {
         job.status = 'cancelled';
