@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api } from './api.js';
+import { api, streamSse } from './api.js';
 import { AccessPanel } from './components/AccessPanel.jsx';
 import { AddAccountModal } from './components/AddAccountModal.jsx';
 import { EditAccountModal } from './components/EditAccountModal.jsx';
@@ -17,6 +17,7 @@ import { Toast } from './components/ui.jsx';
 import { DEMO_PERSON_FLAGS, EMPTY_FOLDER_COUNTS, SMART_CATEGORIES, UNIFIED_ACCOUNT } from './mail/constants.js';
 import { demoAccounts, demoDraftThreads, demoMailboxThreads } from './mail/demo.js';
 import { normalizeFreshDraft, pruneDismissedFreshDrafts, visibleFreshDrafts } from './mail/fresh-drafts.js';
+import { querySupportsDeepSearch } from './mail/deep-search.js';
 import { countSmartCategories, filterVisibleThreads, findPersonFlag } from './mail/filter.js';
 import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.js';
 import { quotedComposeHtml } from './mail/html.js';
@@ -87,7 +88,11 @@ export default function App() {
   const demoDraftsSeededRef = useRef(false);
   const [savedDrafts, setSavedDrafts] = useState([]);
   const [dismissedFreshDrafts, setDismissedFreshDrafts] = useState(() => readDismissedFreshDrafts());
+  const [deepSearch, setDeepSearch] = useState(null);
+  const deepAbortRef = useRef(null);
+  const deepSearchRef = useRef(null);
   const canUsePasskeys = passkeysSupported();
+  deepSearchRef.current = deepSearch;
 
   const updateDensity = (value) => {
     setDensity(value);
@@ -214,7 +219,71 @@ export default function App() {
     setComposeOpen(true);
   };
 
+  const beginDeepSearch = useCallback(async ({ query: rawQuery, requestId, folder, accountId }) => {
+    if (!querySupportsDeepSearch(rawQuery, folder)) {
+      setDeepSearch(null);
+      return;
+    }
+    deepAbortRef.current?.abort();
+    const abort = new AbortController();
+    deepAbortRef.current = abort;
+    setDeepSearch({
+      status: 'running',
+      jobId: null,
+      progress: { done: 0, total: 1, ratio: 0, label: 'Starting deep search', found: 0 },
+    });
+    const params = new URLSearchParams({ q: rawQuery, folder: folder || 'inbox' });
+    if (accountId) params.set('accountId', accountId);
+    if (folder === 'inbox' && !activePersonFlag && activeCategory !== 'all') params.set('category', activeCategory);
+    if (activePersonFlag) params.set('flag', activePersonFlag);
+    try {
+      await streamSse(`/search/deep?${params.toString()}`, {
+        signal: abort.signal,
+        onEvent: ({ event, data }) => {
+          if (requestId !== loadRequestRef.current) return;
+          if (event === 'hello' || event === 'progress' || event === 'result' || event === 'done' || event === 'error') {
+            setDeepSearch((current) => ({
+              status: data?.status
+                || (event === 'done' ? (data?.cancelled ? 'cancelled' : 'complete') : event === 'error' ? 'error' : 'running'),
+              jobId: data?.jobId || current?.jobId || null,
+              progress: data?.progress || current?.progress || null,
+            }));
+          }
+          if ((event === 'hello' || event === 'result' || event === 'done') && Array.isArray(data?.messages)) {
+            const nextThreads = data.messages.map(normalizeThread);
+            setThreads(nextThreads);
+            setMailTotal(Number.isFinite(Number(data.total)) ? Number(data.total) : nextThreads.length);
+            if (data.categoryCounts && typeof data.categoryCounts === 'object') {
+              setCategoryCounts(Object.fromEntries(
+                SMART_CATEGORIES.filter((item) => item.id !== 'all').map((item) => [item.id, Number(data.categoryCounts[item.id] || 0)]),
+              ));
+            }
+          }
+        },
+      });
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      if (requestId === loadRequestRef.current) {
+        setDeepSearch((current) => (current
+          ? { ...current, status: 'error', progress: { ...current.progress, label: 'Deep search could not finish' } }
+          : null));
+      }
+    }
+  }, [activeCategory, activePersonFlag]);
+
+  const cancelDeepSearch = useCallback(() => {
+    deepAbortRef.current?.abort();
+    const jobId = deepSearchRef.current?.jobId;
+    if (jobId) {
+      api(`/search/deep/${encodeURIComponent(jobId)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    setDeepSearch((current) => (current ? { ...current, status: 'cancelled' } : null));
+  }, []);
+
   const loadMailbox = useCallback(async ({ keepSelection = true, silent = false } = {}) => {
+    deepAbortRef.current?.abort();
+    const previousJob = deepSearchRef.current?.jobId;
+    if (previousJob) api(`/search/deep/${encodeURIComponent(previousJob)}`, { method: 'DELETE' }).catch(() => {});
     const requestId = ++loadRequestRef.current;
     if (!silent) setLoading(true);
     try {
@@ -239,6 +308,7 @@ export default function App() {
         setFolderCounts({ ...EMPTY_FOLDER_COUNTS });
         setSelectedThread(null);
         setSavedDrafts([]);
+        setDeepSearch(null);
         return;
       }
       const params = new URLSearchParams({ folder: activeFolder });
@@ -313,6 +383,16 @@ export default function App() {
       // Functional update so an in-flight reload cannot close a thread opened after it started.
       const loadedThreads = isFreshSetup ? previewThreads : nextThreads;
       setSelectedThread((current) => reconcileSelectedThread(current, loadedThreads, { keepSelection }));
+      if (!isFreshSetup && querySupportsDeepSearch(debouncedQuery, activeFolder)) {
+        void beginDeepSearch({
+          query: debouncedQuery,
+          requestId,
+          folder: activeFolder,
+          accountId: activeAccount?.id,
+        });
+      } else {
+        setDeepSearch(null);
+      }
     } catch (error) {
       if (requestId !== loadRequestRef.current) return;
       if (error.status === 401 || error.status === 403) {
@@ -328,6 +408,7 @@ export default function App() {
         setFolderCounts({ ...EMPTY_FOLDER_COUNTS });
         setSelectedThread(null);
         setSavedDrafts([]);
+        setDeepSearch(null);
       } else {
         // Keep the last confirmed mailbox intact. Preview data is only enabled
         // after a successful zero-account response, never as an outage fallback.
@@ -337,7 +418,7 @@ export default function App() {
     } finally {
       if (requestId === loadRequestRef.current) setLoading(false);
     }
-  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, debouncedQuery, onboardingDismissed]);
+  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, beginDeepSearch, debouncedQuery, onboardingDismissed]);
 
   const lastChangeRef = useRef('');
   const liveSyncInboxes = useCallback(async ({ immediate } = {}) => {
@@ -502,6 +583,22 @@ export default function App() {
     drafts: folderCounts.drafts,
     unanalyzed: folderCounts.unanalyzed || 0,
   }), [folderCounts]);
+
+  const commitSearch = () => {
+    const next = query.trim();
+    if (next === debouncedQuery) {
+      if (!isDemo && querySupportsDeepSearch(next, activeFolder)) {
+        void beginDeepSearch({
+          query: next,
+          requestId: loadRequestRef.current,
+          folder: activeFolder,
+          accountId: activeAccount?.id,
+        });
+      }
+      return;
+    }
+    setDebouncedQuery(next);
+  };
 
   const goHome = () => {
     setActiveFolder('inbox');
@@ -1050,6 +1147,9 @@ export default function App() {
         searchRef={searchRef}
         account={displayAccount}
         isDemo={isDemo}
+        onCommitSearch={commitSearch}
+        deepSearchAvailable={!isDemo && querySupportsDeepSearch(query, activeFolder)}
+        deepSearchRunning={deepSearch?.status === 'running'}
       />
       <Sidebar
         compact={sidebarCompact}
@@ -1117,6 +1217,8 @@ export default function App() {
             onReply={(thread) => openReplyComposer(thread, thread.messages?.at(-1) || thread)}
             onForward={(thread) => openForwardComposer(thread, thread.messages?.at(-1) || thread)}
             onNotice={setNotice}
+            deepSearch={deepSearch}
+            onCancelDeepSearch={cancelDeepSearch}
           />
           {readerThread ? <ThreadView key={readerThread.id} thread={readerThread} activeFolder={activeFolder} onBack={() => setSelectedThread(null)} onAction={applyAction} onLoadRemote={loadRemoteContent} onReply={openReplyComposer} onReplyAll={(thread, message) => openReplyComposer(thread, message, { replyAll: true })} onForward={openForwardComposer} onToggleStar={toggleStar} onNotice={setNotice} allowPrivateImages={privacy.privateImages} /> : null}
         </div>

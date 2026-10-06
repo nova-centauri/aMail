@@ -188,7 +188,7 @@ test('attachment filenames are indexed and pruneBodies keeps existing FTS tokens
   assert.equal(stillFound.messages[0].id, conversation.id);
 });
 
-test('human leftover text searches the provider; MCP and analyzed filters stay cache-only', async (t) => {
+test('human leftover text stays cache-only; MCP in:anywhere still searches the provider', async (t) => {
   const { repos, add, thread } = fixture(t);
   add(thread('Cached'));
   const calls = [];
@@ -199,8 +199,7 @@ test('human leftover text searches the provider; MCP and analyzed filters stay c
     },
   };
   await listConversations(repos, { query: 'invoice', mailService, searchSource: 'human' });
-  assert.equal(calls.length, 1);
-  calls.length = 0;
+  assert.equal(calls.length, 0);
   await listConversations(repos, { query: 'invoice', mailService, searchSource: 'mcp' });
   assert.equal(calls.length, 0);
   await listConversations(repos, { query: 'invoice is:unanalyzed', mailService, searchSource: 'human' });
@@ -251,9 +250,9 @@ test('IMAP envelope hits join leftover-text pages and stay out of analyzed filte
     },
   };
   const page = await listConversations(repos, {
-    query: 'bodyonlyword',
+    query: 'in:anywhere bodyonlyword',
     mailService,
-    searchSource: 'human',
+    searchSource: 'mcp',
   });
   assert.equal(page.total, 1);
   assert.equal(page.messages[0].id, conversation.id);
@@ -325,7 +324,7 @@ test('Typesense pages are not clipped and analyzed text stays off IMAP', async (
   assert.equal(page.total, 1200);
   assert.equal(paging.offset, 1000);
   assert.equal(paging.limit, 50);
-  assert.equal(providerCalls.length, 1);
+  assert.equal(providerCalls.length, 0);
 
   providerCalls.length = 0;
   paging = null;
@@ -385,9 +384,9 @@ test('Typesense results still include IMAP hits that are not in the index', asyn
     },
   };
   const page = await listConversations(repos, {
-    query: 'bodyonlyword',
+    query: 'in:anywhere bodyonlyword',
     mailService,
-    searchSource: 'human',
+    searchSource: 'mcp',
   });
   assert.equal(page.total, 1);
   assert.equal(page.messages[0].id, conversation.id);

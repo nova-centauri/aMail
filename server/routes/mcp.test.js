@@ -303,6 +303,9 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     'list_accounts',
     'list_providers',
     'list_messages',
+    'start_deep_search',
+    'get_deep_search',
+    'cancel_deep_search',
     'list_unanalyzed_messages',
     'get_message',
     'get_analysis_status',
@@ -349,6 +352,33 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
   assert.equal(messagesPayload.total, 1);
   assert.equal(messagesPayload.messages[0].subject, 'Hello from MCP');
   assert.equal(messagesPayload.messages[0].from.email, 'friend@example.test');
+
+  const deepStart = await mcpRpc(origin, {
+    token: accessToken,
+    method: 'tools/call',
+    params: { name: 'start_deep_search', arguments: { q: 'Hello', pageSize: 20 } },
+    id: 31,
+  });
+  assert.equal(deepStart.response.status, 200);
+  const deepStarted = JSON.parse(deepStart.body.result.content[0].text);
+  assert.ok(deepStarted.jobId);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const deepPoll = await mcpRpc(origin, {
+    token: accessToken,
+    method: 'tools/call',
+    params: { name: 'get_deep_search', arguments: { jobId: deepStarted.jobId } },
+    id: 32,
+  });
+  const deepSnapshot = JSON.parse(deepPoll.body.result.content[0].text);
+  assert.ok(['running', 'complete'].includes(deepSnapshot.status));
+  assert.ok(deepSnapshot.progress.total >= 1);
+  const deepCancel = await mcpRpc(origin, {
+    token: accessToken,
+    method: 'tools/call',
+    params: { name: 'cancel_deep_search', arguments: { jobId: deepStarted.jobId } },
+    id: 33,
+  });
+  assert.ok(['cancelled', 'complete'].includes(JSON.parse(deepCancel.body.result.content[0].text).status));
 
   const secondMessage = repos.messages.upsert(messageInput({
     accountId: account.id, threadId: thread.id, uid: 2, subject: 'Another message in the thread',

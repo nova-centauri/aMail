@@ -7,6 +7,7 @@ import {
   classifyMailConnectionError,
   compileRfc822Message,
   createMailService,
+  discoverSearchMailboxes,
   discoverSyncMailboxes,
   sqliteConstraintReason,
 } from './mail-service.js';
@@ -1482,7 +1483,11 @@ function searchHarness({
     }
     async connect() {}
     async list() {
-      return [{ path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' }];
+      return [
+        { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
+        { path: 'Sent', name: 'Sent', specialUse: '\\Sent' },
+        { path: 'Receipts', name: 'Receipts' },
+      ];
     }
     async mailboxOpen() {}
     async getMailboxLock() {
@@ -1678,6 +1683,40 @@ test('a newer leftover-text search cancels the in-flight IMAP SEARCH', async () 
   assert.equal(secondResult.cancelled, false);
   assert.ok(state.searchQueries.some((query) => query.text === 'secondquery'));
   await service.close();
+});
+
+test('deep IMAP search walks extra folders in batches and reports progress', async () => {
+  const { service, state, account } = searchHarness({
+    messages: [historicalInvoice()],
+  });
+  const progress = [];
+  const hits = [];
+  const result = await service.searchAndMaterialize({
+    accounts: [{ id: account.id }],
+    parsed: parseMailboxQuery('invoice'),
+    folder: 'inbox',
+    mode: 'deep',
+    paceMs: 0,
+    onProgress: (event) => progress.push(event),
+    onHits: (event) => hits.push(event),
+  });
+  assert.equal(result.cancelled, false);
+  assert.ok(state.searchQueries.length >= 2);
+  assert.ok(progress.some((item) => item.mailbox === 'INBOX'));
+  assert.ok(progress.some((item) => item.mailbox === 'Sent' || item.mailbox === 'Receipts'));
+  assert.ok(hits.length >= 1);
+  assert.ok(result.threadIds.includes(state.savedMessages[0].threadId));
+  await service.close();
+});
+
+test('discoverSearchMailboxes includes custom folders after special-use ones', () => {
+  const descriptors = discoverSearchMailboxes([
+    { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
+    { path: 'Receipts', name: 'Receipts' },
+    { path: 'Sent', name: 'Sent', specialUse: '\\Sent' },
+    { path: 'Noselect', name: 'Noselect', flags: new Set(['\\Noselect']) },
+  ]);
+  assert.deepEqual(descriptors.map((item) => item.mailbox), ['INBOX', 'Sent', 'Receipts']);
 });
 
 test('discoverSyncMailboxes imports Drafts before All Mail', () => {

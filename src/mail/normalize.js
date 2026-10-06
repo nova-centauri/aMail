@@ -96,6 +96,9 @@ export function normalizeThread(raw, index = 0) {
     folder: inferFolder(raw),
     messageCount: raw.messageCount || raw.count || messages.length || 1,
     hasAttachments: Boolean(raw.hasAttachments || raw.attachments?.length || messages.some((message) => message.attachments.length)),
+    sourceImported: raw.sourceImported !== false,
+    providerHit: raw.sourceImported === false,
+    rfcMessageId: raw.messageId || raw.rfcMessageId || latest.rfcMessageId || null,
     messages: messages.length ? messages : [latest],
     ...classification,
   };

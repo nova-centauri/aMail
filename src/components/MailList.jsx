@@ -3,6 +3,7 @@ import { smartCategoryMetadata } from '../mail/classify.js';
 import { copyText, draftContextMenu, threadContextMenu } from '../mail/context-menu.js';
 import { formatListDate } from '../mail/dates.js';
 import { ContextMenu, useContextMenu } from './ContextMenu.jsx';
+import { DeepSearchProgress } from './DeepSearchProgress.jsx';
 import { FreshDraftsCard } from './FreshDraftsCard.jsx';
 import { Icon } from './Icon.jsx';
 import { Checkbox, IconButton } from './ui.jsx';
@@ -118,6 +119,7 @@ function ThreadRow({ thread, selected, isCursor, isChecked, isMenuTarget, onOpen
         {thread.analyzed === false && thread.folder !== 'drafts' && (
           <span className="analyzed-marker" title="No agent has analyzed this conversation yet" aria-label="Not yet analyzed by an agent"><Icon name="sparkles" size={14} /></span>
         )}
+        {thread.providerHit && <span className="provider-hit" title="Found on the mail server" aria-label="Found on the mail server"><Icon name="search" size={14} /></span>}
         {thread.hasAttachments && <Icon name="attachment" size={17} />}
         {thread.messageCount > 1 && <span className="thread-count">{thread.messageCount}</span>}
         <time>{formatListDate(thread.timestamp)}</time>
@@ -133,7 +135,7 @@ function EmptyMailbox({ folder, query, category = 'all', onCompose, onClearSearc
   const copy = agentQueue
     ? 'Your agent is caught up. New mail lands here until an agent marks it analyzed.'
     : query
-    ? 'Try from:, to:, subject:, has:attachment, is:unanalyzed, or a different search term.'
+    ? 'Try from:, to:, subject:, has:attachment, is:unanalyzed, or Deep search to look on the server for mail that is not downloaded yet.'
     : categoryDefinition && category !== 'all'
       ? `${categoryDefinition.description}. New matches will appear here automatically.`
     : folder === 'inbox'
@@ -160,7 +162,7 @@ function SkeletonRows() {
   );
 }
 
-export function MailList({ threads, totalCount, categoryCounts, selectedThread, cursorThreadId, loading, folder, query, activeCategory, setActiveCategory, selectedIds, setSelectedIds, onOpenThread, onToggleStar, onRefresh, onBulkAction, onCompose, onClearSearch, hideSmartFilters = false, freshDrafts = [], onOpenFreshDraft, onDismissFreshDraft, onDeleteFreshDraft, onViewAllDrafts, onReply, onForward, onNotice }) {
+export function MailList({ threads, totalCount, categoryCounts, selectedThread, cursorThreadId, loading, folder, query, activeCategory, setActiveCategory, selectedIds, setSelectedIds, onOpenThread, onToggleStar, onRefresh, onBulkAction, onCompose, onClearSearch, hideSmartFilters = false, freshDrafts = [], onOpenFreshDraft, onDismissFreshDraft, onDeleteFreshDraft, onViewAllDrafts, onReply, onForward, onNotice, deepSearch = null, onCancelDeepSearch }) {
   const allSelected = threads.length > 0 && threads.every((thread) => selectedIds.includes(thread.id));
   const toggleAll = () => setSelectedIds(allSelected ? [] : threads.map((thread) => thread.id));
   const toggleOne = (thread, checked) => setSelectedIds((current) => checked ? [...new Set([...current, thread.id])] : current.filter((id) => id !== thread.id));
@@ -211,7 +213,8 @@ export function MailList({ threads, totalCount, categoryCounts, selectedThread, 
         />
       )}
       {folder === 'inbox' && !hideSmartFilters && <SmartFilterBar activeCategory={activeCategory} onChange={setActiveCategory} visibleCount={threads.length} categoryCounts={categoryCounts} loading={loading} />}
-      {loading && !threads.length ? <SkeletonRows /> : threads.length ? (
+      {deepSearch ? <DeepSearchProgress progress={deepSearch.progress} status={deepSearch.status} onCancel={onCancelDeepSearch} /> : null}
+      {loading && !threads.length && deepSearch?.status !== 'running' ? <SkeletonRows /> : threads.length ? (
         <div className="thread-list" id="conversation-list" role="tabpanel">
           {threads.map((thread) => (
             <ThreadRow
@@ -227,6 +230,12 @@ export function MailList({ threads, totalCount, categoryCounts, selectedThread, 
               onContextMenu={openThreadMenu}
             />
           ))}
+        </div>
+      ) : deepSearch?.status === 'running' ? (
+        <div className="empty-state" role="status">
+          <div className="empty-icon"><Icon name="search" size={38} /></div>
+          <h2>Looking on the server</h2>
+          <p>Local matches appear first. Older mail streams in as each account and folder is searched.</p>
         </div>
       ) : (
         <EmptyMailbox folder={folder} query={query} category={activeCategory} onCompose={onCompose} onClearSearch={onClearSearch} onClearCategory={() => setActiveCategory('all')} onRefresh={onRefresh} />

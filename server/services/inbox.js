@@ -226,6 +226,7 @@ export async function listConversations(repos, {
   mailService = null,
   searchSource = 'cache',
   signal = null,
+  extraThreadIds: extraThreadIdsInput = null,
 } = {}) {
   const parsedQuery = parseMailboxQuery(String(queryInput || '').trim().slice(0, 800));
   const folder = normalizeFolder(parsedQuery.folder || folderInput);
@@ -239,9 +240,10 @@ export async function listConversations(repos, {
   const accounts = accountId ? [repos.accounts.get(accountId)].filter(Boolean) : repos.accounts.list();
   if (accountId && !accounts.length) throw new NotFoundError('Mail account not found.');
 
-  let extraThreadIds = [];
+  let extraThreadIds = Array.isArray(extraThreadIdsInput) ? extraThreadIdsInput.filter(Boolean) : [];
   if (
-    mailService?.searchAndMaterialize
+    !Array.isArray(extraThreadIdsInput)
+    && mailService?.searchAndMaterialize
     && shouldSearchProvider(parsedQuery, { source: searchSource, folder })
   ) {
     try {
