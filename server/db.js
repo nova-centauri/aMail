@@ -181,6 +181,7 @@ function publicDraft(row, { includeContent = true } = {}) {
       contentType: attachment?.contentType || 'application/octet-stream',
       size: Number(attachment?.size) || 0,
     };
+    if (attachment?.contentId || attachment?.cid) meta.contentId = attachment.contentId || attachment.cid;
     if (includeContent && attachment?.content) meta.content = attachment.content;
     return meta;
   });
