@@ -38,6 +38,17 @@ test('non-implicit TLS ports require STARTTLS before authentication', () => {
   assert.equal(imap.doSTARTTLS, true);
   assert.equal(imap.tls.rejectUnauthorized, true);
   assert.equal(imap.disableAutoIdle, true);
+  assert.equal(imap.proxy, undefined);
+  assert.equal(imap.proxyUrl, undefined);
+  assert.equal(Object.hasOwn(imap, 'proxy'), false);
+  const pooled = buildImapOptions(account, credentials, {
+    ...config,
+    remoteContentProxyUrl: 'http://tor-proxy:8118',
+  }, { pooled: true });
+  assert.equal(pooled.disableAutoIdle, false);
+  assert.equal(pooled.proxy, undefined);
+  assert.equal(Object.hasOwn(pooled, 'proxy'), false);
+  assert.equal(smtp.proxy, undefined);
   assert.equal(smtp.secure, false);
   assert.equal(smtp.requireTLS, true);
   assert.equal(smtp.tls.rejectUnauthorized, true);
@@ -181,10 +192,8 @@ function syncHarness({
     checkpoints: 0,
     logs: [],
   };
-  const mailboxMessages = messagesByMailbox
-    ? Object.values(messagesByMailbox).flat()
-    : [];
-  const latestUid = Math.max(0, ...messages.map((message) => message.uid), ...mailboxMessages.map((message) => message.uid));
+  state.messages = messages;
+  state.sources = sources;
   class FakeImapClient extends EventEmitter {
     constructor() {
       super();
@@ -215,7 +224,10 @@ function syncHarness({
     async getMailboxLock(path) {
       this.assertIdle('SELECT');
       this.lockedMailbox = path;
-      this.mailbox = { uidValidity, uidNext: latestUid + 1 };
+      const pool = messagesByMailbox ? (messagesByMailbox[path] || []) : state.messages;
+      const maxUid = pool.reduce((max, message) => Math.max(max, Number(message.uid) || 0), 0);
+      this.mailbox = { uidValidity, uidNext: maxUid + 1 };
+      state.onLock?.(this, path);
       return { release() {} };
     }
     async *fetch(range, query, options) {
@@ -227,7 +239,7 @@ function syncHarness({
       });
       const pool = messagesByMailbox
         ? (messagesByMailbox[this.lockedMailbox] || [])
-        : messages;
+        : state.messages;
       const matches = pool.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
       if (fetchHangs) {
         this.fetching = true;
@@ -542,6 +554,88 @@ test('a hung IMAP session is closed at the deadline and does not block later syn
   const [again] = await service.syncAll({ force: true });
   assert.equal(again.error, 'IMAP_SYNC_TIMEOUT');
   assert.equal(state.connects, 2);
+  await service.close();
+});
+
+test('an unchanged inbox probe checks UIDNEXT and does not download bodies', async () => {
+  const { service, state } = syncHarness({
+    ...mailboxOf([1]),
+    maxMessageBytes: 4096,
+    syncMinIntervalMs: 60_000,
+    previousSync: { last_uid: 1, uid_validity: 41 },
+  });
+
+  const result = await service.probeInboxes();
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].probed, true);
+  assert.equal(result[0].changed, false);
+  assert.equal(result[0].imported, 0);
+  assert.equal(state.fetchCalls.length, 0);
+  assert.equal(state.fetchOneCalls.length, 0);
+  assert.equal(state.savedMessages.length, 0);
+  assert.equal(state.savedSync, null);
+  await service.close();
+});
+
+test('an inbox probe downloads bodies only for UIDs above the high-water mark', async () => {
+  const { service, state } = syncHarness({
+    ...mailboxOf([1, 2, 3]),
+    maxMessageBytes: 4096,
+    syncMinIntervalMs: 60_000,
+    previousSync: { last_uid: 1, uid_validity: 41 },
+  });
+
+  const [result] = await service.probeInboxes();
+
+  assert.equal(result.changed, true);
+  assert.equal(result.imported, 2);
+  assert.deepEqual(state.savedMessages.map((message) => message.uid), [2, 3]);
+  assert.equal(state.fetchCalls.some((call) => call.query.source && call.range === '1'), false);
+  assert.ok(state.fetchCalls.some((call) => call.query.source && String(call.range).includes('2')));
+  await service.close();
+});
+
+test('IMAP IDLE wake imports mail that arrived inside the full-sync floor', async () => {
+  const box = mailboxOf([1]);
+  const { service, state } = syncHarness({
+    ...box,
+    maxMessageBytes: 4096,
+    syncMinIntervalMs: 60_000,
+  });
+  await service.syncAccount('sync-account');
+  assert.equal(state.savedMessages.length, 1);
+  const fetchesBeforeWake = state.fetchCalls.length;
+
+  state.messages.push({ uid: 2, size: plainSource(2).length });
+  state.sources.set(2, plainSource(2));
+  state.clients[0].emit('exists', { count: 2 });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.deepEqual(state.savedMessages.map((message) => message.uid), [1, 2]);
+  assert.ok(state.fetchCalls.length > fetchesBeforeWake);
+  assert.ok(state.fetchCalls.slice(fetchesBeforeWake).some((call) => call.query.source));
+  await service.close();
+});
+
+test('an IDLE wake during a sync is not dropped', async () => {
+  const box = mailboxOf([1]);
+  const { service, state } = syncHarness({
+    ...box,
+    maxMessageBytes: 4096,
+    syncMinIntervalMs: 60_000,
+  });
+  state.onLock = (client) => {
+    if (state.messages.some((message) => message.uid === 2)) return;
+    state.messages.push({ uid: 2, size: plainSource(2).length });
+    state.sources.set(2, plainSource(2));
+    client.emit('exists', { count: 2 });
+  };
+
+  await service.syncAccount('sync-account');
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  assert.deepEqual(state.savedMessages.map((message) => message.uid), [1, 2]);
   await service.close();
 });
 

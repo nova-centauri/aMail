@@ -28,7 +28,7 @@ describe('nextLiveSyncDelayMs', () => {
   it('polls quickly while focused and relaxes in the background', () => {
     expect(nextLiveSyncDelayMs(true)).toBe(FOCUSED_SYNC_INTERVAL_MS);
     expect(nextLiveSyncDelayMs(false)).toBe(BACKGROUND_SYNC_INTERVAL_MS);
-    expect(FOCUSED_SYNC_INTERVAL_MS).toBe(60_000);
+    expect(FOCUSED_SYNC_INTERVAL_MS).toBe(20_000);
     expect(LIVE_SYNC_MAX_AGE_SECONDS).toBe(60);
     expect(BACKGROUND_SYNC_INTERVAL_MS).toBe(5 * 60_000);
   });

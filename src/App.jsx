@@ -435,6 +435,8 @@ export default function App() {
       } else {
         const since = lastChangeRef.current;
         const query = since ? `?since=${encodeURIComponent(since)}` : '';
+        // Local cache only. IMAP IDLE and the server's inbox probe import new
+        // mail; this tick just notices that the cache changed.
         const payload = await api(`/changes${query}`);
         if (payload?.changedAt) lastChangeRef.current = payload.changedAt;
         reload = Boolean(payload?.changed);

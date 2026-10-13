@@ -29,6 +29,11 @@ import {
   storedAttachmentRecords,
 } from './compose-attachments.js';
 import {
+  IDLE_WAKE_COALESCE_MS,
+  INBOX_BACKLOG_DELAY_MS,
+  imapAutoIdleEnabled,
+} from '../mail/receipt-path.js';
+import {
   IMAP_DEEP_ACCOUNT_GAP_MS,
   IMAP_DEEP_BATCH_GAP_MS,
   IMAP_DEEP_ENVELOPE_BATCH,
@@ -170,8 +175,9 @@ export function buildImapOptions(account, credentials, config, { pooled = false 
     logger: false,
     socketTimeout: pooled ? Math.max(config.syncTimeoutMs, poolIdleMs + 60_000) : config.syncTimeoutMs,
     tls: { rejectUnauthorized: !config.allowInsecureTls },
-    // One-shot connections log out immediately; pooled ones keep INBOX selected
-    // so ImapFlow's auto-IDLE can push new mail without a reconnect.
+    // One-shot connections log out immediately. Pooled ones keep INBOX selected
+    // so ImapFlow can IDLE. Never copy REMOTE_CONTENT_PROXY_URL onto this
+    // session: mailbox sync and send stay on the provider network.
     disableAutoIdle: !pooled,
   };
 }
@@ -529,6 +535,12 @@ export function createMailService({
   const syncConcurrency = Number.isSafeInteger(config.syncConcurrency) && config.syncConcurrency > 0
     ? config.syncConcurrency
     : DEFAULT_SYNC_CONCURRENCY;
+  const inboxProbeTimers = new Map();
+  const inboxProbeInFlight = new Map();
+  const inboxFollowUp = new Set();
+  const probeWaiters = [];
+  let probeSlots = 0;
+  let closed = false;
 
   function clearPoolTimer(entry) {
     if (entry?.closeTimer) {
@@ -586,6 +598,12 @@ export function createMailService({
       await client.connect();
       assertAccountGeneration(account.id, generation);
       if (failedImapClients.has(client)) throw new Error('IMAP connection closed during setup');
+      // Unknown capabilities still try IDLE. A server that lists its
+      // capabilities and omits IDLE stays on the UIDNEXT probe.
+      if (!imapAutoIdleEnabled({ pooled: true, capabilities: client.capabilities })) {
+        // ImapFlow reads this off the options object, not a later own-property.
+        if (client.options) client.options.disableAutoIdle = true;
+      }
     } catch (error) {
       // A failed connection never enters the pool; close any partially opened
       // socket while retaining its error listener for late teardown events.
@@ -606,10 +624,12 @@ export function createMailService({
       onExists: null,
     };
     entry.onExists = () => {
-      if (!entry.usable || entry.refs > 0) return;
-      void syncAccount(account.id, { maxAgeMs: config.syncMinIntervalMs || 0 }).catch((error) => {
-        logger.warn({ accountId: account.id, err: cleanupError(error) }, 'IMAP IDLE wake could not synchronize');
-      });
+      if (!entry.usable) return;
+      // A wake during a command must not be dropped: EXISTS is not repeated
+      // for the same count, and the sync floor must not swallow it.
+      entry.idlePending = true;
+      if (entry.refs > 0) return;
+      scheduleInboxProbe(account.id);
     };
     client.on?.('exists', entry.onExists);
     imapPool.set(account.id, entry);
@@ -622,6 +642,10 @@ export function createMailService({
     entry.refs = Math.max(0, entry.refs - 1);
     if (entry.refs > 0) return;
     entry.lastUsed = Date.now();
+    if (entry.idlePending) {
+      entry.idlePending = false;
+      scheduleInboxProbe(accountId);
+    }
     if (poolIdleMs <= 0) {
       void evictPoolEntry(accountId);
       return;
@@ -1275,6 +1299,163 @@ export function createMailService({
     return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
   };
 
+  function scheduleInboxProbe(accountId, delayMs = IDLE_WAKE_COALESCE_MS) {
+    if (closed || inboxProbeTimers.has(accountId)) return;
+    const timer = setTimeout(() => {
+      inboxProbeTimers.delete(accountId);
+      void probeAccountInbox(accountId).catch((error) => {
+        logger.warn({ accountId, err: cleanupError(error) }, 'IMAP inbox probe failed');
+      });
+    }, delayMs);
+    timer.unref?.();
+    inboxProbeTimers.set(accountId, timer);
+  }
+
+  function withProbeSlot(work) {
+    const start = () => {
+      probeSlots += 1;
+      return Promise.resolve()
+        .then(work)
+        .finally(() => {
+          probeSlots -= 1;
+          const resume = probeWaiters.shift();
+          if (resume) resume();
+        });
+    };
+    if (probeSlots < syncConcurrency) return start();
+    return new Promise((resolve, reject) => {
+      probeWaiters.push(() => {
+        start().then(resolve, reject);
+      });
+    });
+  }
+
+  async function runInboxProbe(accountId) {
+    const generation = accountGeneration(accountId);
+    for (const key of accountInFlight.keys()) {
+      if (!key.startsWith(`${accountId}\u0000`)) continue;
+      const pooled = imapPool.get(accountId);
+      if (pooled) pooled.idlePending = true;
+      else scheduleInboxProbe(accountId, INBOX_BACKLOG_DELAY_MS);
+      return { accountId, status: 'deferred', changed: false, imported: 0, probed: false };
+    }
+
+    let account;
+    let credentials;
+    try {
+      ({ account, credentials } = accountAndCredentials(accountId));
+    } catch (error) {
+      return { accountId, status: 'failed', changed: false, imported: 0, error: error.code || 'IMAP_SYNC_FAILED' };
+    }
+    if (!account.sync_enabled) {
+      return { accountId, skipped: true, changed: false, imported: 0, probed: false };
+    }
+
+    let entry;
+    try {
+      entry = await acquirePooledClient(account, credentials);
+    } catch (error) {
+      logger.warn({ accountId, err: cleanupError(error) }, 'IMAP inbox probe could not connect');
+      return { accountId, status: 'failed', changed: false, imported: 0, error: 'IMAP_SYNC_FAILED' };
+    }
+    // This probe observes wakes that arrived before the SELECT. A wake during
+    // the SELECT is recorded again and runs once more after release.
+    entry.idlePending = false;
+    try {
+      assertAccountGeneration(accountId, generation);
+      const folders = await pooledList(entry);
+      const descriptor = discoverSyncMailboxes(folders).find((item) => item.role === 'inbox')
+        || { mailbox: 'INBOX', role: 'inbox', allMailMirror: false };
+      let lock;
+      let latestUid = 0;
+      try {
+        lock = await entry.client.getMailboxLock(descriptor.mailbox);
+        assertAccountGeneration(accountId, generation);
+        const uidNext = Number(entry.client.mailbox?.uidNext || 0);
+        latestUid = Math.max(0, uidNext - 1);
+      } finally {
+        lock?.release();
+      }
+      const previous = repos.sync.get(account.id, descriptor.mailbox);
+      const lastUid = Number(previous?.last_uid) || 0;
+      // UIDNEXT is enough to notice mail. Bodies are fetched only for UIDs
+      // above the high-water mark, and only after this check says the box moved.
+      if (latestUid <= lastUid) {
+        return { accountId, mailbox: descriptor.mailbox, status: 'ok', changed: false, imported: 0, probed: true };
+      }
+      const summary = await syncMailbox({
+        account,
+        client: entry.client,
+        descriptor,
+        limit: config.syncBatchSize,
+        generation,
+      });
+      return {
+        accountId,
+        mailbox: descriptor.mailbox,
+        status: summary.status,
+        changed: (summary.imported || 0) > 0 || (summary.remaining || 0) > 0,
+        imported: summary.imported || 0,
+        remaining: summary.remaining || 0,
+        probed: true,
+      };
+    } catch (error) {
+      if (imapPool.get(account.id) === entry) await evictPoolEntry(account.id);
+      logger.warn({ accountId, err: cleanupError(error) }, 'IMAP inbox probe failed');
+      return { accountId, status: 'failed', changed: false, imported: 0, error: error.code || 'IMAP_SYNC_FAILED' };
+    } finally {
+      if (imapPool.get(account.id) === entry) releasePooledClient(account.id);
+    }
+  }
+
+  async function probeAccountInbox(accountId) {
+    if (closed) return { accountId, status: 'skipped', changed: false, imported: 0, probed: false };
+    const existing = inboxProbeInFlight.get(accountId);
+    if (existing) {
+      inboxFollowUp.add(accountId);
+      return existing;
+    }
+    const promise = (async () => {
+      try {
+        return await withProbeSlot(() => runInboxProbe(accountId));
+      } finally {
+        inboxProbeInFlight.delete(accountId);
+      }
+    })();
+    inboxProbeInFlight.set(accountId, promise);
+    const result = await promise;
+    if ((result?.remaining || 0) > 0 && !closed) scheduleInboxProbe(accountId, INBOX_BACKLOG_DELAY_MS);
+    if (inboxFollowUp.delete(accountId) && !closed) return probeAccountInbox(accountId);
+    return result;
+  }
+
+  async function probeInboxes() {
+    const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
+    const results = new Array(accounts.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < accounts.length) {
+        const index = next;
+        next += 1;
+        const account = accounts[index];
+        try {
+          results[index] = await probeAccountInbox(account.id);
+        } catch (error) {
+          results[index] = {
+            accountId: account.id,
+            status: 'failed',
+            changed: false,
+            imported: 0,
+            error: error.code || 'IMAP_SYNC_FAILED',
+          };
+        }
+      }
+    };
+    const workers = Math.min(syncConcurrency, accounts.length);
+    if (workers > 0) await Promise.all(Array.from({ length: workers }, worker));
+    return results;
+  }
+
   async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false } = {}) {
     const key = syncKey({ mailbox, limit });
     while (inFlightSync) {
@@ -1299,6 +1480,10 @@ export function createMailService({
   }
 
   async function close() {
+    closed = true;
+    for (const timer of inboxProbeTimers.values()) clearTimeout(timer);
+    inboxProbeTimers.clear();
+    inboxFollowUp.clear();
     const ids = [...imapPool.keys()];
     await Promise.all(ids.map((id) => evictPoolEntry(id)));
   }
@@ -1319,6 +1504,10 @@ export function createMailService({
     poolConnecting.delete(accountId);
     for (const key of accountInFlight.keys()) if (key.startsWith(`${accountId}\u0000`)) accountInFlight.delete(key);
     for (const key of accountLastSync.keys()) if (key.startsWith(`${accountId}\u0000`)) accountLastSync.delete(key);
+    const probeTimer = inboxProbeTimers.get(accountId);
+    if (probeTimer) clearTimeout(probeTimer);
+    inboxProbeTimers.delete(accountId);
+    inboxFollowUp.delete(accountId);
     // Small transient caches contain message ids, so clear them conservatively.
     attachmentCache.clear();
     attachmentFetches.clear();
@@ -2052,5 +2241,5 @@ export function createMailService({
     }
   }
 
-  return { syncAccount, syncAll, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, hydrateMessageSource, searchAndMaterialize, invalidateAccount, close };
+  return { syncAccount, syncAll, probeInboxes, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, hydrateMessageSource, searchAndMaterialize, invalidateAccount, close };
 }

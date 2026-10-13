@@ -135,9 +135,10 @@ export function loadConfig(env = process.env) {
     // Keep one IMAP TCP session per account this long after the last use so
     // the next pass skips the TLS handshake. 0 logs out immediately (tests).
     imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),
-    // 0 disables background polling. Hosted defaults to 15. A focused tab
-    // polls GET /api/changes; IMAP IDLE on the pooled INBOX connection is the
-    // push path for new mail between polls.
+    // 0 disables background polling. Otherwise this is the full-folder pass
+    // (Sent, Drafts, and the rest). New inbox mail does not wait for it:
+    // pooled IMAP IDLE pushes, and a 60-second UIDNEXT probe is the fallback.
+    // Hosted defaults the full pass to 15 minutes.
     syncIntervalMinutes: integer(
       readEnv(env, 'SYNC_INTERVAL_MINUTES', env.SYNC_INTERVAL_MINUTES),
       keyslotMode ? 15 : 0,

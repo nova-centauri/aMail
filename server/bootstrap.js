@@ -9,6 +9,7 @@ import { createVault } from './vault.js';
 import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
 import { createSearchEngine } from './services/search-engine.js';
+import { backgroundReceiptPlan, INBOX_PROBE_START_DELAY_MS } from './mail/receipt-path.js';
 
 const BACKLOG_DRAIN_DELAY_MS = 5_000;
 
@@ -24,10 +25,13 @@ const BACKLOG_DRAIN_DELAY_MS = 5_000;
 export function createHarness({ config, logger }) {
   const metering = createMeteringService({ config, logger });
   let pollTimer = null;
+  let probeTimer = null;
+  let probeStartTimer = null;
   let drainTimer = null;
 
   function startPolling(mailService) {
-    if (pollTimer || config.syncIntervalMinutes <= 0) return;
+    const plan = backgroundReceiptPlan(config);
+    if (pollTimer || !plan.enabled) return;
     const poll = ({ force = false } = {}) => mailService.syncAll({ maxAgeMs: config.syncMinIntervalMs || 0, force })
       .then((results) => {
         // A pass that ran out of budget with mail still waiting continues
@@ -42,15 +46,32 @@ export function createHarness({ config, logger }) {
         }
       })
       .catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
-    pollTimer = setInterval(poll, config.syncIntervalMinutes * 60_000);
+    const probe = () => mailService.probeInboxes()
+      .catch((error) => logger.warn({ err: error }, 'Inbox probe failed'));
+    // IDLE on the pooled INBOX connection is the fast path. This probe is the
+    // fallback: one UIDNEXT check per account, no body download unless the
+    // mailbox moved. The full-folder interval stays the slow pass.
+    probeStartTimer = setTimeout(probe, INBOX_PROBE_START_DELAY_MS);
+    probeStartTimer.unref();
+    probeTimer = setInterval(probe, plan.inboxProbeMs);
+    probeTimer.unref();
+    pollTimer = setInterval(poll, plan.fullSyncMs);
     pollTimer.unref();
-    logger.info({ intervalMinutes: config.syncIntervalMinutes }, 'Background IMAP polling enabled');
+    logger.info({
+      inboxProbeSeconds: plan.inboxProbeMs / 1000,
+      fullSyncMinutes: plan.fullSyncMs / 60_000,
+      preferIdle: plan.preferIdle,
+    }, 'Background inbox watch enabled');
   }
 
   function stopPolling() {
     if (pollTimer) clearInterval(pollTimer);
+    if (probeTimer) clearInterval(probeTimer);
+    if (probeStartTimer) clearTimeout(probeStartTimer);
     if (drainTimer) clearTimeout(drainTimer);
     pollTimer = null;
+    probeTimer = null;
+    probeStartTimer = null;
     drainTimer = null;
   }
 
