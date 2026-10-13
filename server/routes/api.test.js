@@ -252,6 +252,20 @@ test('message API filters unified mail by smart category and account creation is
   const loadedDraft = await fetch(`${origin}/api/drafts/${createdDraftBody.draft.id}`);
   assert.equal((await loadedDraft.json()).draft.attachments[0].content, draftContent);
 
+  const closedLocal = await fetch(`${origin}/api/drafts/${createdDraftBody.draft.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      subject: 'Draft with file',
+      textBody: 'Working copy',
+      attachments: [{ filename: 'notes.txt', contentType: 'text/plain', size: 11 }],
+    }),
+  });
+  assert.equal(closedLocal.status, 200);
+  const closedLocalBody = await closedLocal.json();
+  assert.equal(closedLocalBody.draft.attachments[0].content, draftContent);
+  assert.equal(closedLocalBody.draft.attachments[0].filename, 'notes.txt');
+
   const providerDraft = repos.messages.upsert({
     ...messageInput({
       accountId: account.id,
@@ -290,6 +304,37 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(all.folderCounts.starred, 0);
   assert.equal(all.folderCounts.drafts, 2);
   assert.equal(all.messages.some((message) => message.subject === 'Q3 budget notes'), false);
+
+  const providerWithFile = repos.messages.upsert({
+    ...messageInput({
+      accountId: account.id,
+      threadId: threadIds[0],
+      uid: 91,
+      subject: 'Quote follow-up',
+      fromEmail: 'owner@example.test',
+      timestamp: '2026-02-02T00:00:00.000Z',
+    }),
+    mailbox: '[Gmail]/Drafts',
+    is_draft: 1,
+    is_read: 1,
+    text_body: 'See the attached quote.',
+    attachments_json: JSON.stringify([{ index: 0, filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }]),
+  });
+  const closedProvider = await fetch(`${origin}/api/drafts/${providerWithFile.id}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      subject: 'Quote follow-up',
+      textBody: 'See the attached quote.',
+      attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }],
+    }),
+  });
+  assert.equal(closedProvider.status, 201);
+  const closedProviderBody = await closedProvider.json();
+  assert.equal(closedProviderBody.draft.attachments[0].filename, 'quote.pdf');
+  assert.equal(closedProviderBody.draft.attachments[0].content, undefined);
+  assert.equal(repos.messages.get(providerWithFile.id).isTrashed, false);
+  assert.equal((await (await fetch(`${origin}/api/drafts/${createdDraftBody.draft.id}`)).json()).draft.attachments[0].content, draftContent);
 
   // Routine ops digests stay out of the default inbox even when unread. Errors
   // surface in the dedicated Ops errors smart view.

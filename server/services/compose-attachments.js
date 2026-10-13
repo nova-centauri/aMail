@@ -45,17 +45,36 @@ export function publicAttachmentMeta(attachment, index = 0) {
   };
 }
 
-export function normalizeComposeAttachments(raw) {
-  if (raw == null) return [];
+function assertAttachmentList(raw) {
   if (!Array.isArray(raw)) throw new ValidationError('Attachments must be an array.');
   if (raw.length > MAX_COMPOSE_ATTACHMENT_COUNT) {
     throw new ValidationError(`Attach at most ${MAX_COMPOSE_ATTACHMENT_COUNT} files.`);
   }
+}
+
+function contentBuffer(item) {
+  return decodeBase64Content(item?.content || item?.data);
+}
+
+function attachmentRecord({ index, filename, contentType, size, content, contentId }) {
+  const record = { index, filename, contentType, size };
+  if (content) record.content = content;
+  if (contentId) record.contentId = contentId;
+  return record;
+}
+
+function storedFilename(item) {
+  return asciiFilename(item?.filename || item?.name);
+}
+
+export function normalizeComposeAttachments(raw) {
+  if (raw == null) return [];
+  assertAttachmentList(raw);
   let total = 0;
   return raw.map((item, index) => {
-    const filename = asciiFilename(item?.filename || item?.name);
+    const filename = storedFilename(item);
     const contentType = safeAttachmentType(item?.contentType || item?.type);
-    const buffer = decodeBase64Content(item?.content || item?.data);
+    const buffer = contentBuffer(item);
     if (!buffer) throw new ValidationError(`Attachment ${index + 1} is missing file bytes.`);
     if (buffer.length > MAX_COMPOSE_ATTACHMENT_BYTES) {
       throw new ValidationError(`${filename} is larger than 8 MB.`);
@@ -64,13 +83,84 @@ export function normalizeComposeAttachments(raw) {
     if (total > MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES) {
       throw new ValidationError('Attached files together must stay under 8 MB.');
     }
-    return {
+    return attachmentRecord({
       index,
       filename,
       contentType,
       size: buffer.length,
       content: buffer.toString('base64'),
-    };
+      contentId: item?.contentId || item?.cid || null,
+    });
+  });
+}
+
+/**
+ * Save path for a draft that is already open. New uploads still need bytes.
+ * Parts the composer already has — stored compose bytes, or provider metadata
+ * that never included bytes — are kept so closing the draft does not fail.
+ */
+export function mergeDraftAttachments(incoming, existing = []) {
+  if (incoming == null) return [];
+  assertAttachmentList(incoming);
+  const pool = (Array.isArray(existing) ? existing : []).map((item, index) => ({
+    item,
+    index: Number.isInteger(item?.index) ? item.index : index,
+    filename: storedFilename(item),
+    used: false,
+  }));
+  const claimStored = (item, index) => {
+    const filename = storedFilename(item);
+    const wantedIndex = Number.isInteger(item?.index) ? item.index : index;
+    const available = pool.filter((entry) => !entry.used && entry.filename === filename);
+    const match = available.find((entry) => entry.index === wantedIndex) || available[0] || null;
+    if (match) match.used = true;
+    return match?.item || null;
+  };
+  let uploadedBytes = 0;
+  return incoming.map((item, index) => {
+    const filename = storedFilename(item);
+    const presented = item?.content ?? item?.data;
+    const buffer = contentBuffer(item);
+    if (presented != null && presented !== '' && !buffer) {
+      throw new ValidationError(`Attachment ${index + 1} is missing file bytes.`);
+    }
+    if (buffer) {
+      if (buffer.length > MAX_COMPOSE_ATTACHMENT_BYTES) {
+        throw new ValidationError(`${filename} is larger than 8 MB.`);
+      }
+      uploadedBytes += buffer.length;
+      if (uploadedBytes > MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES) {
+        throw new ValidationError('Attached files together must stay under 8 MB.');
+      }
+      return attachmentRecord({
+        index,
+        filename,
+        contentType: safeAttachmentType(item?.contentType || item?.type),
+        size: buffer.length,
+        content: buffer.toString('base64'),
+        contentId: item?.contentId || item?.cid || null,
+      });
+    }
+    const stored = claimStored(item, index);
+    const storedBuffer = stored ? contentBuffer(stored) : null;
+    if (storedBuffer) {
+      return attachmentRecord({
+        index,
+        filename,
+        contentType: safeAttachmentType(stored.contentType || item?.contentType || item?.type),
+        size: storedBuffer.length,
+        content: storedBuffer.toString('base64'),
+        contentId: item?.contentId || item?.cid || stored.contentId || stored.cid || null,
+      });
+    }
+    const declared = Number(item?.size ?? stored?.size);
+    return attachmentRecord({
+      index,
+      filename,
+      contentType: safeAttachmentType(item?.contentType || item?.type || stored?.contentType),
+      size: Number.isFinite(declared) && declared >= 0 ? declared : 0,
+      contentId: item?.contentId || item?.cid || stored?.contentId || stored?.cid || null,
+    });
   });
 }
 

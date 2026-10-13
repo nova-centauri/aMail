@@ -18,7 +18,7 @@ import {
   discoverAccountProvider,
   mailProviderCatalog,
 } from '../utils/mail.js';
-import { normalizeComposeAttachments } from '../services/compose-attachments.js';
+import { mergeDraftAttachments, normalizeComposeAttachments } from '../services/compose-attachments.js';
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
@@ -626,7 +626,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
         subject: String(body.subject ?? synced.subject ?? '').slice(0, 998),
         html_body: sanitizeComposeHtml(body.htmlBody ?? synced.htmlBody).slice(0, 1_000_000),
         text_body: String(body.textBody ?? synced.textBody ?? '').slice(0, 1_000_000),
-        attachments_json: JSON.stringify(normalizeComposeAttachments(body.attachments || synced.attachments || [])),
+        attachments_json: JSON.stringify(mergeDraftAttachments(body.attachments ?? synced.attachments ?? [], synced.attachments || [])),
       });
       response.status(201).json({ draft });
       return;
@@ -640,7 +640,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       subject: String(body.subject ?? existing.subject).slice(0, 998),
       html_body: sanitizeComposeHtml(body.htmlBody ?? existing.htmlBody).slice(0, 1_000_000),
       text_body: String(body.textBody ?? existing.textBody).slice(0, 1_000_000),
-      ...(body.attachments !== undefined ? { attachments_json: JSON.stringify(normalizeComposeAttachments(body.attachments)) } : {}),
+      ...(body.attachments !== undefined ? { attachments_json: JSON.stringify(mergeDraftAttachments(body.attachments, existing.attachments || [])) } : {}),
     });
     response.json({ draft });
   });
