@@ -97,6 +97,84 @@ describe('ComposeModal', () => {
     expect(screen.getByDisplayValue('Design follow-up')).toBeInTheDocument();
   });
 
+  it('keeps the composer open and the typed text when the mailbox around it reloads', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const props = {
+      account,
+      accounts: [account],
+      contacts,
+      isDemo: true,
+      onClose,
+      onSent: vi.fn(),
+      onDraftSaved: vi.fn(),
+      onDraftRemoved: vi.fn(),
+    };
+    const { rerender } = render(<ComposeModal {...props} />);
+    const body = screen.getByRole('textbox', { name: 'Message body' });
+    await user.click(body);
+    await user.type(body, 'Still writing');
+    rerender(<ComposeModal {...props} contacts={[...contacts, { name: 'New', email: 'new@example.test' }]} accounts={[{ ...account }]} />);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: 'New message' })).toBeInTheDocument();
+    expect(body).toHaveTextContent('Still writing');
+    expect(api).not.toHaveBeenCalled();
+  });
+
+  it('does not close while a recipient suggestion is dismissed, and Enter in the subject does not send', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const onSent = vi.fn();
+    render(
+      <ComposeModal
+        account={account}
+        accounts={[account]}
+        contacts={contacts}
+        isDemo
+        onClose={onClose}
+        onSent={onSent}
+        onDraftSaved={vi.fn()}
+        onDraftRemoved={vi.fn()}
+      />,
+    );
+    await user.type(screen.getByLabelText('Recipients'), 'may');
+    expect(await screen.findByRole('option', { name: /Maya Chen/i })).toBeInTheDocument();
+    await user.keyboard('{Escape}');
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog', { name: 'New message' })).toBeInTheDocument();
+    await user.type(screen.getByLabelText('Subject'), 'Notes{Enter}');
+    expect(onSent).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByDisplayValue('Notes')).toBeInTheDocument();
+  });
+
+  it('fills an empty draft from a later payload and does not wipe text already typed', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const base = {
+      account,
+      accounts: [account],
+      contacts,
+      isDemo: true,
+      onClose,
+      onSent: vi.fn(),
+      onDraftSaved: vi.fn(),
+      onDraftRemoved: vi.fn(),
+    };
+    const { rerender } = render(<ComposeModal {...base} initialReply={{ mode: 'draft', draftId: 'd1', subject: 'Hello', htmlBody: '' }} />);
+    rerender(<ComposeModal {...base} initialReply={{ mode: 'draft', draftId: 'd1', subject: 'Hello', htmlBody: '<p>Filled from the cache.</p>' }} />);
+    expect(await screen.findByText('Filled from the cache.')).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+
+    const body = screen.getByRole('textbox', { name: 'Message body' });
+    await user.click(body);
+    await user.type(body, ' mine');
+    rerender(<ComposeModal {...base} initialReply={{ mode: 'draft', draftId: 'd2', subject: 'Replaced', htmlBody: '<p>Server copy</p>' }} />);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(body).toHaveTextContent('mine');
+    expect(screen.queryByText('Server copy')).not.toBeInTheDocument();
+  });
+
   it('saves and closes a draft whose attachment has no file bytes', async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
@@ -133,7 +211,7 @@ describe('ComposeModal', () => {
     await user.click(screen.getByRole('button', { name: 'Save and close' }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(api).toHaveBeenCalledWith('/drafts/draft-quote', expect.objectContaining({ method: 'PATCH' }));
-    const payload = JSON.parse(api.mock.calls[0][1].body);
+    const payload = JSON.parse(api.mock.calls.at(-1)[1].body);
     expect(payload.attachments[0].filename).toBe('quote.pdf');
     expect(payload.attachments[0].content).toBeUndefined();
     expect(onDraftSaved).toHaveBeenCalled();

@@ -30,6 +30,7 @@ export function normalizeMessage(raw, index = 0) {
     timestamp: raw.timestamp || raw.date || raw.sentAt || raw.receivedAt || new Date().toISOString(),
     body: raw.textBody || raw.bodyText || raw.text || raw.body || raw.snippet || '',
     bodyHtml: raw.htmlBody || raw.bodyHtml || raw.html || '',
+    sourceImported: raw.sourceImported !== false,
     attachments: (raw.attachments || []).map((attachment) => ({
       ...attachment,
       name: attachment.name || attachment.filename || 'Attachment',

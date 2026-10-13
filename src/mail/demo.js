@@ -359,6 +359,7 @@ const demoDraftSources = [
         timestamp: new Date(Date.now() - 1000 * 60 * 14).toISOString(),
         body: 'Hi Priya,\n\nThursday afternoon still works. I will send the confirmed window after I check the run sheet.\n\nSam',
         htmlBody: '<p>Hi Priya,</p><p>Thursday afternoon still works. I will send the confirmed window after I check the run sheet.</p><p>Sam</p>',
+        attachments: [{ filename: 'run-sheet.pdf', name: 'run-sheet.pdf', contentType: 'application/pdf', size: 4096 }],
       },
     ],
   },

@@ -548,13 +548,11 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   router.get('/threads/:id', async (request, response) => {
     const thread = repos.threads.get(request.params.id);
     if (!thread) throw new NotFoundError('Thread not found.');
+    // Cached envelopes and bodies only. A missing RFC822 source is filled
+    // later, one message at a time, so the reader is not stuck behind the thread.
     const stored = repos.messages.forThread(thread.id);
-    const hydrated = [];
-    for (const item of stored) {
-      const next = mailService?.hydrateMessageSource ? await mailService.hydrateMessageSource(item.id) : item;
-      hydrated.push(hydrateMessage(next, remoteContent));
-    }
-    response.json({ thread: { ...thread, messages: hydrated }, messages: hydrated });
+    const messages = stored.map((item) => hydrateMessage(item, remoteContent));
+    response.json({ thread: { ...thread, messages }, messages });
   });
 
   const storedDrafts = (accountId) => {

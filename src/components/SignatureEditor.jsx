@@ -55,6 +55,8 @@ export function SignatureEditor({
   const htmlFileRef = useRef(null);
   const imageFileRef = useRef(null);
   const skipVisualSync = useRef(false);
+  // Compose keeps the live DOM. Sanitizing or rewriting it on each key stalls typing.
+  const composeDomOwnsValue = useRef(false);
   const draftRef = useRef(draft);
   const savedRange = useRef(null);
   draftRef.current = draft;
@@ -62,19 +64,21 @@ export function SignatureEditor({
   const dirty = draft !== (baseline || '');
 
   useEffect(() => {
+    if (isCompose && composeDomOwnsValue.current) return;
     setDraft(value);
     setError('');
-  }, [value]);
+  }, [value, isCompose]);
 
   useEffect(() => {
     if (mode !== 'visual' || !visualRef.current) return;
+    if (isCompose && composeDomOwnsValue.current) return;
     if (skipVisualSync.current) {
       skipVisualSync.current = false;
       return;
     }
-    const next = storedSignatureToEditorHtml(draft);
+    const next = isCompose ? String(draft || '') : storedSignatureToEditorHtml(draft);
     if (visualRef.current.innerHTML !== next) visualRef.current.innerHTML = next;
-  }, [draft, mode]);
+  }, [draft, mode, isCompose]);
 
   const persistable = (next) => {
     const raw = String(next ?? '');
@@ -103,6 +107,11 @@ export function SignatureEditor({
   const readVisual = () => editorHtmlToStored(visualRef.current?.innerHTML || '');
 
   const handleVisualInput = () => {
+    if (isCompose) {
+      composeDomOwnsValue.current = true;
+      onChange?.(visualRef.current?.innerHTML || '');
+      return;
+    }
     skipVisualSync.current = true;
     commit(readVisual());
   };
@@ -233,8 +242,8 @@ export function SignatureEditor({
     >
       <div className="signature-editor-toolbar">
         <div className="signature-editor-modes" role="tablist" aria-label={modeLabel}>
-          <button type="button" role="tab" aria-selected={mode === 'visual'} className={mode === 'visual' ? 'is-selected' : ''} disabled={disabled} onClick={() => { setMode('visual'); setLinkOpen(false); }}>Visual</button>
-          <button type="button" role="tab" aria-selected={mode === 'html'} className={mode === 'html' ? 'is-selected' : ''} disabled={disabled} onClick={() => setMode('html')}>HTML</button>
+          <button type="button" role="tab" aria-selected={mode === 'visual'} className={mode === 'visual' ? 'is-selected' : ''} disabled={disabled} onClick={() => { if (mode === 'html') composeDomOwnsValue.current = false; setMode('visual'); setLinkOpen(false); }}>Visual</button>
+          <button type="button" role="tab" aria-selected={mode === 'html'} className={mode === 'html' ? 'is-selected' : ''} disabled={disabled} onClick={() => { if (isCompose && visualRef.current) { const raw = visualRef.current.innerHTML; composeDomOwnsValue.current = false; setDraft(raw); onChange?.(raw); } setMode('html'); }}>HTML</button>
         </div>
         {mode === 'visual' && (
           <div className="signature-editor-format" role="toolbar" aria-label={formatLabel}>

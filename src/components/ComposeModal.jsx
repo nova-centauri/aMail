@@ -57,16 +57,47 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
   const attachmentsRef = useRef(attachments);
   const draftIdRef = useRef(draftId);
   const fileRef = useRef(null);
+  const pristineRef = useRef(true);
+  const saveDraftRef = useRef(null);
+  const expandedRef = useRef(isExpanded);
+  const closingRef = useRef(closing);
   toRef.current = to;
   ccRef.current = cc;
   bccRef.current = bcc;
   subjectRef.current = subject;
-  htmlBodyRef.current = htmlBody;
   attachmentsRef.current = attachments;
   draftIdRef.current = draftId;
+  expandedRef.current = isExpanded;
+  closingRef.current = closing;
   useEffect(() => {
-    setSenderId((current) => accounts.some((item) => item.id === current) ? current : initialReply?.accountId || account?.id || accounts[0]?.id || '');
+    setSenderId((current) => {
+      if (accounts.some((item) => item.id === current)) return current;
+      if (current && accounts.length === 0) return current;
+      return initialReply?.accountId || account?.id || accounts[0]?.id || '';
+    });
   }, [account?.id, accounts, initialReply?.accountId]);
+  useEffect(() => {
+    if (!initialReply || !pristineRef.current) return;
+    const nextHtml = initialHtmlBody(initialReply);
+    setTo(parseRecipientList(initialReply.to || ''));
+    setCc(parseRecipientList(initialReply.cc || ''));
+    setBcc(parseRecipientList(initialReply.bcc || ''));
+    setSubject(initialReply.subject || '');
+    setHtmlBody(nextHtml);
+    htmlBodyRef.current = nextHtml;
+    setAttachments(initialReply.attachments || []);
+    setExtraFields(Boolean(initialReply.cc || initialReply.bcc));
+    setDraftId(initialReply.draftId || '');
+  }, [initialReply]);
+  const onBodyChange = (next) => {
+    if (next === htmlBodyRef.current) return;
+    htmlBodyRef.current = next;
+    pristineRef.current = false;
+  };
+  const editRecipients = (setter) => (next) => {
+    pristineRef.current = false;
+    setter(next);
+  };
   const senderAccount = accounts.find((item) => item.id === senderId) || account || accounts[0] || null;
   const recipientPayload = (list) => list.map((person) => ({
     name: person.name || '',
@@ -82,10 +113,11 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
     || draftIdRef.current,
   );
   const composeBodies = () => {
-    const storedHtml = editorHtmlToStored(htmlBody);
+    const liveHtml = htmlBodyRef.current;
+    const storedHtml = editorHtmlToStored(liveHtml);
     return {
       htmlBody: storedHtml,
-      textBody: htmlToPlainText(storedHtml || htmlBody),
+      textBody: htmlToPlainText(storedHtml || liveHtml),
     };
   };
   const draftPayload = () => ({
@@ -132,6 +164,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
       setIsSavingDraft(false);
     }
   };
+  saveDraftRef.current = saveDraft;
   const discardDraft = async () => {
     if (isSending || isSavingDraft) return;
     if (!draftId) { onClose(); return; }
@@ -149,22 +182,18 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
   };
   useEffect(() => {
     const handleEscape = (event) => {
-      if (closing || event.key !== 'Escape') return;
+      if (event.key !== 'Escape' || closingRef.current) return;
       event.preventDefault();
       event.stopPropagation();
-      if (isExpanded) {
+      if (expandedRef.current) {
         setIsExpanded(false);
         return;
       }
-      if (isMinimized) {
-        onClose();
-        return;
-      }
-      void saveDraft({ closeAfter: true });
+      void saveDraftRef.current?.({ closeAfter: true });
     };
-    window.addEventListener('keydown', handleEscape, true);
-    return () => window.removeEventListener('keydown', handleEscape, true);
-  });
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, []);
   const addFiles = async (fileList) => {
     const files = [...(fileList || [])];
     if (!files.length) return;
@@ -187,6 +216,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
         setError('Attached files together must stay under 8 MB.');
         return;
       }
+      pristineRef.current = false;
       setAttachments(next);
       setError('');
     } catch (readError) {
@@ -194,7 +224,15 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
     }
   };
   const removeAttachment = (index) => {
+    pristineRef.current = false;
     setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  };
+  const onFormKeyDown = (event) => {
+    if (event.key !== 'Enter' || event.defaultPrevented) return;
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.type === 'submit' || target.type === 'button') return;
+    event.preventDefault();
   };
   const send = async (event) => {
     event.preventDefault();
@@ -254,12 +292,12 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
         </div>
       </div>
       {!isMinimized && (
-        <form className="compose-form email-light" onSubmit={send}>
+        <form className="compose-form email-light" onSubmit={send} onKeyDown={onFormKeyDown}>
           <div className="recipient-line">
             <RecipientField
               label="Recipients"
               values={to}
-              onChange={setTo}
+              onChange={editRecipients(setTo)}
               contacts={contacts}
               placeholder="Recipients"
               autoFocus={!initialReply?.draftId}
@@ -277,19 +315,19 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
           {extraFields && (
             <>
               <div className="recipient-line">
-                <RecipientField label="Cc" values={cc} onChange={setCc} contacts={contacts} placeholder="Cc" />
+                <RecipientField label="Cc" values={cc} onChange={editRecipients(setCc)} contacts={contacts} placeholder="Cc" />
               </div>
               <div className="recipient-line">
-                <RecipientField label="Bcc" values={bcc} onChange={setBcc} contacts={contacts} placeholder="Bcc" />
+                <RecipientField label="Bcc" values={bcc} onChange={editRecipients(setBcc)} contacts={contacts} placeholder="Bcc" />
               </div>
             </>
           )}
-          <div className="recipient-line subject-line"><input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Subject" aria-label="Subject" /></div>
+          <div className="recipient-line subject-line"><input value={subject} onChange={(event) => { pristineRef.current = false; setSubject(event.target.value); }} placeholder="Subject" aria-label="Subject" /></div>
           <SignatureEditor
             variant="compose"
             compact
             value={htmlBody}
-            onChange={setHtmlBody}
+            onChange={onBodyChange}
             placeholder="Write your message"
             ariaLabel="Message body"
           />
