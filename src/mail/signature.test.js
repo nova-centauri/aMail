@@ -56,5 +56,6 @@ describe('signature helpers', () => {
   it('turns stored HTML into plain text for the SMTP text part', () => {
     expect(htmlToPlainText('<p>Hello <strong>Maya</strong></p><p>See you tomorrow.</p>')).toMatch(/Hello Maya/);
     expect(htmlToPlainText('<p>Hello <strong>Maya</strong></p><p>See you tomorrow.</p>')).toMatch(/See you tomorrow/);
+    expect(htmlToPlainText('Still writing.&nbsp;')).toBe('Still writing.');
   });
 });

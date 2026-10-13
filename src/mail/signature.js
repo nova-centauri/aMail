@@ -207,7 +207,10 @@ export function validateSignatureLength(value, maxLength = SIGNATURE_MAX_LENGTH)
 }
 
 export function htmlToPlainText(value) {
-  const raw = String(value || '');
+  const raw = String(value || '')
+    .replace(/&nbsp;/gi, '\u00a0')
+    .replace(/&#0*160;/g, '\u00a0')
+    .replace(/&#x0*a0;/gi, '\u00a0');
   if (!raw.trim()) return '';
   if (!looksLikeHtml(raw) && typeof DOMParser === 'undefined') return raw.replace(/\r\n/g, '\n').trim();
   if (typeof DOMParser === 'undefined') {
