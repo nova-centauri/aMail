@@ -1,11 +1,11 @@
 import { useEffect, useRef } from 'react';
 
-export const FOCUSED_SYNC_INTERVAL_MS = 60_000;
+export const FOCUSED_SYNC_INTERVAL_MS = 20_000;
 export const BACKGROUND_SYNC_INTERVAL_MS = 5 * 60_000;
 export const MAX_FOCUSED_SYNC_INTERVAL_MS = 10 * 60_000;
-// A full sync runs every mailbox of every account over IMAP, so the pause after
-// one is scaled to how long it took: the server is never asked to spend more
-// than about a third of its time syncing for one open tab.
+// A focused tick reads the local change stamp. The server imports new mail
+// over IMAP IDLE and a UIDNEXT probe, so this timer does not start an IMAP
+// pass. If a tick does run long, the next pause scales with it.
 export const SYNC_DUTY_FACTOR = 2;
 // A result the server produced this recently is good enough for a poll; it
 // lets a second tab or an agent share one run instead of starting another.

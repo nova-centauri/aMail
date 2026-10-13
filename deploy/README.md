@@ -41,13 +41,15 @@ Open `http://127.0.0.1:3080`, sign in with the access token, and the first-run
 wizard walks you through connecting mailboxes and pointing an agent at the MCP
 endpoint.
 
-The supplied `.env.example` polls enabled accounts every five minutes and keeps
-one IMAP connection per account pooled (with ImapFlow auto-IDLE on INBOX)
-instead of reconnecting on every pass. A focused mailbox tab checks every inbox
-immediately when it becomes visible, then polls `GET /api/changes` about every
-60 seconds. Hosted keyslot tenants default to a 15-minute unattended poll
-instead; copy `deploy/hosted.env.example` rather than this file. Set
-`SYNC_INTERVAL_MINUTES=0` only if you want no server-side fallback.
+The supplied `.env.example` keeps one IMAP connection per account pooled, with
+ImapFlow auto-IDLE on INBOX, so new mail is pushed instead of waiting on a
+poll. If the server has no IDLE, or the push is missed, a background probe
+checks each inbox's UIDNEXT every 60 seconds and downloads message bodies only
+when that cursor moved. `SYNC_INTERVAL_MINUTES` is the slower full-folder pass
+(five minutes in `.env.example`, 15 for hosted keyslot tenants — copy
+`deploy/hosted.env.example` rather than this file). A focused tab syncs on
+focus, then reads the local change stamp about every 20 seconds. Set
+`SYNC_INTERVAL_MINUTES=0` only if you want no server-side probe and no full pass.
 `AMAIL_RETAIN_DAYS` (default 0) can drop stored bodies of old mail while keeping
 headers and flags.
 
@@ -363,14 +365,16 @@ container at `AMAIL_MEMORY_LIMIT` (default 1.5 GiB) and the Tor relay at
 `AMAIL_TOR_MEMORY_LIMIT` (default 256 MiB) so one runaway instance cannot
 starve a shared host; raise the first for very large mailboxes.
 
-CPU is spent almost entirely in IMAP passes. The web client asks for a focused
-refresh immediately, then polls `GET /api/changes` about every 60 seconds. The
-server coalesces concurrent syncs, enforces a 60-second minimum interval
-(`AMAIL_SYNC_MIN_INTERVAL_MS`), and returns a pass that finished inside that
-window. Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
-`POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES` governs the pass
-that runs with no tab open (15 minutes in keyslot mode, 5 in the supplied
-`.env.example`).
+CPU is spent almost entirely in IMAP passes. New inbox mail arrives over IMAP
+IDLE. The fallback is a UIDNEXT probe every 60 seconds (concurrency-capped,
+no body download unless the inbox moved). A focused tab reloads from the
+local cache about every 20 seconds. The server
+coalesces concurrent full syncs, enforces a 60-second minimum interval
+(`AMAIL_SYNC_MIN_INTERVAL_MS`) on those full passes, and returns a pass that
+finished inside that window. Agents that poll should pass `maxAgeSeconds` to
+`sync_mail` (or `POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES`
+is the full-folder pass, not the inbox wait (15 minutes in keyslot mode, 5 in
+the supplied `.env.example`).
 
 ## Continuous integration
 
