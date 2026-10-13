@@ -632,3 +632,97 @@ test('account settings hide secrets, preserve blank passwords, verify changes at
   assert.equal(removedWhileTesting.status, 404);
   assert.equal(repos.accounts.get(untouched.id), null);
 });
+
+test('opening a thread returns cached envelopes without waiting on source hydration', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-open-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 7),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const database = createDatabase(config);
+  const repos = createRepositories(database);
+  let hydrates = 0;
+  const mailService = {
+    async hydrateMessageSource() {
+      hydrates += 1;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    },
+  };
+  const app = express();
+  app.use(express.json());
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  app.use(errorHandler({ error() {} }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const account = repos.accounts.create({
+    email: 'owner@example.test',
+    display_name: 'Owner',
+    avatar_blob: null,
+    avatar_mime: null,
+    color: '#1a73e8',
+    provider: 'custom',
+    imap_host: 'imap.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    smtp_host: 'smtp.example.test',
+    smtp_port: 465,
+    smtp_secure: 1,
+    credential_ciphertext: 'test-only',
+    signature: '',
+    sync_enabled: 1,
+  });
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Cached subject',
+    normalized_subject: 'cached subject',
+    latest_at: '2026-04-01T00:00:00.000Z',
+  });
+  repos.messages.upsert({
+    ...messageInput({
+      accountId: account.id,
+      threadId: thread.id,
+      uid: 1,
+      subject: 'Cached subject',
+      fromEmail: 'friend@example.test',
+      timestamp: '2026-04-01T00:00:00.000Z',
+    }),
+    source_imported: 0,
+    snippet: 'Envelope snippet',
+  });
+  repos.messages.upsert({
+    ...messageInput({
+      accountId: account.id,
+      threadId: thread.id,
+      uid: 2,
+      subject: 'Cached subject',
+      fromEmail: 'friend@example.test',
+      timestamp: '2026-04-02T00:00:00.000Z',
+    }),
+    source_imported: 0,
+    snippet: 'Newer envelope',
+    rfc_message_id: '<api-2b@example.test>',
+  });
+
+  const started = Date.now();
+  const response = await fetch(`${origin}/api/threads/${encodeURIComponent(thread.id)}`);
+  assert.equal(response.status, 200);
+  assert.ok(Date.now() - started < 500);
+  const payload = await response.json();
+  assert.equal(payload.messages.length, 2);
+  assert.equal(payload.messages.some((message) => message.snippet === 'Envelope snippet'), true);
+  assert.equal(payload.messages.some((message) => message.snippet === 'Newer envelope'), true);
+  assert.equal(payload.messages.every((message) => message.sourceImported === false), true);
+  assert.equal(hydrates, 0);
+});

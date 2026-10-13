@@ -214,6 +214,7 @@ export function ThreadView({ thread, activeFolder, onBack, onAction, onLoadRemot
   const latestRef = useRef(null);
   const [downloadProgress, setDownloadProgress] = useState({});
   const attachmentKey = sourceMessages.map((message) => (message.attachments || []).map((attachment, index) => attachmentDownloadKey(message.id, attachment, index)).join(',')).join('|');
+  const bodiesPending = sourceMessages.some((message) => message.sourceImported === false);
 
   useEffect(() => {
     const scroller = scrollerRef.current;
@@ -224,14 +225,14 @@ export function ThreadView({ thread, activeFolder, onBack, onAction, onLoadRemot
   }, [thread.id, messageKey]);
 
   useEffect(() => {
+    if (bodiesPending) return undefined;
     const controller = new AbortController();
     abortRef.current = controller;
     stagedRef.current = new Map();
     const items = stageableAttachments(sourceMessages);
     let cancelled = false;
-    // Stage only this open conversation, after the cards have rendered.
-    // The next list row is not fetched: it often has no attachment URLs yet,
-    // and warming it would pull IMAP before the reader needs it.
+    // Stage only this open conversation, after the body is already cached.
+    // Missing RFC822 is filled first; attachment bytes must not take that connection.
     void runWithConcurrency(items, ATTACHMENT_STAGE_CONCURRENCY, async (item) => {
       if (cancelled || controller.signal.aborted) return;
       try {
@@ -248,7 +249,7 @@ export function ThreadView({ thread, activeFolder, onBack, onAction, onLoadRemot
       laneRef.current.clear();
       busyRef.current.clear();
     };
-  }, [thread.id, attachmentKey]);
+  }, [thread.id, attachmentKey, bodiesPending]);
 
   const reportProgress = (key, progress) => {
     setDownloadProgress((current) => ({ ...current, [key]: progress }));

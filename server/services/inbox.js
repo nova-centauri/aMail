@@ -161,6 +161,7 @@ export function listStoredDrafts(repos, accountIds = null) {
         htmlBody: message.htmlBody || '',
         textBody: message.textBody || '',
         attachments: message.attachments || [],
+        sourceImported: message.sourceImported !== false,
         updatedAt: message.receivedAt || message.sentAt || message.updatedAt,
         createdAt: message.createdAt || message.receivedAt || message.sentAt,
       }, account);
@@ -205,6 +206,7 @@ export function draftListItem(draft, account) {
     messageCount: 1,
     unreadCount: 0,
     labels: ['Draft'],
+    sourceImported: draft.sourceImported !== false,
     attachments: (draft.attachments || []).map((attachment, index) => publicAttachmentMeta(attachment, index)),
     hasAttachments: Boolean((draft.attachments || []).length),
   };

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, streamSse } from './api.js';
 import { AccessPanel } from './components/AccessPanel.jsx';
 import { AddAccountModal } from './components/AddAccountModal.jsx';
@@ -20,7 +20,9 @@ import { normalizeFreshDraft, pruneDismissedFreshDrafts, visibleFreshDrafts } fr
 import { querySupportsDeepSearch } from './mail/deep-search.js';
 import { countSmartCategories, filterVisibleThreads, findPersonFlag } from './mail/filter.js';
 import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.js';
+import { composeWindowKey, shouldDismissCompose } from './mail/compose-session.js';
 import { quotedComposeHtml } from './mail/html.js';
+import { bodiesToFill } from './mail/open-message.js';
 import { formatMessageDate, getArray, normalizeAccount, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
 import { collectKnownPeople } from './mail/people.js';
 import { PANEL_EASE_MS, prefersReducedMotion, usePresence } from './mail/presence.js';
@@ -60,7 +62,12 @@ export default function App() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [composeOpen, setComposeOpen] = useState(false);
   const [composeContext, setComposeContext] = useState(null);
+  const [composeSession, setComposeSession] = useState(0);
   const composePresence = usePresence(composeOpen);
+  const composeSessionRef = useRef(0);
+  const composeOpenRef = useRef(false);
+  const threadLoadRef = useRef(0);
+  composeOpenRef.current = composeOpen;
   const readerThreadRef = useRef(null);
   const [readerMounted, setReaderMounted] = useState(false);
   const [readerOpen, setReaderOpen] = useState(false);
@@ -143,12 +150,19 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [selectedThread, readerMounted]);
 
-  const openNewCompose = () => {
-    setComposeContext(null);
+  const beginCompose = (context) => {
+    composeSessionRef.current += 1;
+    setComposeSession(composeSessionRef.current);
+    setComposeContext(context);
     setComposeOpen(true);
   };
 
-  const closeCompose = () => {
+  const openNewCompose = () => {
+    beginCompose(null);
+  };
+
+  const closeCompose = (reason = 'explicit-close') => {
+    if (!shouldDismissCompose(reason, { editing: composeOpenRef.current })) return;
     setComposeOpen(false);
   };
 
@@ -176,7 +190,7 @@ export default function App() {
     const recipients = uniqueRecipients(toCandidates);
     const ccRecipients = uniqueRecipients(originalCc);
     if (!recipients.length && primaryRecipients[0]) recipients.push(normalizePerson(primaryRecipients[0]));
-    setComposeContext({
+    beginCompose({
       mode: replyAll ? 'reply-all' : 'reply',
       accountId: message.accountId || thread.accountId || null,
       to: formatRecipients(recipients),
@@ -194,14 +208,13 @@ export default function App() {
       threadId: thread.threadId || thread.id,
       replyToMessageId: message.rfcMessageId || undefined,
     });
-    setComposeOpen(true);
   };
 
   const openForwardComposer = (thread, message) => {
     const subject = /^fwd:/i.test(thread.subject || '') ? thread.subject : `Fwd: ${thread.subject || '(no subject)'}`;
     const sender = message.from?.name || message.from?.email || 'Unknown sender';
     const original = String(message.body || '').trim();
-    setComposeContext({
+    beginCompose({
       mode: 'forward',
       accountId: message.accountId || thread.accountId || null,
       to: '',
@@ -216,7 +229,6 @@ export default function App() {
         mode: 'forward',
       }),
     });
-    setComposeOpen(true);
   };
 
   const beginDeepSearch = useCallback(async ({ query: rawQuery, requestId, folder, accountId }) => {
@@ -346,43 +358,48 @@ export default function App() {
           unanalyzed: Number(mailData.folderCounts.unanalyzed) || 0,
         }
         : null;
-      setAuthRequired(false);
-      setAuthenticated(true);
-      setPasskeyCount(Number(session?.passkeys) || 0);
-      setOffline(false);
-      setAccounts(isFreshSetup ? [] : nextAccounts);
-      // Null represents the unified inbox. Preserve an explicit per-account choice,
-      // but start every newly loaded mailbox with all connected accounts visible.
-      setActiveAccount((current) => nextAccounts.find((item) => item.id === current?.id) || null);
-      setThreads(isFreshSetup ? previewThreads : nextThreads);
-      setMailTotal(isFreshSetup ? previewThreads.length : Number.isFinite(responseTotal) ? responseTotal : nextThreads.length);
-      setCategoryCounts(isFreshSetup ? countSmartCategories(previewThreads) : nextCategoryCounts);
-      if (isFreshSetup) {
-        const preview = previewThreads;
-        setFolderCounts({
-          inbox: preview.filter((thread) => thread.folder === 'inbox' && thread.unread).length,
-          starred: preview.filter((thread) => thread.starred).length,
-          snoozed: preview.filter((thread) => thread.folder === 'snoozed').length,
-          drafts: preview.filter((thread) => thread.folder === 'drafts').length,
-          unanalyzed: preview.filter((thread) => thread.folder === 'inbox' && thread.analyzed === false).length,
-        });
-      } else if (nextFolderCounts) {
-        setFolderCounts(nextFolderCounts);
-      }
-      setIsDemo(isFreshSetup);
-      if (isFreshSetup && !onboardingDismissed) setOnboardingOpen(true);
       const nextSavedDrafts = isFreshSetup
         ? previewThreads.filter((thread) => thread.folder === 'drafts' || thread.draftId).map(normalizeFreshDraft)
         : getArray(draftData, ['drafts', 'items']).map(normalizeFreshDraft);
-      setSavedDrafts(nextSavedDrafts);
       const prunedDismissals = pruneDismissedFreshDrafts(dismissedFreshDrafts, nextSavedDrafts);
-      if (prunedDismissals !== dismissedFreshDrafts) {
-        setDismissedFreshDrafts(prunedDismissals);
-        writeDismissedFreshDrafts(prunedDismissals);
-      }
-      // Functional update so an in-flight reload cannot close a thread opened after it started.
       const loadedThreads = isFreshSetup ? previewThreads : nextThreads;
-      setSelectedThread((current) => reconcileSelectedThread(current, loadedThreads, { keepSelection }));
+      const publishLoadedMailbox = () => {
+        setAuthRequired(false);
+        setAuthenticated(true);
+        setPasskeyCount(Number(session?.passkeys) || 0);
+        setOffline(false);
+        setAccounts(isFreshSetup ? [] : nextAccounts);
+        // Null represents the unified inbox. Preserve an explicit per-account choice,
+        // but start every newly loaded mailbox with all connected accounts visible.
+        setActiveAccount((current) => nextAccounts.find((item) => item.id === current?.id) || null);
+        setThreads(isFreshSetup ? previewThreads : nextThreads);
+        setMailTotal(isFreshSetup ? previewThreads.length : Number.isFinite(responseTotal) ? responseTotal : nextThreads.length);
+        setCategoryCounts(isFreshSetup ? countSmartCategories(previewThreads) : nextCategoryCounts);
+        if (isFreshSetup) {
+          const preview = previewThreads;
+          setFolderCounts({
+            inbox: preview.filter((thread) => thread.folder === 'inbox' && thread.unread).length,
+            starred: preview.filter((thread) => thread.starred).length,
+            snoozed: preview.filter((thread) => thread.folder === 'snoozed').length,
+            drafts: preview.filter((thread) => thread.folder === 'drafts').length,
+            unanalyzed: preview.filter((thread) => thread.folder === 'inbox' && thread.analyzed === false).length,
+          });
+        } else if (nextFolderCounts) {
+          setFolderCounts(nextFolderCounts);
+        }
+        setIsDemo(isFreshSetup);
+        if (isFreshSetup && !onboardingDismissed) setOnboardingOpen(true);
+        setSavedDrafts(nextSavedDrafts);
+        if (prunedDismissals !== dismissedFreshDrafts) {
+          setDismissedFreshDrafts(prunedDismissals);
+          writeDismissedFreshDrafts(prunedDismissals);
+        }
+        // Functional update so an in-flight reload cannot close a thread opened after it started.
+        // The open composer is not part of this update: sync, focus, and list reload leave it up.
+        setSelectedThread((current) => reconcileSelectedThread(current, loadedThreads, { keepSelection }));
+      };
+      if (composeOpenRef.current) startTransition(publishLoadedMailbox);
+      else publishLoadedMailbox();
       if (!isFreshSetup && querySupportsDeepSearch(debouncedQuery, activeFolder)) {
         void beginDeepSearch({
           query: debouncedQuery,
@@ -635,53 +652,95 @@ export default function App() {
     setSelectedThread(null);
   };
 
-  const openSavedDraft = async (source, { expanded = false } = {}) => {
+  const openSavedDraft = (source, { expanded = false } = {}) => {
     const draftMessage = source.messages?.at(-1) || source;
     const draftId = source.draftId || String(source.id || '').replace(/^draft:/, '');
-    let attachments = source.attachments || draftMessage.attachments || [];
-    let body = draftMessage.body || source.textBody || '';
-    let htmlBody = draftMessage.bodyHtml || source.htmlBody || '';
-    let subject = source.subject === '(no subject)' ? '' : (source.subject || '');
-    let to = formatRecipients(source.to || draftMessage.to);
-    let cc = formatRecipients(source.cc || draftMessage.cc);
-    let bcc = formatRecipients(source.bcc || draftMessage.bcc);
-    if (!isDemo && draftId) {
-      try {
-        const data = await api(`/drafts/${encodeURIComponent(draftId)}`);
-        const draft = data?.draft || data;
-        attachments = draft?.attachments || attachments;
-        body = draft?.textBody || body;
-        htmlBody = draft?.htmlBody || htmlBody;
-        subject = draft?.subject || subject;
-        to = formatRecipients(draft?.to || source.to);
-        cc = formatRecipients(draft?.cc || source.cc);
-        bcc = formatRecipients(draft?.bcc || source.bcc);
-      } catch {
-        // The list payload is enough to keep editing if the full draft fetch fails.
-      }
-    }
-    setComposeContext({
+    const attachments = source.attachments || draftMessage.attachments || [];
+    const body = draftMessage.body || source.textBody || source.snippet || '';
+    const htmlBody = draftMessage.bodyHtml || source.htmlBody || '';
+    const subject = source.subject === '(no subject)' ? '' : (source.subject || '');
+    beginCompose({
       mode: 'draft',
       draftId,
       accountId: source.accountId || draftMessage.accountId || null,
       threadId: source.threadId && source.threadId !== source.id && !String(source.threadId).startsWith('draft:') ? source.threadId : null,
-      to,
-      cc,
-      bcc,
+      to: formatRecipients(source.to || draftMessage.to),
+      cc: formatRecipients(source.cc || draftMessage.cc),
+      bcc: formatRecipients(source.bcc || draftMessage.bcc),
       subject,
       body,
       htmlBody: htmlBody || body,
       attachments,
       expanded,
+      sourceImported: source.sourceImported !== false && draftMessage.sourceImported !== false,
     });
-    setComposeOpen(true);
+    if (isDemo || !draftId) return;
+    const session = composeSessionRef.current;
+    const applyDetail = (draft) => {
+      if (!draft || composeSessionRef.current !== session) return;
+      setComposeContext((current) => {
+        if (!current || String(current.draftId || '') !== String(draftId)) return current;
+        return {
+          ...current,
+          to: draft.to ? formatRecipients(draft.to) : current.to,
+          cc: draft.cc ? formatRecipients(draft.cc) : current.cc,
+          bcc: draft.bcc ? formatRecipients(draft.bcc) : current.bcc,
+          subject: draft.subject ?? current.subject,
+          body: draft.textBody || current.body,
+          htmlBody: draft.htmlBody || current.htmlBody || current.body,
+          attachments: draft.attachments?.length ? draft.attachments : current.attachments,
+        };
+      });
+    };
+    void api(`/drafts/${encodeURIComponent(draftId)}`)
+      .then((data) => applyDetail(data?.draft || data))
+      .catch(() => undefined);
+    if (source.sourceImported === false || draftMessage.sourceImported === false) {
+      void api(`/messages/${encodeURIComponent(draftId)}`)
+        .then((data) => {
+          const message = data?.message || data;
+          if (!message) return;
+          applyDetail({
+            to: message.to,
+            cc: message.cc,
+            bcc: message.bcc,
+            subject: message.subject === '(no subject)' ? '' : message.subject,
+            textBody: message.textBody,
+            htmlBody: message.htmlBody,
+            attachments: message.attachments,
+          });
+        })
+        .catch(() => undefined);
+    }
+  };
+
+  const fillMessageBodies = async (thread, requestId) => {
+    for (const message of bodiesToFill(thread?.messages)) {
+      if (requestId !== threadLoadRef.current) return;
+      try {
+        const data = await api(`/messages/${encodeURIComponent(message.id)}`);
+        if (requestId !== threadLoadRef.current) return;
+        const hydrated = normalizeMessage({ ...(data?.message || data), sourceImported: true });
+        setSelectedThread((current) => {
+          if (!sameOpenThread(current, thread)) return current;
+          const messages = (current.messages || []).map((item) => (
+            item.id === hydrated.id ? { ...item, ...hydrated, sourceImported: true } : item
+          ));
+          if (!messages.some((item) => item.id === hydrated.id)) return current;
+          return { ...current, messages };
+        });
+      } catch {
+        // The envelope stays on screen. A later open can fetch the body again.
+      }
+    }
   };
 
   const openThread = async (thread) => {
     if (thread.folder === 'drafts' || thread.draftId) {
-      await openSavedDraft(thread);
+      openSavedDraft(thread);
       return;
     }
+    const requestId = ++threadLoadRef.current;
     const alreadyRead = !thread.unread;
     const provisional = { ...thread, unread: false };
     setSelectedThread(provisional);
@@ -690,9 +749,10 @@ export default function App() {
       setFolderCounts((current) => ({ ...current, inbox: Math.max(0, current.inbox - 1) }));
       if (!isDemo) api(`/messages/${encodeURIComponent(thread.id)}/read`, { method: 'POST' }).catch(() => undefined);
     }
-    if (isDemo || thread.messages?.length > 1) return;
+    if (isDemo) return;
     try {
       const data = await api(`/threads/${encodeURIComponent(thread.threadId)}`);
+      if (requestId !== threadLoadRef.current) return;
       const raw = {
         ...(data?.thread || data || {}),
         messages: data?.messages || data?.thread?.messages || [],
@@ -704,8 +764,9 @@ export default function App() {
           : current
       ));
       setThreads((current) => current.map((item) => sameOpenThread(item, detailed) ? { ...item, ...detailed } : item));
+      void fillMessageBodies(detailed, requestId);
     } catch {
-      // The compact list payload remains a valid reader view.
+      void fillMessageBodies(provisional, requestId);
     }
   };
 
@@ -932,7 +993,7 @@ export default function App() {
       if (!isDemo && activeFolder === 'drafts') setMailTotal((current) => Math.max(0, current - 1));
     }
     setSelectedThread((current) => current?.draftId === id || current?.id === `draft:${id}` ? null : current);
-    if (composeContext?.draftId === id) closeCompose();
+    if (composeContext?.draftId === id) closeCompose('discard');
   };
 
   const dismissFreshDraft = (draft) => {
@@ -964,7 +1025,7 @@ export default function App() {
     persistAccessToken('');
     setProfileOpen(false);
     setSettingsOpen(false);
-    setComposeOpen(false);
+    closeCompose('sign-out');
     setComposeContext(null);
     setAddAccountOpen(false);
     setEditingAccount(null);
@@ -1225,7 +1286,7 @@ export default function App() {
           {readerThread ? <ThreadView key={readerThread.id} thread={readerThread} activeFolder={activeFolder} onBack={() => setSelectedThread(null)} onAction={applyAction} onLoadRemote={loadRemoteContent} onReply={openReplyComposer} onReplyAll={(thread, message) => openReplyComposer(thread, message, { replyAll: true })} onForward={openForwardComposer} onToggleStar={toggleStar} onNotice={setNotice} allowPrivateImages={privacy.privateImages} /> : null}
         </div>
       </main>
-      {composePresence.mounted && <ComposeModal key={composeContext?.draftId || composeContext?.mode || 'compose'} closing={composePresence.closing} account={composeAccount} accounts={identityAccounts} contacts={composeContacts} isDemo={isDemo} initialReply={composeContext} onClose={closeCompose} onSent={sendMessage} onDraftSaved={draftSaved} onDraftRemoved={draftRemoved} />}
+      {composePresence.mounted && <ComposeModal key={composeWindowKey(composeSession)} closing={composePresence.closing} account={composeAccount} accounts={identityAccounts} contacts={composeContacts} isDemo={isDemo} initialReply={composeContext} onClose={closeCompose} onSent={sendMessage} onDraftSaved={draftSaved} onDraftRemoved={draftRemoved} />}
       <SettingsPanel
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
