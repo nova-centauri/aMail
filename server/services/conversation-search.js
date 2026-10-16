@@ -57,6 +57,65 @@ function likeHaystack(alias, columns, param) {
 }
 
 /**
+ * Default inbox polling only needs latest-message category + recency.
+ * Operator/FTS filters still use the full per-thread stats CTE.
+ */
+export function listingNeedsThreadStats(input = {}) {
+  if (input.forceLegacy) return true;
+  const query = input.parsed && mailboxQueryIsActive(input.parsed) ? input.parsed : null;
+  return Boolean(
+    input.ftsQuery
+    || query
+    || (input.personEmails || []).length
+    || (input.extraThreadIds || []).length
+    || (input.restrictThreadIds || []).length
+  );
+}
+
+function cheapListingSql({ accountSql, hideQuiet, category }) {
+  const headedWhere = [
+    hideQuiet ? "latest_category <> 'ops_quiet'" : '',
+    category ? 'latest_category = @category' : '',
+  ].filter(Boolean);
+  const headedWhereSql = headedWhere.length ? `WHERE ${headedWhere.join('\n      AND ')}` : '';
+  const cte = `WITH latest AS (
+      SELECT thread_id, account_id, latest_at, latest_category
+      FROM (
+        SELECT
+          m.thread_id AS thread_id,
+          m.account_id AS account_id,
+          m.smart_category AS latest_category,
+          COALESCE(m.sent_at, m.received_at, m.created_at) AS latest_at,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.account_id, m.thread_id
+            ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.id DESC
+          ) AS rk
+        FROM messages m
+        WHERE ${accountSql}
+          AND ${folderPredicate('m')}
+      ) ranked
+      WHERE rk = 1
+    )`;
+  return {
+    cheap: true,
+    pageSql: `${cte}
+      SELECT thread_id AS threadId
+      FROM latest
+      ${headedWhereSql}
+      ORDER BY latest_at DESC, thread_id DESC
+      LIMIT @limit OFFSET @offset`,
+    countSql: `${cte}
+      SELECT COUNT(*) AS total FROM latest
+      ${headedWhereSql}`,
+    categorySql: `${cte}
+      SELECT latest_category AS category, COUNT(*) AS count
+      FROM latest
+      WHERE latest_category IS NOT NULL AND latest_category <> 'ops_quiet'
+      GROUP BY latest_category`,
+  };
+}
+
+/**
  * Build the CTE shared by the page, total, and category-count queries.
  * Message bodies are never selected.
  */
@@ -190,6 +249,14 @@ export function buildConversationSearch(input = {}) {
     }).join(', ')})`);
   }
 
+  if (!listingNeedsThreadStats({ ...input, parsed: query })) {
+    return {
+      params,
+      empty: false,
+      ...cheapListingSql({ accountSql, hideQuiet, category }),
+    };
+  }
+
   const whereSql = filters.length ? `WHERE ${filters.join('\n      AND ')}` : '';
   const pageWhere = [
     filters.length ? filters.join('\n      AND ') : '',
@@ -245,6 +312,7 @@ export function buildConversationSearch(input = {}) {
   return {
     params,
     empty: false,
+    cheap: false,
     pageSql: `${cte}
       SELECT thread_id AS threadId
       FROM paged

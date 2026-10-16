@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildConversationSearch, escapeLike } from './conversation-search.js';
+import { buildConversationSearch, escapeLike, listingNeedsThreadStats } from './conversation-search.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
 
 test('LIKE metacharacters are escaped for SQL contains matches', () => {
@@ -69,4 +69,31 @@ test('analyzed filters require imported source and extra IMAP thread ids bypass 
   assert.match(restricted.pageSql, /stats.thread_id IN \(@restrict0\)/);
   assert.equal(restricted.params.restrict0, 'thread-envelope');
   assert.doesNotMatch(restricted.pageSql, /messages_fts MATCH/);
+});
+
+test('default inbox listing skips attachment JSON and the full stats window', () => {
+  assert.equal(listingNeedsThreadStats({ folder: 'inbox', hideQuiet: true }), false);
+  const cheap = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    hideQuiet: true,
+    limit: 50,
+    offset: 0,
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.equal(cheap.cheap, true);
+  assert.doesNotMatch(cheap.pageSql, /json_array_length/);
+  assert.doesNotMatch(cheap.pageSql, /has_attachment/);
+  assert.match(cheap.pageSql, /FROM latest/);
+  assert.match(cheap.pageSql, /LIMIT @limit OFFSET @offset/);
+
+  const legacy = buildConversationSearch({
+    accountIds: ['account-1'],
+    folder: 'inbox',
+    hideQuiet: true,
+    forceLegacy: true,
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  assert.equal(legacy.cheap, false);
+  assert.match(legacy.pageSql, /json_array_length/);
 });

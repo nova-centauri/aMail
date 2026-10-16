@@ -8,6 +8,7 @@ import { registerMcp } from './routes/mcp.js';
 import { errorHandler, notFound } from './middleware/errors.js';
 import { createAuthenticator } from './middleware/auth.js';
 import { logSerializers } from './logging.js';
+import { requestTiming } from './middleware/request-timing.js';
 import { createDeepSearchService } from './services/deep-search.js';
 
 export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null }) {
@@ -23,6 +24,7 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
     // recorded (route, status, request id, scrubbed error).
     serializers: logSerializers,
   }));
+  app.use(requestTiming());
   app.use(helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {

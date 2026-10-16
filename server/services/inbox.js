@@ -11,13 +11,63 @@ import {
   parseMailboxQuery,
 } from '../mail/search-query.js';
 import { publicAttachmentMeta } from './compose-attachments.js';
+import { createHash } from 'node:crypto';
 import { NotFoundError, ValidationError } from '../errors.js';
 import { shouldSearchProvider } from '../mail/imap-search.js';
+
+export const DEFAULT_PAGE_SIZE = 50;
+export const MAX_PAGE_SIZE = 200;
+const LIST_CACHE_LIMIT = 16;
+const FOLDER_COUNT_CACHE_LIMIT = 8;
+const cachesByRepos = new WeakMap();
+
+function cachesFor(repos) {
+  let entry = cachesByRepos.get(repos);
+  if (!entry) {
+    entry = { list: new Map(), folders: new Map() };
+    cachesByRepos.set(repos, entry);
+  }
+  return entry;
+}
 
 export const parseNumber = (value, fallback, min, max) => {
   const number = Number.parseInt(value, 10);
   return Number.isInteger(number) && number >= min && number <= max ? number : fallback;
 };
+
+export const parsePageSize = (value, fallback = DEFAULT_PAGE_SIZE) => {
+  const number = Number.parseInt(value, 10);
+  if (!Number.isInteger(number)) return fallback;
+  return Math.min(MAX_PAGE_SIZE, Math.max(1, number));
+};
+
+export function conversationListEtag(changedAt, input = {}) {
+  const raw = JSON.stringify({
+    v: changedAt || '',
+    accountId: input.accountId || null,
+    folder: input.folder || 'inbox',
+    category: input.category || '',
+    personFlag: input.personFlag || input.flag || '',
+    page: input.page || 1,
+    pageSize: input.pageSize || DEFAULT_PAGE_SIZE,
+    query: input.query || input.q || '',
+    mailbox: input.mailbox || 'INBOX',
+  });
+  return `W/"${createHash('sha1').update(raw).digest('base64url')}"`;
+}
+
+export function clearConversationListCache(repos = null) {
+  if (repos) {
+    cachesByRepos.delete(repos);
+    return;
+  }
+}
+
+function remember(cache, key, value, limit) {
+  cache.set(key, value);
+  if (cache.size > limit) cache.delete(cache.keys().next().value);
+  return value;
+}
 
 export const normalizeFolder = (value) => {
   const folder = String(value || 'inbox').toLowerCase();
@@ -119,16 +169,28 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
   return repos.messages.searchConversations(listArgs);
 }
 
-export const sumFolderCounts = (accounts, repos) => accounts.reduce((totals, account) => {
-  const counts = repos.messages.folderCounts(account.id);
-  return {
-    inbox: totals.inbox + counts.inbox,
-    starred: totals.starred + counts.starred,
-    snoozed: totals.snoozed + counts.snoozed,
-    drafts: totals.drafts + counts.drafts,
-    unanalyzed: totals.unanalyzed + (counts.unanalyzed || 0),
-  };
-}, emptyFolderCounts());
+export const sumFolderCounts = (accounts, repos) => {
+  const ids = accounts.map((account) => account.id).filter(Boolean);
+  const changedAt = repos.changes?.stamp?.()?.changedAt || '';
+  const cacheKey = `${changedAt}:${[...ids].sort().join(',')}`;
+  const folderCache = cachesFor(repos).folders;
+  const cached = folderCache.get(cacheKey);
+  if (cached) return cached;
+  if (typeof repos.messages.folderCountsForAccounts === 'function') {
+    return remember(folderCache, cacheKey, repos.messages.folderCountsForAccounts(ids), FOLDER_COUNT_CACHE_LIMIT);
+  }
+  const totals = ids.reduce((sum, accountId) => {
+    const counts = repos.messages.folderCounts(accountId);
+    return {
+      inbox: sum.inbox + counts.inbox,
+      starred: sum.starred + counts.starred,
+      snoozed: sum.snoozed + counts.snoozed,
+      drafts: sum.drafts + counts.drafts,
+      unanalyzed: sum.unanalyzed + (counts.unanalyzed || 0),
+    };
+  }, emptyFolderCounts());
+  return remember(folderCache, cacheKey, totals, FOLDER_COUNT_CACHE_LIMIT);
+};
 
 export function listStoredDrafts(repos, accountIds = null) {
   const accounts = accountIds
@@ -222,20 +284,39 @@ export async function listConversations(repos, {
   category: categoryInput = '',
   personFlag: personFlagInput = '',
   page: pageInput = 1,
-  pageSize: pageSizeInput = 50,
+  pageSize: pageSizeInput = DEFAULT_PAGE_SIZE,
   query: queryInput = '',
   mailbox = 'INBOX',
   mailService = null,
   searchSource = 'cache',
   signal = null,
   extraThreadIds: extraThreadIdsInput = null,
+  forceLegacy = false,
 } = {}) {
   const parsedQuery = parseMailboxQuery(String(queryInput || '').trim().slice(0, 800));
   const folder = normalizeFolder(parsedQuery.folder || folderInput);
   const category = normalizeCategory(categoryInput);
   const personFlag = normalizePersonFlag(personFlagInput, loadPersonFlags(repos));
   const page = parseNumber(pageInput, 1, 1, 100_000);
-  const pageSize = parseNumber(pageSizeInput, 50, 1, 200);
+  const pageSize = parsePageSize(pageSizeInput, DEFAULT_PAGE_SIZE);
+  const changedAt = repos.changes?.stamp?.()?.changedAt || '';
+  const resultCacheKey = JSON.stringify({
+    changedAt,
+    accountId,
+    folder,
+    category,
+    personFlag: personFlag?.id || '',
+    page,
+    pageSize,
+    query: parsedQuery.raw,
+    mailbox,
+    forceLegacy,
+  });
+  const resultCache = cachesFor(repos).list;
+  const canCache = !extraThreadIdsInput && !mailboxQueryIsActive(parsedQuery) && !category && !personFlag;
+  if (canCache && resultCache.has(resultCacheKey)) {
+    return resultCache.get(resultCacheKey);
+  }
   const query = parsedQuery.raw;
   const searchActive = mailboxQueryIsActive(parsedQuery);
   const ftsQuery = parsedQuery.text ? toFtsMatchQuery(parsedQuery.text) : '';
@@ -271,7 +352,7 @@ export async function listConversations(repos, {
       })
       .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
     const start = (page - 1) * pageSize;
-    return {
+    const draftResult = {
       messages: category ? [] : drafts.slice(start, start + pageSize),
       total: category ? 0 : drafts.length,
       page,
@@ -281,6 +362,7 @@ export async function listConversations(repos, {
       personFlag: personFlag?.id || null,
       personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
     };
+    return canCache ? remember(resultCache, resultCacheKey, draftResult, LIST_CACHE_LIMIT) : draftResult;
   }
 
   const listArgs = {
@@ -295,6 +377,7 @@ export async function listConversations(repos, {
     extraThreadIds,
     limit: pageSize,
     offset: (page - 1) * pageSize,
+    forceLegacy,
   };
   const search = await conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds });
   const byThread = new Map();
@@ -317,13 +400,16 @@ export async function listConversations(repos, {
   for (const row of search.categoryCounts) {
     if (Object.hasOwn(categoryCounts, row.category)) categoryCounts[row.category] = Number(row.count) || 0;
   }
+  const threadsById = typeof repos.threads.getMany === 'function'
+    ? repos.threads.getMany(search.threadIds)
+    : new Map(search.threadIds.map((id) => [id, repos.threads.get(id)]));
   // Filtering still uses all candidate messages in each conversation. Only
   // visible rows need their stored, whole-thread unread/analyzed aggregates.
   const pageItems = search.threadIds.map((threadId) => {
     const grouped = byThread.get(threadId);
     if (!grouped) return null;
     const { latest: latestMessage, messages } = grouped;
-    const thread = repos.threads.get(latestMessage.threadId);
+    const thread = threadsById.get(latestMessage.threadId);
     const latestAt = latestMessage.sentAt || latestMessage.receivedAt || latestMessage.createdAt;
     return {
       ...latestMessage,
@@ -345,7 +431,7 @@ export async function listConversations(repos, {
       ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
     };
   }).filter(Boolean);
-  return {
+  const result = {
     messages: pageItems,
     total: search.total,
     page,
@@ -355,4 +441,5 @@ export async function listConversations(repos, {
     personFlag: personFlag?.id || null,
     personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
   };
+  return canCache ? remember(resultCache, resultCacheKey, result, LIST_CACHE_LIMIT) : result;
 }

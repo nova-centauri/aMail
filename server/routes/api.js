@@ -8,7 +8,7 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { listConversations, listStoredDrafts, parseNumber } from '../services/inbox.js';
+import { conversationListEtag, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
@@ -442,15 +442,25 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   router.get('/messages', async (request, response) => {
-    response.json(await listConversations(repos, {
+    const listInput = {
       accountId: request.query.accountId ? String(request.query.accountId) : null,
       folder: request.query.folder,
       category: request.query.category,
       personFlag: request.query.flag || request.query.personFlag,
       page: request.query.page,
-      pageSize: request.query.pageSize || request.query.limit,
+      pageSize: parsePageSize(request.query.pageSize || request.query.limit),
       query: request.query.q,
       mailbox: request.query.mailbox,
+    };
+    const stamp = repos.changes.stamp()?.changedAt || '';
+    const etag = conversationListEtag(stamp, listInput);
+    response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
+    if (request.headers['if-none-match'] === etag) {
+      response.status(304).end();
+      return;
+    }
+    response.json(await listConversations(repos, {
+      ...listInput,
       mailService,
       searchSource: 'human',
       signal: request.signal,

@@ -483,6 +483,9 @@ function initSchema(db) {
       ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
     CREATE INDEX IF NOT EXISTS idx_messages_review_account_order
       ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
+    CREATE INDEX IF NOT EXISTS idx_messages_inbox_list
+      ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id)
+      WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0;
   `);
 
   // Rules are partly operator-configured (ops-digest sources), so a changed
@@ -1288,6 +1291,67 @@ export function createRepositories(db) {
           unanalyzed: Number(row.unanalyzed) || 0,
         };
       },
+      folderCountsForAccounts(accountIds = []) {
+        const ids = [...new Set((accountIds || []).filter(Boolean))];
+        if (!ids.length) return { inbox: 0, starred: 0, snoozed: 0, drafts: 0, unanalyzed: 0 };
+        const row = db.prepare(`
+          WITH scoped AS (SELECT value AS account_id FROM json_each(@accountIds))
+          SELECT
+            (
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.mailbox = 'INBOX'
+                  AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
+                  AND m.is_read = 0
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+                  AND m.smart_category <> 'ops_quiet'
+                GROUP BY m.account_id, m.thread_id
+              )
+            ) AS inbox,
+            (
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.is_starred = 1 AND m.is_trashed = 0
+                GROUP BY m.account_id, m.thread_id
+              )
+            ) AS starred,
+            (
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
+                GROUP BY m.account_id, m.thread_id
+              )
+            ) AS snoozed,
+            (
+              (SELECT COUNT(*) FROM drafts d JOIN scoped s ON s.account_id = d.account_id)
+              + (SELECT COUNT(*) FROM messages m JOIN scoped s ON s.account_id = m.account_id
+                 WHERE m.is_draft = 1 AND m.is_trashed = 0 AND m.is_spam = 0)
+            ) AS drafts,
+            (
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.mailbox = 'INBOX'
+                  AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
+                  AND m.analyzed_at IS NULL
+                  AND COALESCE(m.source_imported, 1) = 1
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+                  AND m.smart_category <> 'ops_quiet'
+                GROUP BY m.account_id, m.thread_id
+              )
+            ) AS unanalyzed
+        `).get({ accountIds: JSON.stringify(ids), now: now() }) || {};
+        return {
+          inbox: Number(row.inbox) || 0,
+          starred: Number(row.starred) || 0,
+          snoozed: Number(row.snoozed) || 0,
+          drafts: Number(row.drafts) || 0,
+          unanalyzed: Number(row.unanalyzed) || 0,
+        };
+      },
       forThread: (threadId) => queries.messagesByThread.all(threadId).map(publicMessage),
       findByRfcId: (accountId, messageId) => publicMessage(queries.messageByRfcId.get(accountId, messageId)),
       findByUid: (accountId, mailbox, uid) => publicMessage(queries.messageByUid.get(accountId, mailbox, uid)),
@@ -1393,6 +1457,7 @@ export function createRepositories(db) {
         extraThreadIds = [],
         limit = 50,
         offset = 0,
+        forceLegacy = false,
       } = {}) {
         const built = buildConversationSearch({
           accountIds,
@@ -1406,6 +1471,7 @@ export function createRepositories(db) {
           extraThreadIds,
           limit,
           offset,
+          forceLegacy,
           nowIso: now(),
         });
         if (built.empty) return { threadIds: [], total: 0, categoryCounts: [] };
@@ -1470,6 +1536,12 @@ export function createRepositories(db) {
     },
     threads: {
       get: (id) => publicThread(queries.threadById.get(id)),
+      getMany(ids = []) {
+        const clean = [...new Set((ids || []).filter(Boolean))];
+        if (!clean.length) return new Map();
+        const rows = db.prepare(`SELECT * FROM threads WHERE id IN (${clean.map(() => '?').join(',')})`).all(...clean);
+        return new Map(rows.map((row) => [row.id, publicThread(row)]));
+      },
       findBySubject: (accountId, subject) => publicThread(queries.threadBySubject.get(accountId, subject)),
       list: ({ accountId, limit = 50, offset = 0 }) => queries.threadList.all({ accountId, limit, offset }).map(publicThread),
       create(input) {

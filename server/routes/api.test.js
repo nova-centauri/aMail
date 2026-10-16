@@ -449,6 +449,18 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(invalidResponse.status, 400);
   assert.equal((await invalidResponse.json()).error.code, 'VALIDATION_ERROR');
 
+  const firstList = await fetch(`${origin}/api/messages?folder=inbox`);
+  assert.equal(firstList.status, 200);
+  const etag = firstList.headers.get('etag');
+  assert.ok(etag);
+  assert.match(firstList.headers.get('cache-control') || '', /no-cache/);
+  const cachedList = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
+  assert.equal(cachedList.status, 304);
+  const hugePage = await (await fetch(`${origin}/api/messages?folder=inbox&limit=9999`)).json();
+  assert.equal(hugePage.pageSize, 200);
+  const omittedLimit = await (await fetch(`${origin}/api/messages?folder=inbox`)).json();
+  assert.equal(omittedLimit.pageSize, 50);
+
   const accountPayload = {
     // Match AccountConnectForm.submit, including its legacy credentials.email.
     name: 'New account',
