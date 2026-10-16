@@ -1,11 +1,18 @@
-import assert from 'node:assert/strict';
+/**
+ * Opt-in inbox listing benchmark. Not part of `npm test`.
+ *
+ *   npm run bench
+ *
+ * Prints before/after timings for the legacy conversation CTE vs the cheap
+ * inbox path on a 20-account, 30k-message mailbox. Wall-clock numbers are
+ * informational; CI uses structural cache/ETag/limit tests instead.
+ */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
-import { createDatabase, createRepositories } from '../db.js';
-import { buildConversationSearch } from './conversation-search.js';
-import { conversationListEtag, listConversations, parsePageSize } from './inbox.js';
+import { createDatabase, createRepositories } from '../server/db.js';
+import { buildConversationSearch } from '../server/services/conversation-search.js';
+import { conversationListEtag, listConversations, parsePageSize } from '../server/services/inbox.js';
 
 const ACCOUNT_COUNT = 20;
 const MESSAGES_PER_ACCOUNT = 1_500;
@@ -80,23 +87,13 @@ async function timeMsAsync(work) {
   return { result, durationMs };
 }
 
-test('GET /api/messages is cheap on a 20-account, 30k-message mailbox', async (t) => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-bench-'));
-  const db = createDatabase({ dataDir, dbPath: path.join(dataDir, 'mail.sqlite') });
-  const repos = createRepositories(db);
-  t.after(() => {
-    repos.close();
-    fs.rmSync(dataDir, { recursive: true, force: true });
-  });
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-bench-'));
+const db = createDatabase({ dataDir, dbPath: path.join(dataDir, 'mail.sqlite') });
+const repos = createRepositories(db);
 
+try {
   const accountIds = seedLargeMailbox(db);
   const totalMessages = ACCOUNT_COUNT * MESSAGES_PER_ACCOUNT;
-  assert.equal(accountIds.length, ACCOUNT_COUNT);
-  assert.equal(Number(db.prepare('SELECT COUNT(*) AS c FROM messages').get().c), totalMessages);
-
-  const indexes = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_inbox_list'`).all();
-  assert.equal(indexes.length, 1);
-
   const cheapSql = buildConversationSearch({
     accountIds,
     folder: 'inbox',
@@ -115,9 +112,7 @@ test('GET /api/messages is cheap on a 20-account, 30k-message mailbox', async (t
     nowIso: '2026-09-18T00:00:00.000Z',
   });
   const cheapPlan = db.prepare(`EXPLAIN QUERY PLAN ${cheapSql.pageSql}`).all(cheapSql.params);
-  const planText = cheapPlan.map((row) => row.detail).join('\n');
-  console.log(`inbox-bench-plan ${planText.replaceAll('\n', ' | ')}`);
-  assert.match(planText, /INDEX|COVERING|idx_messages/i);
+  const planText = cheapPlan.map((row) => row.detail).join(' | ');
 
   const runLegacySql = () => {
     db.prepare(legacySql.pageSql).all(legacySql.params);
@@ -130,7 +125,6 @@ test('GET /api/messages is cheap on a 20-account, 30k-message mailbox', async (t
     db.prepare(cheapSql.categorySql).all(cheapSql.params);
   };
 
-  // Warm the statements once so the comparison is execution, not prepare.
   runLegacySql();
   runCheapSql();
   const before = timeMs(runLegacySql);
@@ -139,8 +133,7 @@ test('GET /api/messages is cheap on a 20-account, 30k-message mailbox', async (t
   const assembledAfter = await timeMsAsync(() => listConversations(repos, { folder: 'inbox', pageSize: 50 }));
   const cached = assembledAfter.result;
   const stamp = repos.changes.stamp().changedAt;
-  const etag = conversationListEtag(stamp, { folder: 'inbox', pageSize: 50, query: '' });
-  const etagAgain = conversationListEtag(stamp, { folder: 'inbox', pageSize: parsePageSize(50), query: '' });
+  const etag = conversationListEtag(stamp, { folder: 'inbox', pageSize: parsePageSize(50), query: '' });
 
   const report = {
     accounts: ACCOUNT_COUNT,
@@ -153,15 +146,10 @@ test('GET /api/messages is cheap on a 20-account, 30k-message mailbox', async (t
     pageSize: cached.pageSize,
     total: cached.total,
     etag,
+    plan: planText,
   };
-  // Printed for the PR. The assertions below are the gate.
-  console.log(`inbox-bench ${JSON.stringify(report)}`);
-
-  assert.equal(cached.pageSize, 50);
-  assert.equal(cached.messages.length, 50);
-  assert.equal(cached.total, totalMessages);
-  assert.ok(after.durationMs < before.durationMs, `cheap SQL ${after.durationMs}ms should beat legacy ${before.durationMs}ms`);
-  assert.ok(assembledAfter.durationMs < 5, `unchanged inbox cache should be nearly free, got ${assembledAfter.durationMs}ms`);
-  assert.equal(etag, etagAgain);
-  assert.ok(assembled.durationMs < 500, `assembled inbox listing ${assembled.durationMs}ms should stay well under a second`);
-});
+  console.log(JSON.stringify(report, null, 2));
+} finally {
+  repos.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+}

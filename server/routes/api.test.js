@@ -738,3 +738,58 @@ test('opening a thread returns cached envelopes without waiting on source hydrat
   assert.equal(payload.messages.every((message) => message.sourceImported === false), true);
   assert.equal(hydrates, 0);
 });
+
+test('GET /api/messages returns 304 for an unchanged change-version and clamps page size', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-etag-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', avatar_blob: null, avatar_mime: null,
+    color: '#1a73e8', provider: 'custom', imap_host: 'imap.example.test', imap_port: 993,
+    imap_secure: 1, smtp_host: 'smtp.example.test', smtp_port: 465, smtp_secure: 1,
+    credential_ciphertext: 'fixture', signature: '', sync_enabled: 0,
+  });
+  const thread = repos.threads.create({
+    account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-01-01T00:00:00.000Z',
+  });
+  repos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello',
+    fromEmail: 'friend@example.test', timestamp: '2026-01-01T00:00:00.000Z',
+  }));
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const first = await fetch(`${origin}/api/messages?folder=inbox`);
+  assert.equal(first.status, 200);
+  const etag = first.headers.get('etag');
+  assert.ok(etag);
+  assert.match(first.headers.get('cache-control') || '', /no-cache/);
+  assert.equal((await first.json()).pageSize, 50);
+
+  const notModified = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
+  assert.equal(notModified.status, 304);
+  assert.equal(notModified.headers.get('etag'), etag);
+  assert.equal(await notModified.text(), '');
+
+  const otherView = await fetch(`${origin}/api/messages?folder=starred`, { headers: { 'If-None-Match': etag } });
+  assert.equal(otherView.status, 200);
+
+  const clamped = await (await fetch(`${origin}/api/messages?folder=inbox&limit=9999`)).json();
+  assert.equal(clamped.pageSize, 200);
+});

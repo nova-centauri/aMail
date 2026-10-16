@@ -444,16 +444,27 @@ test('page sizes clamp to a default and a maximum', () => {
   assert.equal(parsePageSize('-3'), 1);
 });
 
+function isInboxListingSql(sql) {
+  return /WITH\s+(latest|ranked|scoped)\b/i.test(sql)
+    || /FROM threads WHERE id/i.test(sql)
+    || /thread_id IN/i.test(sql)
+    || /json_array_length/i.test(sql)
+    || /ROW_NUMBER\(\)/i.test(sql);
+}
+
 test('unchanged inbox listings reuse the change-version cache and keep a stable ETag', async (t) => {
   const { repos, executed, add, thread } = fixture(t);
   add(thread('Cached'));
   const first = await listConversations(repos, { folder: 'inbox', pageSize: 25 });
   assert.equal(first.pageSize, 25);
   assert.equal(first.total, 1);
+  assert.ok(executed.some(isInboxListingSql));
   executed.length = 0;
   const second = await listConversations(repos, { folder: 'inbox', pageSize: 25 });
   assert.equal(second.total, 1);
-  assert.equal(executed.filter((sql) => /FROM threads WHERE id/.test(sql)).length, 0);
+  assert.deepEqual(second.messages.map((item) => item.id), first.messages.map((item) => item.id));
+  const listingSql = executed.filter(isInboxListingSql);
+  assert.equal(listingSql.length, 0, listingSql[0] || 'cache hit ran a listing query');
   const stamp = repos.changes.stamp().changedAt;
   assert.equal(
     conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
