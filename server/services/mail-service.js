@@ -53,6 +53,9 @@ import {
   toImapSearchQuery,
 } from '../mail/imap-search.js';
 import { emptyRuntimeStatus } from './runtime-health.js';
+import { createPhaseTimer, debugTimingEnabled } from './debug-timing.js';
+import { planMailboxSync, uidPages } from './mailbox-sync-plan.js';
+import { createSyncIngest } from './sync-ingest.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
@@ -518,6 +521,7 @@ export function createMailService({
   compileMessage = compileRfc822Message,
   createMessageId = () => `<${randomUUID()}@amail.local>`,
 }) {
+  const ingest = createSyncIngest({ config, logger });
   const failedImapClients = new WeakSet();
   const newImapClient = (account, credentials, { pooled = false } = {}) => {
     const client = new ImapClient(buildImapOptions(account, credentials, config, { pooled }));
@@ -930,7 +934,7 @@ export function createMailService({
     };
   }
 
-  async function syncMailbox({ account, client, descriptor, limit, generation }) {
+  async function syncMailbox({ account, client, descriptor, limit, generation, mode = 'incremental' }) {
     const { mailbox, role, allMailMirror = false } = descriptor;
     const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
       ? config.syncMaxMessageBytes
@@ -985,6 +989,8 @@ export function createMailService({
       await persistPayloads(pendingWrites.splice(0, pendingWrites.length));
     };
 
+    let highestModseq = previousSync?.highest_modseq || null;
+
     const saveProgress = () => {
       assertAccountGeneration(account.id, generation);
       repos.sync.save({
@@ -994,12 +1000,40 @@ export function createMailService({
         uid_validity: uidValidity,
         last_error: null,
         synced_at: new Date().toISOString(),
+        highest_modseq: highestModseq,
       });
     };
 
     const ingestSource = async (message, source) => {
       const uid = Number(message.uid || 0);
       try {
+        if (ingest.enabled) {
+          try {
+            const result = await ingest.ingest({
+              source,
+              account,
+              mailbox,
+              role,
+              allMailMirror,
+              message,
+            });
+            if (!result?.fallback) {
+              if (result.ok && result.imported) imported += 1;
+              else if (!result.ok) {
+                skippedFailed += 1;
+                repos.sync.recordSkip?.({
+                  account_id: account.id,
+                  mailbox,
+                  uid,
+                  reason: String(result.error || 'import-failed').slice(0, 500),
+                });
+              }
+              return;
+            }
+          } catch {
+            // Worker unavailable; parse on this thread.
+          }
+        }
         const payload = await ingestImapMessage({
           account,
           mailbox,
@@ -1072,47 +1106,149 @@ export function createMailService({
       skippedUnavailable += chunk.length - seen.size;
     };
 
+    const timing = createPhaseTimer({
+      enabled: debugTimingEnabled(config),
+      logger,
+      label: 'imap_sync_mailbox',
+    });
+
+    async function readStatus() {
+      if (typeof client.status !== 'function') return null;
+      try {
+        const status = await client.status(mailbox, { uidNext: true, uidValidity: true, highestModseq: true });
+        return {
+          uidNext: Number(status?.uidNext) || 0,
+          uidValidity: Number(status?.uidValidity) || null,
+          highestModseq: status?.highestModseq != null ? String(status.highestModseq) : null,
+        };
+      } catch {
+        return null;
+      }
+    }
+
+    async function applyFlagChanges(changedSince) {
+      const since = changedSince != null && changedSince !== '' ? changedSince : null;
+      if (since == null) return;
+      const query = { uid: true, flags: true };
+      const options = { uid: true, changedSince: since };
+      for await (const message of client.fetch('1:*', query, options)) {
+        const uid = Number(message.uid || 0);
+        const existing = uid ? repos.messages.findByUid?.(account.id, mailbox, uid) : null;
+        if (!existing?.id || typeof repos.messages.setState !== 'function') continue;
+        const flags = new Set(setValues(message.flags));
+        repos.messages.setState(existing.id, {
+          isRead: flags.has('\\Seen'),
+          isStarred: flags.has('\\Flagged'),
+        });
+        await yieldEventLoop();
+      }
+    }
+
     try {
+      const previousUidValidity = Number(previousSync?.uid_validity) || null;
+      const preview = await readStatus();
+      const planPreview = planMailboxSync({
+        lastUid,
+        uidValidity: preview?.uidValidity ?? previousUidValidity,
+        previousUidValidity,
+        uidNext: preview?.uidNext,
+        limit,
+        role,
+        mode,
+        mailboxModseq: preview?.highestModseq,
+        previousModseq: highestModseq,
+      });
+      timing.mark('status');
+      if (preview && planPreview.kind === 'unchanged') {
+        uidValidity = preview.uidValidity;
+        highestModseq = preview.highestModseq || highestModseq;
+        timing.log({ accountId: account.id, mailbox, plan: planPreview.kind });
+        return {
+          mailbox,
+          role,
+          status: 'ok',
+          imported: 0,
+          skipped: 0,
+          skipReasons: [],
+          lastUid,
+          remaining: 0,
+          uidValidityChanged: false,
+          plan: planPreview.kind,
+        };
+      }
+
       lock = await client.getMailboxLock(mailbox);
       assertAccountGeneration(account.id, generation);
-      uidValidity = Number(client.mailbox?.uidValidity) || null;
-      const previousUidValidity = Number(previousSync?.uid_validity) || null;
-      if (previousUidValidity && uidValidity && previousUidValidity !== uidValidity) {
-        uidValidityChanged = true;
-        logger.info({ accountId: account.id, mailbox }, 'IMAP UIDVALIDITY changed; resynchronizing mailbox window');
+      uidValidity = Number(client.mailbox?.uidValidity) || preview?.uidValidity || null;
+      if (client.mailbox?.highestModseq != null) highestModseq = String(client.mailbox.highestModseq);
+      const uidNext = Number(client.mailbox?.uidNext || preview?.uidNext || 0);
+      const plan = planMailboxSync({
+        lastUid,
+        uidValidity,
+        previousUidValidity,
+        uidNext,
+        limit,
+        role,
+        mode,
+        mailboxModseq: highestModseq,
+        previousModseq: previousSync?.highest_modseq || null,
+      });
+      uidValidityChanged = Boolean(plan.uidValidityChanged);
+      if (plan.resetCursor) {
         lastUid = 0;
         repos.sync.clearSkips?.(account.id, mailbox);
+        if (uidValidityChanged) {
+          logger.info({ accountId: account.id, mailbox }, 'IMAP UIDVALIDITY changed; resynchronizing mailbox window');
+        }
       }
-      const uidNext = Number(client.mailbox?.uidNext || 0);
+
+      if (plan.kind === 'unchanged') {
+        timing.log({ accountId: account.id, mailbox, plan: plan.kind });
+        return {
+          mailbox,
+          role,
+          status: 'ok',
+          imported: 0,
+          skipped: 0,
+          skipReasons: [],
+          lastUid,
+          remaining: 0,
+          uidValidityChanged,
+          plan: plan.kind,
+        };
+      }
+
+      if (plan.kind === 'flags') {
+        await applyFlagChanges(plan.changedSince);
+        saveProgress();
+        timing.log({ accountId: account.id, mailbox, plan: plan.kind });
+        return {
+          mailbox,
+          role,
+          status: 'ok',
+          imported: 0,
+          skipped: 0,
+          skipReasons: [],
+          lastUid,
+          remaining: 0,
+          uidValidityChanged,
+          plan: plan.kind,
+        };
+      }
+
+      const scanDrafts = Boolean(plan.scanDrafts);
       const latestUid = Math.max(0, uidNext - 1);
-      // Drafts keep the UID they were created with after newer drafts are sent
-      // and expunged. A high-water mark that starts at the newest window, or
-      // that is already caught up to UIDNEXT, never sees those older messages.
-      const scanDrafts = role === 'drafts';
-      if (latestUid > lastUid || scanDrafts) {
-        // A mailbox seen for the first time imports only its newest `limit`
-        // messages. After that every UID above the high-water mark is imported,
-        // oldest first, so a burst larger than one page is drained across pages
-        // and passes instead of being jumped over. Drafts are the exception:
-        // every still-present UID is eligible until it is stored.
-        const firstUid = scanDrafts ? 1 : (lastUid > 0 ? lastUid + 1 : Math.max(1, latestUid - limit + 1));
-        const endUid = Math.max(latestUid, firstUid);
-        // Size-only scan: a few bytes per message, no bodies, so oversized mail
-        // is rejected without transferring it. UIDs arrive in ascending order.
+      const pages = uidPages(plan.firstUid, plan.endUid, limit);
+      const startedAt = Date.now();
+      let pageIndex = 0;
+      for (const page of pages) {
         const scanned = [];
-        let scannedSinceYield = 0;
-        for await (const message of client.fetch(`${firstUid}:${endUid}`, { uid: true, size: true }, { uid: true })) {
+        for await (const message of client.fetch(`${page.firstUid}:${page.endUid}`, { uid: true, size: true }, { uid: true })) {
           const uid = Number(message.uid || 0);
-          // `n:m` can return the last message when nothing newer exists.
           if (uid < 1 || uid > latestUid) continue;
           if (!scanDrafts && uid <= lastUid) continue;
           const size = Number(message.size);
           scanned.push({ uid, size: Number.isSafeInteger(size) && size >= 0 ? size : null });
-          scannedSinceYield += 1;
-          if (scannedSinceYield >= SYNC_SCAN_YIELD_EVERY) {
-            scannedSinceYield = 0;
-            await yieldEventLoop();
-          }
         }
         const candidates = [];
         for (const candidate of scanned) {
@@ -1122,34 +1258,28 @@ export function createMailService({
           }
           candidates.push(candidate);
         }
-
-        const startedAt = Date.now();
-        let processed = 0;
-        while (processed < candidates.length) {
-          const page = candidates.slice(processed, processed + limit);
-          const wanted = [];
-          for (const candidate of page) {
-            if (candidate.size !== null && candidate.size > maxMessageBytes) skippedTooLarge += 1;
-            else wanted.push(candidate);
-          }
-          for (let index = 0; index < wanted.length; index += SYNC_SOURCE_CHUNK) {
-            await fetchSources(wanted.slice(index, index + SYNC_SOURCE_CHUNK));
-          }
-          await flushWrites();
-          processed += page.length;
-          lastUid = Math.max(lastUid, page.at(-1).uid);
-          // Persist each page so a restart or a later failure resumes here.
-          saveProgress();
-          // better-sqlite3 writes are synchronous; yield so /api/health and
-          // /api/messages are not starved for the rest of a long IMAP pass.
-          await yieldEventLoop();
-          if (Date.now() - startedAt >= passBudgetMs) break;
+        const wanted = [];
+        for (const candidate of candidates) {
+          if (candidate.size !== null && candidate.size > maxMessageBytes) skippedTooLarge += 1;
+          else wanted.push(candidate);
         }
-        remaining = candidates.length - processed;
-        if (remaining > 0) {
-          logger.info({ accountId: account.id, mailbox, remaining }, 'IMAP mailbox backlog continues on the next pass');
+        for (let index = 0; index < wanted.length; index += SYNC_SOURCE_CHUNK) {
+          await fetchSources(wanted.slice(index, index + SYNC_SOURCE_CHUNK));
         }
+        await flushWrites();
+        if (!scanDrafts) lastUid = Math.max(lastUid, page.endUid);
+        else if (scanned.length) lastUid = Math.max(lastUid, scanned.at(-1).uid);
+        saveProgress();
+        await yieldEventLoop();
+        pageIndex += 1;
+        timing.mark(`page_${page.firstUid}_${page.endUid}`);
+        if (Date.now() - startedAt >= passBudgetMs) break;
       }
+      remaining = scanDrafts ? 0 : Math.max(0, (plan.endUid || 0) - lastUid);
+      if (remaining > 0) {
+        logger.info({ accountId: account.id, mailbox, remaining }, 'IMAP mailbox backlog continues on the next pass');
+      }
+      timing.log({ accountId: account.id, mailbox, plan: plan.kind, imported, remaining });
       const skipped = skippedTooLarge + skippedUnavailable + skippedFailed;
       const skipReasons = [
         skippedTooLarge && { code: 'IMAP_MESSAGE_TOO_LARGE', count: skippedTooLarge, maxBytes: maxMessageBytes },
@@ -1193,7 +1323,7 @@ export function createMailService({
     }
   }
 
-  async function runSyncAccount(accountId, { mailbox, limit = config.syncBatchSize } = {}) {
+  async function runSyncAccount(accountId, { mailbox, limit = config.syncBatchSize, mode = 'incremental' } = {}) {
     const generation = accountGeneration(accountId);
     const { account, credentials } = accountAndCredentials(accountId);
     const explicitMailbox = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : null;
@@ -1229,7 +1359,7 @@ export function createMailService({
       const mailboxes = [];
       for (const descriptor of descriptors) {
         try {
-          mailboxes.push(await syncMailbox({ account, client, descriptor, limit, generation }));
+          mailboxes.push(await syncMailbox({ account, client, descriptor, limit, generation, mode }));
         } catch {
           assertAccountGeneration(accountId, generation);
           const failed = { mailbox: descriptor.mailbox, role: descriptor.role, status: 'failed', imported: 0, error: 'IMAP_SYNC_FAILED' };
@@ -1307,7 +1437,7 @@ export function createMailService({
   const accountSyncKey = (accountId, { mailbox, limit }) => `${accountId}\u0000${syncKey({ mailbox, limit })}`;
 
   async function syncAccount(accountId, {
-    mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false, retryFailed,
+    mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false, retryFailed, mode = 'incremental',
   } = {}) {
     const allowRetry = retryFailed === undefined ? force : Boolean(retryFailed);
     const generation = accountGeneration(accountId);
@@ -1319,7 +1449,7 @@ export function createMailService({
     const age = Math.max(Number(maxAgeMs) || 0, floor);
     const last = accountLastSync.get(key);
     if (age > 0 && last && Date.now() - last.finishedAt < age) return last.result;
-    const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit }), generation);
+    const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit, mode }), generation);
     const entry = { promise, startedAt: Date.now(), accountId };
     accountInFlight.set(key, entry);
     try {
@@ -1342,7 +1472,7 @@ export function createMailService({
     }
   }
 
-  async function runSyncAll({ mailbox = null, limit, force = false, retryFailed } = {}) {
+  async function runSyncAll({ mailbox = null, limit, force = false, retryFailed, mode = 'incremental' } = {}) {
     const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
     const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
     const startedAt = Date.now();
@@ -1356,7 +1486,7 @@ export function createMailService({
         next += 1;
         const account = accounts[index];
         try {
-          results[index] = await syncAccount(account.id, { mailbox, limit, force, retryFailed });
+          results[index] = await syncAccount(account.id, { mailbox, limit, force, retryFailed, mode });
         } catch (error) {
           results[index] = { accountId: account.id, ...(singleMailbox ? { mailbox } : {}), status: 'failed', mailboxes: [], error: error.code || 'IMAP_SYNC_FAILED' };
         }
@@ -1394,7 +1524,7 @@ export function createMailService({
       logger.warn({ err: cleanupError(error) }, 'Mail body retention prune failed');
     }
     try {
-      repos.checkpointWal?.();
+      repos.checkpointWal?.('PASSIVE');
     } catch (error) {
       logger.warn({ err: cleanupError(error) }, 'WAL checkpoint failed');
     }
@@ -1507,6 +1637,7 @@ export function createMailService({
         descriptor,
         limit: config.syncBatchSize,
         generation,
+        mode: 'incremental',
       });
       return {
         accountId,
@@ -1575,7 +1706,7 @@ export function createMailService({
     return results;
   }
 
-  async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false, retryFailed } = {}) {
+  async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false, retryFailed, mode = 'incremental' } = {}) {
     const key = syncKey({ mailbox, limit });
     while (inFlightSync) {
       if (inFlightSync.key === key) return inFlightSync.promise;
@@ -1587,7 +1718,7 @@ export function createMailService({
       return lastFullSync.results;
     }
     const generation = settingsGeneration;
-    const promise = runSyncAll({ mailbox, limit, force, retryFailed }).finally(() => afterSyncMaintenance());
+    const promise = runSyncAll({ mailbox, limit, force, retryFailed, mode }).finally(() => afterSyncMaintenance());
     inFlightSync = { key, promise, startedAt: Date.now() };
     try {
       const results = await promise;
@@ -1614,6 +1745,7 @@ export function createMailService({
       connecting: poolConnecting.size,
       coolingDown: accountCooldown.size,
       probesQueued: probeWaiters.length,
+      ingestWorker: ingest.live,
     };
   }
 
@@ -1665,6 +1797,7 @@ export function createMailService({
     inboxFollowUp.clear();
     const ids = [...imapPool.keys()];
     await Promise.all(ids.map((id) => evictPoolEntry(id)));
+    await ingest.close().catch(() => {});
   }
 
   function invalidateAccount(accountId) {

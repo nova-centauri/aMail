@@ -21,6 +21,7 @@ test('databaseFileStats reports sqlite, wal, and shm sizes without throwing on m
   fs.writeFileSync(dbPath, 'abcdefghij');
   fs.writeFileSync(`${dbPath}-wal`, 'w'.repeat(20));
   fs.writeFileSync(`${dbPath}-shm`, 's'.repeat(5));
+  assert.deepEqual(databaseFileStats(dbPath, { ttlMs: 0 }), { bytes: 10, walBytes: 20, shmBytes: 5 });
   assert.deepEqual(databaseFileStats(dbPath), { bytes: 10, walBytes: 20, shmBytes: 5 });
 });
 

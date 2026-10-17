@@ -6,6 +6,22 @@
 # environment always wins.
 set -eu
 
+if [ "${AMAIL_CPU_PROF:-}" = "1" ] || [ "${AMAIL_CPU_PROF:-}" = "true" ]; then
+  PROF_DIR="${AMAIL_DATA_DIR:-/data}/cpu-profiles"
+  mkdir -p "$PROF_DIR"
+  case "${NODE_OPTIONS:-}" in
+    *cpu-prof*) ;;
+    "")
+      NODE_OPTIONS="--cpu-prof --cpu-prof-dir=${PROF_DIR}"
+      export NODE_OPTIONS
+      ;;
+    *)
+      NODE_OPTIONS="${NODE_OPTIONS} --cpu-prof --cpu-prof-dir=${PROF_DIR}"
+      export NODE_OPTIONS
+      ;;
+  esac
+fi
+
 if [ "${AMAIL_KEY_MODE:-}" = "keyslot" ]; then
   if [ -z "${UV_THREADPOOL_SIZE:-}" ]; then
     UV_THREADPOOL_SIZE=2

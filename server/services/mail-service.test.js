@@ -99,6 +99,8 @@ test('IMAP sync yields the event loop between parse and write batches', async ()
   assert.match(source, /await yieldEventLoop\(\)/);
   assert.match(source, /SYNC_SCAN_YIELD_EVERY/);
   assert.match(source, /SYNC_WRITE_YIELD_BATCH/);
+  assert.match(source, /planMailboxSync/);
+  assert.match(source, /createSyncIngest/);
 });
 
 test('unsaved settings test verifies IMAP and SMTP without reading repositories', async () => {
@@ -261,6 +263,12 @@ function syncHarness({
       this.mailbox = { uidValidity, uidNext: maxUid + 1 };
       state.onLock?.(this, path);
       return { release() {} };
+    }
+    async status(path) {
+      this.assertIdle('STATUS');
+      const pool = messagesByMailbox ? (messagesByMailbox[path] || []) : state.messages;
+      const maxUid = (pool || []).reduce((max, message) => Math.max(max, Number(message.uid) || 0), 0);
+      return { uidNext: maxUid + 1, uidValidity, highestModseq: undefined };
     }
     async *fetch(range, query, options) {
       this.assertIdle('FETCH');
@@ -524,7 +532,7 @@ test('a burst larger than one page is imported oldest first instead of skipped',
   assert.equal(first.imported, 5);
   assert.equal(first.remaining, 7);
   assert.equal(state.savedSync.last_uid, 15);
-  assert.equal(state.fetchCalls[0].range, '11:22');
+  assert.equal(state.fetchCalls[0].range, '11:15');
 
   const second = await service.syncAccount('sync-account', { limit: 5, force: true });
   assert.equal(second.imported, 5);
@@ -586,6 +594,26 @@ test('a hung IMAP session is closed at the deadline and does not block later syn
   const [again] = await service.syncAll({ force: true });
   assert.equal(again.error, 'IMAP_SYNC_TIMEOUT');
   assert.equal(state.connects, 2);
+  await service.close();
+});
+
+test('periodic sync does not refetch already-synced UIDs', async () => {
+  const uids = [1, 2, 3];
+  const { service, state } = syncHarness({
+    ...mailboxOf(uids),
+    maxMessageBytes: 4096,
+    previousSync: { last_uid: 3, uid_validity: 41 },
+  });
+
+  const result = await service.syncAccount('sync-account');
+  assert.equal(result.imported, 0);
+  assert.equal(result.mailboxes[0].plan, 'unchanged');
+  assert.equal(state.fetchCalls.length, 0);
+  assert.equal(state.savedMessages.length, 0);
+
+  const burst = await service.syncAccount('sync-account', { force: true });
+  assert.equal(burst.imported, 0);
+  assert.equal(state.fetchCalls.length, 0);
   await service.close();
 });
 

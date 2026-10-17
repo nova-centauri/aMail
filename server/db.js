@@ -362,6 +362,8 @@ function initSchema(db) {
       PRIMARY KEY (account_id, mailbox, uid)
     );
   `);
+  const syncColumns = new Set(db.prepare('PRAGMA table_info(sync_state)').all().map((column) => column.name));
+  if (!syncColumns.has('highest_modseq')) db.exec('ALTER TABLE sync_state ADD COLUMN highest_modseq TEXT');
   const messageColumns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
   if (!messageColumns.has('is_spam')) db.exec('ALTER TABLE messages ADD COLUMN is_spam INTEGER NOT NULL DEFAULT 0');
   if (!messageColumns.has('snoozed_until')) db.exec('ALTER TABLE messages ADD COLUMN snoozed_until TEXT');
@@ -807,7 +809,7 @@ export function encryptDatabaseInPlace(dbPath, key) {
   }
 }
 
-export function createDatabase(config, { key = config.databaseKey || null } = {}) {
+export function createDatabase(config, { key = config.databaseKey || null, checkpoint = true } = {}) {
   fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   const sqliteTmpDir = prepareSqliteTempDir(config.dataDir);
   const plaintext = isPlaintextSqliteFile(config.dbPath);
@@ -838,7 +840,9 @@ export function createDatabase(config, { key = config.databaseKey || null } = {}
   db.pragma('busy_timeout = 5000');
   db.pragma(`temp_store_directory = '${sqliteTmpDir.replace(/'/g, "''")}'`);
   initSchema(db);
-  db.pragma('wal_checkpoint(TRUNCATE)');
+  // A second connection (sync ingest worker) must not TRUNCATE the WAL out
+  // from under the HTTP thread's readers.
+  if (checkpoint) db.pragma('wal_checkpoint(TRUNCATE)');
   return db;
 }
 
@@ -1056,11 +1060,12 @@ export function createRepositories(db) {
       updated_at = @updated_at
       WHERE id = @id`),
     syncState: db.prepare('SELECT * FROM sync_state WHERE account_id = ? AND mailbox = ?'),
-    syncStateUpsert: db.prepare(`INSERT INTO sync_state (account_id, mailbox, last_uid, uid_validity, last_error, synced_at)
-      VALUES (@account_id, @mailbox, @last_uid, @uid_validity, @last_error, @synced_at)
+    syncStateUpsert: db.prepare(`INSERT INTO sync_state (account_id, mailbox, last_uid, uid_validity, last_error, synced_at, highest_modseq)
+      VALUES (@account_id, @mailbox, @last_uid, @uid_validity, @last_error, @synced_at, @highest_modseq)
       ON CONFLICT(account_id, mailbox) DO UPDATE SET
         last_uid = excluded.last_uid, uid_validity = excluded.uid_validity,
-        last_error = excluded.last_error, synced_at = excluded.synced_at`),
+        last_error = excluded.last_error, synced_at = excluded.synced_at,
+        highest_modseq = COALESCE(excluded.highest_modseq, highest_modseq)`),
     syncSkipUpsert: db.prepare(`INSERT INTO sync_skips (account_id, mailbox, uid, reason, seen_at)
       VALUES (@account_id, @mailbox, @uid, @reason, @seen_at)
       ON CONFLICT(account_id, mailbox, uid) DO UPDATE SET
@@ -1205,8 +1210,10 @@ export function createRepositories(db) {
     setSearchIndexer(fn) {
       queueSearch = typeof fn === 'function' ? fn : () => {};
     },
-    checkpointWal() {
-      db.pragma('wal_checkpoint(TRUNCATE)');
+    checkpointWal(mode = 'PASSIVE') {
+      const allowed = new Set(['PASSIVE', 'RESTART', 'FULL', 'TRUNCATE']);
+      const chosen = allowed.has(String(mode || '').toUpperCase()) ? String(mode).toUpperCase() : 'PASSIVE';
+      db.pragma(`wal_checkpoint(${chosen})`);
     },
     vacuum() {
       db.exec('VACUUM');
@@ -1628,7 +1635,7 @@ export function createRepositories(db) {
     },
     sync: {
       get: (accountId, mailbox) => queries.syncState.get(accountId, mailbox) || null,
-      save: (state) => queries.syncStateUpsert.run(state),
+      save: (state) => queries.syncStateUpsert.run({ highest_modseq: null, ...state }),
       recordSkip(state) {
         queries.syncSkipUpsert.run({
           account_id: state.account_id,

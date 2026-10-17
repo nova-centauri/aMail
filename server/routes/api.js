@@ -25,6 +25,7 @@ import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, Valida
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
 import { buildHealthExtras } from '../services/runtime-health.js';
+import { createPhaseTimer, debugTimingEnabled } from '../services/debug-timing.js';
 import {
   BARE_MESSAGES_PER_MINUTE,
   MESSAGES_PER_MINUTE,
@@ -191,10 +192,18 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
 
   app.get('/api/health', (_request, response) => {
     // Container probes. Must not query SQLite, take mailbox locks, or wait
-    // on IMAP: a long sync may be on this thread, and this handler has to
-    // still return. Extras are process memory, fs.stat of the db files, and
+    // on IMAP. File sizes are cached; extras are process memory and
     // in-memory mailService.runtimeStatus().
+    const timing = createPhaseTimer({
+      enabled: debugTimingEnabled(config),
+      logger: _request.log,
+      label: 'api_health',
+    });
     const status = keyStatus();
+    timing.mark('keyStatus');
+    const extras = buildHealthExtras({ config, mailService, locked: status.locked });
+    timing.mark('extras');
+    timing.log();
     response.json({
       status: 'ok',
       version: '0.1.0',
@@ -212,7 +221,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,
       webauthnOrigins: config.webauthnOrigins || [],
-      ...buildHealthExtras({ config, mailService, locked: status.locked }),
+      ...extras,
     });
   });
 
@@ -540,19 +549,30 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       query: request.query.q,
       mailbox: request.query.mailbox,
     };
+    const timing = createPhaseTimer({
+      enabled: debugTimingEnabled(config),
+      logger: request.log,
+      label: 'api_messages',
+    });
     const stamp = listContentStamp(repos.changes.stamp() || {});
+    timing.mark('stamp');
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
     if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {
+      timing.mark('etag_hit');
+      timing.log({ status: 304 });
       response.status(304).end();
       return;
     }
-    response.json(await listConversations(repos, {
+    const listing = await listConversations(repos, {
       ...listInput,
       mailService,
       searchSource: 'human',
       signal: request.signal,
-    }));
+    });
+    timing.mark('list');
+    timing.log({ status: 200, total: listing?.total });
+    response.json(listing);
   });
   router.post('/search/deep', (request, response) => {
     const job = startDeepSearchJob({ ...(request.body || {}), ...request.query }, 'human');
