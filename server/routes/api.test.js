@@ -857,6 +857,49 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
   assert.ok(health.memory.rssBytes > 0);
 });
 
+test('GET /api/health does not touch repos, sqlite, or mailbox locks', async (t) => {
+  const config = {
+    dataDir: '/tmp/amail-health-no-db',
+    dbPath: '/tmp/does-not-exist-amail-health.sqlite',
+    credentialKey: Buffer.alloc(32, 5),
+    accessToken: null,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  let reposTouched = 0;
+  const repos = new Proxy({}, {
+    get(_target, prop) {
+      reposTouched += 1;
+      throw new Error(`health must not touch repos.${String(prop)}`);
+    },
+  });
+  const app = express();
+  registerApi(app, {
+    config,
+    repos,
+    mailService: {
+      runtimeStatus() {
+        return { inFlight: true, queueDepth: 1 };
+      },
+    },
+    remoteContent: { canIssueTokens: false },
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const response = await fetch(`${origin}/api/health`);
+  assert.equal(response.status, 200);
+  const health = await response.json();
+  assert.equal(health.status, 'ok');
+  assert.equal(health.sync.inFlight, true);
+  assert.equal(reposTouched, 0);
+  assert.equal(Object.hasOwn(health, 'accounts'), false);
+});
+
 test('GET /api/messages without If-None-Match is capped tighter than ETag pollers', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-bare-limit-'));
   const config = {

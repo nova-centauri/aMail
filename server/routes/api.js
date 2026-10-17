@@ -190,6 +190,10 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
 
   app.get('/api/health', (_request, response) => {
+    // Container probes. Must not query SQLite, take mailbox locks, or wait
+    // on IMAP: a long sync may be on this thread, and this handler has to
+    // still return. Extras are process memory, fs.stat of the db files, and
+    // in-memory mailService.runtimeStatus().
     const status = keyStatus();
     response.json({
       status: 'ok',

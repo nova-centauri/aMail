@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   buildHealthExtras,
@@ -79,4 +80,12 @@ test('readRuntimeStatus fills defaults when mailService has no snapshot', () => 
   assert.deepEqual(readRuntimeStatus({}), emptyRuntimeStatus());
   const memory = processMemorySnapshot({ rss: 10, heapUsed: 4 });
   assert.deepEqual(memory, { rssBytes: 10, heapUsedBytes: 4 });
+});
+
+test('health extras do not import or call the SQLite layer', () => {
+  const source = fs.readFileSync(fileURLToPath(new URL('./runtime-health.js', import.meta.url)), 'utf8');
+  assert.doesNotMatch(source, /from ['"]\.\.\/db\.js['"]/);
+  assert.doesNotMatch(source, /createDatabase|better-sqlite3|prepare\(/);
+  assert.match(source, /fs\.statSync/);
+  assert.match(source, /mailService\?\.runtimeStatus/);
 });
