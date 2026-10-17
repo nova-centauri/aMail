@@ -3,12 +3,14 @@ import test from 'node:test';
 import express from 'express';
 import { once } from 'node:events';
 import {
+  BARE_MESSAGES_PER_MINUTE,
   MESSAGES_PER_MINUTE,
   SYNC_PER_MINUTE,
   pollerClientKey,
   pollerRateLimit,
   pollerRateLimitEnabled,
   pollerRateLimitedBody,
+  requestHasIfNoneMatch,
   retryAfterSeconds,
 } from './poller-limit.js';
 
@@ -71,5 +73,33 @@ test('GET /api/messages and POST /api/sync return 429 with Retry-After after the
   assert.ok(syncLimited.headers.get('retry-after'));
 
   assert.equal(MESSAGES_PER_MINUTE, 15);
+  assert.equal(BARE_MESSAGES_PER_MINUTE, 4);
   assert.equal(SYNC_PER_MINUTE, 8);
+  assert.equal(requestHasIfNoneMatch({ headers: {} }), false);
+  assert.equal(requestHasIfNoneMatch({ headers: { 'if-none-match': 'W/"abc"' } }), true);
+});
+
+test('bare list polls without If-None-Match hit a tighter quota than ETag clients', async (t) => {
+  const limiter = pollerRateLimit({
+    limit: BARE_MESSAGES_PER_MINUTE,
+    windowMs: 60_000,
+    skip: requestHasIfNoneMatch,
+  });
+  const app = express();
+  app.get('/api/messages', limiter, (_request, response) => response.json({ ok: true }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  for (let index = 0; index < BARE_MESSAGES_PER_MINUTE; index += 1) {
+    assert.equal((await fetch(`${origin}/api/messages?folder=inbox&pageSize=60`)).status, 200);
+  }
+  const limited = await fetch(`${origin}/api/messages?folder=inbox&pageSize=60`);
+  assert.equal(limited.status, 429);
+
+  const cached = await fetch(`${origin}/api/messages?folder=inbox&pageSize=60`, {
+    headers: { 'If-None-Match': 'W/"plugin"' },
+  });
+  assert.equal(cached.status, 200);
 });

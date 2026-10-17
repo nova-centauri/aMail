@@ -794,6 +794,13 @@ test('GET /api/messages returns 304 for an unchanged change-version and clamps p
 
   const clamped = await (await fetch(`${origin}/api/messages?folder=inbox&limit=9999`)).json();
   assert.equal(clamped.pageSize, 200);
+
+  repos.sync.save({
+    account_id: account.id, mailbox: 'INBOX', last_uid: 1, uid_validity: 1, last_error: null,
+    synced_at: '2099-01-01T00:00:00.000Z',
+  });
+  const afterSync = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
+  assert.equal(afterSync.status, 304);
 });
 
 test('GET /api/health reports sync queue, db/WAL size, and memory without mailbox data', async (t) => {
@@ -848,6 +855,41 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
   assert.equal(health.database.walBytes, 32);
   assert.equal(typeof health.memory.rssBytes, 'number');
   assert.ok(health.memory.rssBytes > 0);
+});
+
+test('GET /api/messages without If-None-Match is capped tighter than ETag pollers', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-bare-limit-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+    pollerRateLimit: true,
+    messagesPerMinute: 15,
+    bareMessagesPerMinute: 2,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const pluginQuery = '/api/messages?folder=inbox&pageSize=60';
+  assert.equal((await fetch(`${origin}${pluginQuery}`)).status, 200);
+  assert.equal((await fetch(`${origin}${pluginQuery}`)).status, 200);
+  const limited = await fetch(`${origin}${pluginQuery}`);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get('retry-after'), '60');
+  const withEtag = await fetch(`${origin}${pluginQuery}`, { headers: { 'If-None-Match': 'W/"x"' } });
+  assert.ok([200, 304].includes(withEtag.status));
 });
 
 test('GET /api/messages returns 429 with Retry-After when the poller quota is exceeded', async (t) => {

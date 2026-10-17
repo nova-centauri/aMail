@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { conversationListEtag, ifNoneMatchHits, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listContentStamp, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-'));
@@ -474,6 +474,61 @@ test('unchanged inbox listings reuse the change-version cache and keep a stable 
     conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
     conversationListEtag(stamp, { folder: 'inbox', pageSize: 50 }),
   );
+});
+
+test('sync-cursor-only stamp changes do not bust the inbox list cache or ETag', async (t) => {
+  const { repos, executed, add, thread, account } = fixture(t);
+  add(thread('Cached'));
+  const first = await listConversations(repos, { folder: 'inbox', pageSize: 60 });
+  assert.equal(first.total, 1);
+  const etag = conversationListEtag(listContentStamp(repos.changes.stamp()), { folder: 'inbox', pageSize: 60 });
+  executed.length = 0;
+  repos.sync.save({
+    account_id: account.id,
+    mailbox: 'INBOX',
+    last_uid: 9,
+    uid_validity: 1,
+    last_error: null,
+    synced_at: '2099-01-01T00:00:00.000Z',
+  });
+  const stamp = repos.changes.stamp();
+  assert.equal(stamp.syncAt, '2099-01-01T00:00:00.000Z');
+  assert.notEqual(stamp.changedAt, stamp.messageAt);
+  assert.equal(listContentStamp(stamp), stamp.messageAt);
+  const second = await listConversations(repos, { folder: 'inbox', pageSize: 60 });
+  assert.equal(second.total, 1);
+  assert.deepEqual(second.messages.map((item) => item.id), first.messages.map((item) => item.id));
+  assert.equal(executed.filter(isInboxListingSql).length, 0, executed.filter(isInboxListingSql)[0]);
+  assert.equal(
+    conversationListEtag(listContentStamp(stamp), { folder: 'inbox', pageSize: 60 }),
+    etag,
+  );
+  add(thread('Arrived after sync'));
+  const third = await listConversations(repos, { folder: 'inbox', pageSize: 60 });
+  assert.equal(third.total, 2);
+});
+
+test('default inbox listing SQL materializes once and hydrates without bodies or attachment blobs', async (t) => {
+  const { repos, executed, add, thread } = fixture(t);
+  add(thread('With file'), {
+    attachments_json: JSON.stringify([{ filename: 'huge.bin', content: 'x'.repeat(2048) }]),
+  });
+  executed.length = 0;
+  const page = await listConversations(repos, { folder: 'inbox', pageSize: 60 });
+  assert.equal(page.pageSize, 60);
+  assert.equal(page.messages[0].hasAttachments, true);
+  assert.equal(Object.hasOwn(page.messages[0], 'htmlBody'), false);
+  const listing = executed.filter((sql) => /WITH\s+latest/i.test(sql));
+  assert.ok(listing.length >= 1);
+  for (const sql of listing) {
+    assert.match(sql, /MATERIALIZED/);
+    assert.doesNotMatch(sql, /attachments_json/);
+    assert.doesNotMatch(sql, /html_body/);
+  }
+  const hydrate = executed.filter((sql) => /json_array_length\(attachments_json\)/.test(sql));
+  assert.equal(hydrate.length, 1);
+  assert.match(hydrate[0], /thread_id IN/i);
+  assert.doesNotMatch(hydrate[0], /html_body|text_body/);
 });
 
 test('If-None-Match matches weak ETags the way Node fetch sends them', () => {
