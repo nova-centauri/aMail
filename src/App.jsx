@@ -28,7 +28,7 @@ import { collectKnownPeople } from './mail/people.js';
 import { PANEL_EASE_MS, prefersReducedMotion, usePresence } from './mail/presence.js';
 import { mergeOpenThread, nextThreadAfterRemoval, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
 import { sanitizeSignatureHtml } from './mail/signature.js';
-import { syncResultStatus, syncSkippedMessageCount } from './mail/sync.js';
+import { syncResultStatus, syncSkippedMessageCount, syncWasAccepted } from './mail/sync.js';
 import { authenticateWithPasskey, passkeysSupported, registerPasskey } from './passkeys.js';
 import { clampIndex, shortcutAction } from './shortcuts.js';
 import { getAccessToken, persistAccessToken, readDismissedFreshDrafts, readUiPrefs, writeDismissedFreshDrafts, writeUiPrefs } from './storage.js';
@@ -570,7 +570,8 @@ export default function App() {
       const response = await api(syncPath, { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', force: true }) });
       const status = syncResultStatus(response);
       const skippedMessages = syncSkippedMessageCount(response);
-      if (status === 'failed') setNotice('Mailbox sync failed. Showing the latest stored mail.');
+      if (status === 'accepted' || syncWasAccepted(response)) setNotice('Mailbox sync started. New mail will appear as it arrives.');
+      else if (status === 'failed') setNotice('Mailbox sync failed. Showing the latest stored mail.');
       else if (skippedMessages) setNotice(`Mailbox sync kept running; ${skippedMessages} ${skippedMessages === 1 ? 'message was' : 'messages were'} skipped by the download safety limit.`);
       else if (status === 'partial') setNotice('Mailbox sync finished with some folders unavailable.');
       else if (status === 'skipped') setNotice('Sync is disabled for this account.');
@@ -1193,7 +1194,8 @@ export default function App() {
       try {
         const response = await api(`/accounts/${encodeURIComponent(account.id)}/sync`, { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX' }) });
         const status = syncResultStatus(response);
-        if (status === 'failed') setNotice(`${account.email} is connected, but initial sync failed.`);
+        if (status === 'accepted' || syncWasAccepted(response)) setNotice(`${account.email} connected. Syncing mail in the background.`);
+        else if (status === 'failed') setNotice(`${account.email} is connected, but initial sync failed.`);
         else if (status === 'partial') setNotice(`${account.email} is connected. Some folders could not sync yet.`);
         else if (status === 'skipped') setNotice(`${account.email} is connected. Sync is disabled for this account.`);
         else setNotice(`${account.email} synced.`);

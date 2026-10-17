@@ -38,6 +38,8 @@ test('non-implicit TLS ports require STARTTLS before authentication', () => {
   assert.equal(imap.doSTARTTLS, true);
   assert.equal(imap.tls.rejectUnauthorized, true);
   assert.equal(imap.disableAutoIdle, true);
+  assert.equal(imap.connectionTimeout, 12_345);
+  assert.equal(imap.greetingTimeout, 12_345);
   assert.equal(imap.proxy, undefined);
   assert.equal(imap.proxyUrl, undefined);
   assert.equal(Object.hasOwn(imap, 'proxy'), false);
@@ -46,6 +48,7 @@ test('non-implicit TLS ports require STARTTLS before authentication', () => {
     remoteContentProxyUrl: 'http://tor-proxy:8118',
   }, { pooled: true });
   assert.equal(pooled.disableAutoIdle, false);
+  assert.equal(pooled.connectionTimeout, 12_345);
   assert.equal(pooled.proxy, undefined);
   assert.equal(Object.hasOwn(pooled, 'proxy'), false);
   assert.equal(smtp.proxy, undefined);
@@ -823,6 +826,52 @@ test('failed pooled IMAP connects close their socket and never enter the reusabl
       (error) => error.code === 'IMAP_SYNC_FAILED');
     assert.equal(state.connects, 2);
     assert.equal(state.openSessions, 0);
+  } finally {
+    await service.close();
+  }
+});
+
+test('a failed IMAP account cools down instead of reconnecting on every poll', async () => {
+  const { service, state } = syncHarness({ messages: [], sources: new Map(), connectFailure: true });
+  try {
+    await assert.rejects(() => service.syncAccount('sync-account'), (error) => error.code === 'IMAP_SYNC_FAILED');
+    assert.equal(state.connects, 1);
+    const skipped = await service.syncAccount('sync-account');
+    assert.equal(skipped.coolingDown, true);
+    assert.equal(skipped.status, 'skipped');
+    assert.equal(state.connects, 1);
+    const [probed] = await service.probeInboxes();
+    assert.equal(probed.coolingDown, true);
+    assert.equal(state.connects, 1);
+    const [all] = await service.syncAll({ force: true, retryFailed: false });
+    assert.equal(all.coolingDown, true);
+    assert.equal(state.connects, 1);
+    await assert.rejects(() => service.syncAccount('sync-account', { force: true, retryFailed: true }),
+      (error) => error.code === 'IMAP_SYNC_FAILED');
+    assert.equal(state.connects, 2);
+  } finally {
+    await service.close();
+  }
+});
+
+test('enqueueSyncAll returns before IMAP finishes and coalesces a second caller', async () => {
+  const { service, state } = syncHarness({ messages: [], sources: new Map(), connectDelayMs: 40 });
+  try {
+    const first = service.enqueueSyncAll({ force: true });
+    assert.equal(first.accepted, true);
+    assert.equal(first.state, 'started');
+    assert.equal(first.sync.inFlight, true);
+    assert.equal(typeof first.sync.oldestStartedAt, 'string');
+    assert.equal(typeof first.sync.oldestAgeMs, 'number');
+    const second = service.enqueueSyncAll({ force: true });
+    assert.equal(second.state, 'in-flight');
+    const joined = await service.syncAll({ force: true });
+    assert.equal(joined[0].accountId, 'sync-account');
+    assert.equal(state.connects, 1);
+    assert.equal(service.runtimeStatus().inFlight, false);
+    assert.equal(service.runtimeStatus().oldestStartedAt, null);
+    assert.ok(state.logs.some((entry) => entry.message === 'IMAP full synchronization finished'));
+    assert.ok(state.logs.some((entry) => entry.message === 'IMAP account synchronization finished'));
   } finally {
     await service.close();
   }

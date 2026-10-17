@@ -793,3 +793,160 @@ test('GET /api/messages returns 304 for an unchanged change-version and clamps p
   const clamped = await (await fetch(`${origin}/api/messages?folder=inbox&limit=9999`)).json();
   assert.equal(clamped.pageSize, 200);
 });
+
+test('GET /api/health reports sync queue, db/WAL size, and memory without mailbox data', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-health-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+    releaseSha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  };
+  const repos = createRepositories(createDatabase(config));
+  fs.writeFileSync(`${config.dbPath}-wal`, 'w'.repeat(32));
+  const mailService = {
+    runtimeStatus() {
+      return {
+        inFlight: true,
+        queueDepth: 3,
+        oldestStartedAt: '2026-10-17T12:00:00.000Z',
+        oldestAgeMs: 2500,
+        imapPoolSize: 2,
+        connecting: 1,
+        coolingDown: 1,
+        probesQueued: 0,
+      };
+    },
+  };
+  const app = express();
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const health = await (await fetch(`${origin}/api/health`)).json();
+  assert.equal(health.status, 'ok');
+  assert.equal(health.releaseSha, config.releaseSha);
+  assert.equal(Object.hasOwn(health, 'accounts'), false);
+  assert.equal(health.sync.inFlight, true);
+  assert.equal(health.sync.queueDepth, 3);
+  assert.equal(health.sync.oldestStartedAt, '2026-10-17T12:00:00.000Z');
+  assert.equal(health.sync.coolingDown, 1);
+  assert.ok(health.database.bytes > 0);
+  assert.equal(health.database.walBytes, 32);
+  assert.equal(typeof health.memory.rssBytes, 'number');
+  assert.ok(health.memory.rssBytes > 0);
+});
+
+test('POST /api/sync returns 202 without waiting for IMAP and coalesces callers', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-sync-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const calls = [];
+  const mailService = {
+    enqueueSyncAll(options) {
+      calls.push(options);
+      return {
+        accepted: true,
+        state: calls.length === 1 ? 'started' : 'in-flight',
+        sync: {
+          inFlight: true,
+          queueDepth: 1,
+          oldestStartedAt: '2026-10-17T12:00:00.000Z',
+          oldestAgeMs: 8,
+          imapPoolSize: 0,
+          connecting: 1,
+          coolingDown: 0,
+          probesQueued: 0,
+        },
+      };
+    },
+    enqueueSyncAccount(accountId, options) {
+      calls.push({ accountId, ...options });
+      return {
+        accepted: true,
+        state: 'started',
+        accountId,
+        sync: {
+          inFlight: true,
+          queueDepth: 1,
+          oldestStartedAt: '2026-10-17T12:00:00.000Z',
+          oldestAgeMs: 1,
+          imapPoolSize: 0,
+          connecting: 1,
+          coolingDown: 0,
+          probesQueued: 0,
+        },
+      };
+    },
+  };
+  const app = express();
+  app.use(express.json());
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const first = await fetch(`${origin}/api/sync`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mailbox: 'INBOX' }),
+  });
+  assert.equal(first.status, 202);
+  const firstBody = await first.json();
+  assert.equal(firstBody.accepted, true);
+  assert.equal(firstBody.state, 'started');
+  assert.equal(Object.hasOwn(firstBody, 'results'), false);
+  assert.equal(firstBody.sync.inFlight, true);
+
+  const second = await fetch(`${origin}/api/sync`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ mailbox: 'INBOX' }),
+  });
+  assert.equal(second.status, 202);
+  assert.equal((await second.json()).state, 'in-flight');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].retryFailed, false);
+
+  const forced = await fetch(`${origin}/api/sync`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ force: true }),
+  });
+  assert.equal(forced.status, 202);
+  assert.equal(calls.at(-1).retryFailed, true);
+  assert.equal(calls.at(-1).force, true);
+
+  const account = await fetch(`${origin}/api/accounts/acct-1/sync`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ force: true }),
+  });
+  assert.equal(account.status, 202);
+  const accountBody = await account.json();
+  assert.equal(accountBody.accepted, true);
+  assert.equal(accountBody.accountId, 'acct-1');
+});

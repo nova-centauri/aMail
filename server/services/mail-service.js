@@ -52,6 +52,7 @@ import {
   toGmailRawQuery,
   toImapSearchQuery,
 } from '../mail/imap-search.js';
+import { emptyRuntimeStatus } from './runtime-health.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
@@ -71,6 +72,9 @@ const DEFAULT_SYNC_ACCOUNT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_SYNC_CONCURRENCY = 3;
 const IMAP_LIST_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_IMAP_POOL_IDLE_MS = 8 * 60_000;
+// After IMAP_SYNC_FAILED / connect failure, skip that account until this
+// backoff elapses. Manual force+retryFailed bypasses it; background drain does not.
+export const SYNC_FAILURE_BACKOFF_MS = [15_000, 30_000, 60_000, 2 * 60_000, 5 * 60_000, 15 * 60_000];
 
 const asIso = (value) => {
   const date = value ? new Date(value) : null;
@@ -173,6 +177,11 @@ export function buildImapOptions(account, credentials, config, { pooled = false 
     doSTARTTLS: secure ? undefined : true,
     auth: buildAuth(credentials, account.email, 'imap'),
     logger: false,
+    // ImapFlow defaults connectionTimeout to 90s. A dead host then occupies a
+    // sync worker (and, before HTTP 202, the Nginx upstream) for that long on
+    // every retry. Bound handshake + greeting to the same budget as SMTP.
+    connectionTimeout: config.syncTimeoutMs,
+    greetingTimeout: Math.min(config.syncTimeoutMs, 20_000),
     socketTimeout: pooled ? Math.max(config.syncTimeoutMs, poolIdleMs + 60_000) : config.syncTimeoutMs,
     tls: { rejectUnauthorized: !config.allowInsecureTls },
     // One-shot connections log out immediately. Pooled ones keep INBOX selected
@@ -541,6 +550,49 @@ export function createMailService({
   const probeWaiters = [];
   let probeSlots = 0;
   let closed = false;
+  const accountCooldown = new Map();
+
+  function cooldownEntry(accountId) {
+    return accountCooldown.get(accountId) || null;
+  }
+
+  function accountIsCoolingDown(accountId) {
+    const entry = cooldownEntry(accountId);
+    return Boolean(entry && Date.now() < entry.until);
+  }
+
+  function noteSyncSuccess(accountId) {
+    accountCooldown.delete(accountId);
+  }
+
+  function noteSyncFailure(accountId, error) {
+    if (error?.code === 'ACCOUNT_SETTINGS_CHANGED') return;
+    const prev = cooldownEntry(accountId);
+    const failures = (prev?.failures || 0) + 1;
+    const delay = SYNC_FAILURE_BACKOFF_MS[Math.min(failures - 1, SYNC_FAILURE_BACKOFF_MS.length - 1)];
+    const jitter = Math.floor(delay * 0.2 * Math.random());
+    accountCooldown.set(accountId, {
+      until: Date.now() + delay + jitter,
+      failures,
+      lastError: error?.code || 'IMAP_SYNC_FAILED',
+    });
+  }
+
+  function cooldownSkipResult(accountId, { mailbox } = {}) {
+    const entry = cooldownEntry(accountId);
+    const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
+    return {
+      accountId,
+      ...(singleMailbox ? { mailbox: mailbox.trim() } : {}),
+      skipped: true,
+      coolingDown: true,
+      coolingDownUntil: entry ? new Date(entry.until).toISOString() : null,
+      reason: 'IMAP recently failed; waiting to retry.',
+      error: entry?.lastError || 'IMAP_SYNC_FAILED',
+      status: 'skipped',
+      mailboxes: [],
+    };
+  }
 
   function clearPoolTimer(entry) {
     if (entry?.closeTimer) {
@@ -1221,30 +1273,46 @@ export function createMailService({
   }
   const accountSyncKey = (accountId, { mailbox, limit }) => `${accountId}\u0000${syncKey({ mailbox, limit })}`;
 
-  async function syncAccount(accountId, { mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false } = {}) {
+  async function syncAccount(accountId, {
+    mailbox, limit = config.syncBatchSize, maxAgeMs = 0, force = false, retryFailed,
+  } = {}) {
+    const allowRetry = retryFailed === undefined ? force : Boolean(retryFailed);
     const generation = accountGeneration(accountId);
     const key = accountSyncKey(accountId, { mailbox, limit });
     const pending = accountInFlight.get(key);
-    if (pending) return pending;
+    if (pending) return pending.promise;
+    if (!allowRetry && accountIsCoolingDown(accountId)) return cooldownSkipResult(accountId, { mailbox });
     const floor = force ? 0 : (Number(config.syncMinIntervalMs) || 0);
     const age = Math.max(Number(maxAgeMs) || 0, floor);
     const last = accountLastSync.get(key);
     if (age > 0 && last && Date.now() - last.finishedAt < age) return last.result;
     const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit }), generation);
-    accountInFlight.set(key, promise);
+    const entry = { promise, startedAt: Date.now(), accountId };
+    accountInFlight.set(key, entry);
     try {
       const result = await promise;
       assertAccountGeneration(accountId, generation);
+      noteSyncSuccess(accountId);
       accountLastSync.set(key, { finishedAt: Date.now(), result });
+      logger.info({
+        accountId,
+        durationMs: Date.now() - entry.startedAt,
+        status: result?.status,
+        imported: result?.imported || 0,
+      }, 'IMAP account synchronization finished');
       return result;
+    } catch (error) {
+      if (accountGeneration(accountId) === generation) noteSyncFailure(accountId, error);
+      throw error;
     } finally {
-      if (accountInFlight.get(key) === promise) accountInFlight.delete(key);
+      if (accountInFlight.get(key) === entry) accountInFlight.delete(key);
     }
   }
 
-  async function runSyncAll({ mailbox = null, limit, force = false } = {}) {
+  async function runSyncAll({ mailbox = null, limit, force = false, retryFailed } = {}) {
     const accounts = repos.accounts.list().filter((account) => account.syncEnabled);
     const singleMailbox = typeof mailbox === 'string' && mailbox.trim() && mailbox.trim().toLowerCase() !== 'inbox';
+    const startedAt = Date.now();
     // Accounts are independent IMAP sessions, so a slow provider only holds up
     // its own worker. Results keep the account list's order.
     const results = new Array(accounts.length);
@@ -1255,13 +1323,23 @@ export function createMailService({
         next += 1;
         const account = accounts[index];
         try {
-          results[index] = await syncAccount(account.id, { mailbox, limit, force });
+          results[index] = await syncAccount(account.id, { mailbox, limit, force, retryFailed });
         } catch (error) {
           results[index] = { accountId: account.id, ...(singleMailbox ? { mailbox } : {}), status: 'failed', mailboxes: [], error: error.code || 'IMAP_SYNC_FAILED' };
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(syncConcurrency, accounts.length) }, worker));
+    const failed = results.filter((result) => result?.status === 'failed' && !result?.coolingDown).length;
+    const cooling = results.filter((result) => result?.coolingDown).length;
+    const imported = results.reduce((sum, result) => sum + (Number(result?.imported) || 0), 0);
+    logger.info({
+      durationMs: Date.now() - startedAt,
+      accounts: results.length,
+      imported,
+      failed,
+      coolingDown: cooling,
+    }, 'IMAP full synchronization finished');
     return results;
   }
 
@@ -1335,6 +1413,9 @@ export function createMailService({
 
   async function runInboxProbe(accountId) {
     const generation = accountGeneration(accountId);
+    if (accountIsCoolingDown(accountId)) {
+      return { accountId, status: 'skipped', changed: false, imported: 0, probed: false, coolingDown: true };
+    }
     for (const key of accountInFlight.keys()) {
       if (!key.startsWith(`${accountId}\u0000`)) continue;
       const pooled = imapPool.get(accountId);
@@ -1358,6 +1439,7 @@ export function createMailService({
     try {
       entry = await acquirePooledClient(account, credentials);
     } catch (error) {
+      noteSyncFailure(accountId, { code: 'IMAP_SYNC_FAILED' });
       logger.warn({ accountId, err: cleanupError(error) }, 'IMAP inbox probe could not connect');
       return { accountId, status: 'failed', changed: false, imported: 0, error: 'IMAP_SYNC_FAILED' };
     }
@@ -1404,6 +1486,7 @@ export function createMailService({
       };
     } catch (error) {
       if (imapPool.get(account.id) === entry) await evictPoolEntry(account.id);
+      noteSyncFailure(accountId, error);
       logger.warn({ accountId, err: cleanupError(error) }, 'IMAP inbox probe failed');
       return { accountId, status: 'failed', changed: false, imported: 0, error: error.code || 'IMAP_SYNC_FAILED' };
     } finally {
@@ -1459,7 +1542,7 @@ export function createMailService({
     return results;
   }
 
-  async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false } = {}) {
+  async function syncAll({ mailbox = null, limit, maxAgeMs = 0, force = false, retryFailed } = {}) {
     const key = syncKey({ mailbox, limit });
     while (inFlightSync) {
       if (inFlightSync.key === key) return inFlightSync.promise;
@@ -1471,8 +1554,8 @@ export function createMailService({
       return lastFullSync.results;
     }
     const generation = settingsGeneration;
-    const promise = runSyncAll({ mailbox, limit, force }).finally(() => afterSyncMaintenance());
-    inFlightSync = { key, promise };
+    const promise = runSyncAll({ mailbox, limit, force, retryFailed }).finally(() => afterSyncMaintenance());
+    inFlightSync = { key, promise, startedAt: Date.now() };
     try {
       const results = await promise;
       if (generation === settingsGeneration) lastFullSync = { key, finishedAt: Date.now(), results };
@@ -1480,6 +1563,66 @@ export function createMailService({
     } finally {
       inFlightSync = null;
     }
+  }
+
+  function runtimeStatus() {
+    const started = [];
+    if (inFlightSync?.startedAt) started.push(inFlightSync.startedAt);
+    for (const entry of accountInFlight.values()) {
+      if (entry?.startedAt) started.push(entry.startedAt);
+    }
+    const oldestStartedAtMs = started.length ? Math.min(...started) : null;
+    return {
+      inFlight: Boolean(inFlightSync) || accountInFlight.size > 0 || poolConnecting.size > 0,
+      queueDepth: accountInFlight.size + probeWaiters.length + poolConnecting.size,
+      oldestStartedAt: oldestStartedAtMs ? new Date(oldestStartedAtMs).toISOString() : null,
+      oldestAgeMs: oldestStartedAtMs == null ? null : Math.max(0, Date.now() - oldestStartedAtMs),
+      imapPoolSize: imapPool.size,
+      connecting: poolConnecting.size,
+      coolingDown: accountCooldown.size,
+      probesQueued: probeWaiters.length,
+    };
+  }
+
+  function describeEnqueueState(options) {
+    const key = syncKey(options);
+    const floor = options.force ? 0 : (Number(config.syncMinIntervalMs) || 0);
+    const age = Math.max(Number(options.maxAgeMs) || 0, floor);
+    if (age > 0 && lastFullSync?.key === key && Date.now() - lastFullSync.finishedAt < age) return 'recent';
+    if (inFlightSync?.key === key) return 'in-flight';
+    if (inFlightSync) return 'queued';
+    return 'started';
+  }
+
+  function enqueueSyncAll(options = {}) {
+    const state = describeEnqueueState(options);
+    if (state !== 'recent') {
+      void syncAll(options).catch((error) => {
+        logger.warn({ err: cleanupError(error) }, 'Background mail sync failed');
+      });
+    }
+    return { accepted: true, state, sync: runtimeStatus() };
+  }
+
+  function enqueueSyncAccount(accountId, options = {}) {
+    const key = accountSyncKey(accountId, options);
+    const pending = accountInFlight.get(key);
+    let state = 'started';
+    const allowRetry = options.retryFailed === undefined ? options.force : Boolean(options.retryFailed);
+    if (!allowRetry && accountIsCoolingDown(accountId)) state = 'cooling';
+    else if (pending) state = 'in-flight';
+    else {
+      const floor = options.force ? 0 : (Number(config.syncMinIntervalMs) || 0);
+      const age = Math.max(Number(options.maxAgeMs) || 0, floor);
+      const last = accountLastSync.get(key);
+      if (age > 0 && last && Date.now() - last.finishedAt < age) state = 'recent';
+    }
+    if (state !== 'recent' && state !== 'cooling') {
+      void syncAccount(accountId, options).catch((error) => {
+        logger.warn({ accountId, err: cleanupError(error) }, 'Background account sync failed');
+      });
+    }
+    return { accepted: true, state, accountId, sync: runtimeStatus() };
   }
 
   async function close() {
@@ -1505,6 +1648,7 @@ export function createMailService({
       try { entry.client.close?.(); } catch { /* Already closed. */ }
     }
     poolConnecting.delete(accountId);
+    accountCooldown.delete(accountId);
     for (const key of accountInFlight.keys()) if (key.startsWith(`${accountId}\u0000`)) accountInFlight.delete(key);
     for (const key of accountLastSync.keys()) if (key.startsWith(`${accountId}\u0000`)) accountLastSync.delete(key);
     const probeTimer = inboxProbeTimers.get(accountId);
@@ -2244,5 +2388,21 @@ export function createMailService({
     }
   }
 
-  return { syncAccount, syncAll, probeInboxes, testSettings, testAccount, sendMessage, updateMessageState, fetchAttachment, hydrateMessageSource, searchAndMaterialize, invalidateAccount, close };
+  return {
+    syncAccount,
+    syncAll,
+    enqueueSyncAll,
+    enqueueSyncAccount,
+    runtimeStatus,
+    probeInboxes,
+    testSettings,
+    testAccount,
+    sendMessage,
+    updateMessageState,
+    fetchAttachment,
+    hydrateMessageSource,
+    searchAndMaterialize,
+    invalidateAccount,
+    close,
+  };
 }

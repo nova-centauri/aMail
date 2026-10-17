@@ -23,6 +23,7 @@ import { sanitizeComposeHtml } from '../utils/signature.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
+import { buildHealthExtras } from '../services/runtime-health.js';
 
 function initials(value) {
   return String(value || '?').split(/[\s@._-]+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '?';
@@ -157,6 +158,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,
       webauthnOrigins: config.webauthnOrigins || [],
+      ...buildHealthExtras({ config, mailService, locked: status.locked }),
     });
   });
 
@@ -397,25 +399,36 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     serveAvatar(response, account || { display_name: request.params.email, email: request.params.email });
   });
   router.post('/accounts/:id/test', async (request, response) => response.json({ result: await mailService.testAccount(request.params.id) }));
-  router.post('/accounts/:id/sync', async (request, response) => {
-    const result = await mailService.syncAccount(request.params.id, {
+  router.post('/accounts/:id/sync', (request, response) => {
+    const force = Boolean(request.body?.force);
+    const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
       maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
-      force: Boolean(request.body?.force),
-    });
-    response.json({ result });
+      force,
+      // Manual refresh retries a failing account; background drain does not.
+      retryFailed: force,
+    };
+    const accepted = typeof mailService.enqueueSyncAccount === 'function'
+      ? mailService.enqueueSyncAccount(request.params.id, options)
+      : { accepted: true, state: 'started', accountId: request.params.id, sync: null };
+    response.status(202).json(accepted);
   });
-  router.post('/sync', async (request, response) => {
-    const results = await mailService.syncAll({
+  router.post('/sync', (request, response) => {
+    const force = Boolean(request.body?.force);
+    const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
       // Pollers pass maxAgeSeconds to accept a run that finished this recently
       // instead of starting another; the manual refresh sends force.
       maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
-      force: Boolean(request.body?.force),
-    });
-    response.json({ results });
+      force,
+      retryFailed: force,
+    };
+    const accepted = typeof mailService.enqueueSyncAll === 'function'
+      ? mailService.enqueueSyncAll(options)
+      : { accepted: true, state: 'started', sync: null };
+    response.status(202).json(accepted);
   });
   router.get('/changes', (request, response) => {
     const since = String(request.query.since || '');
