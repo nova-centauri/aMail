@@ -24,6 +24,13 @@ import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, Valida
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
 import { buildHealthExtras } from '../services/runtime-health.js';
+import {
+  MESSAGES_PER_MINUTE,
+  SYNC_PER_MINUTE,
+  passthrough,
+  pollerRateLimit,
+  pollerRateLimitEnabled,
+} from '../middleware/poller-limit.js';
 
 function initials(value) {
   return String(value || '?').split(/[\s@._-]+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '?';
@@ -278,6 +285,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.send(result.body);
   });
 
+  const messagesLimiter = pollerRateLimitEnabled(config)
+    ? pollerRateLimit({ limit: Number(config.messagesPerMinute) || MESSAGES_PER_MINUTE })
+    : passthrough;
+  const syncLimiter = pollerRateLimitEnabled(config)
+    ? pollerRateLimit({ limit: Number(config.syncPerMinute) || SYNC_PER_MINUTE })
+    : passthrough;
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const startDeepSearchJob = (input, owner = 'human') => searchJobs.start({
     query: input.q ?? input.query,
@@ -399,7 +412,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     serveAvatar(response, account || { display_name: request.params.email, email: request.params.email });
   });
   router.post('/accounts/:id/test', async (request, response) => response.json({ result: await mailService.testAccount(request.params.id) }));
-  router.post('/accounts/:id/sync', (request, response) => {
+  router.post('/accounts/:id/sync', syncLimiter, (request, response) => {
     const force = Boolean(request.body?.force);
     const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
@@ -414,7 +427,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       : { accepted: true, state: 'started', accountId: request.params.id, sync: null };
     response.status(202).json(accepted);
   });
-  router.post('/sync', (request, response) => {
+  router.post('/sync', syncLimiter, (request, response) => {
     const force = Boolean(request.body?.force);
     const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
@@ -454,7 +467,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json(flagsPayload(savePersonFlags(repos, input ?? [])));
   });
 
-  router.get('/messages', async (request, response) => {
+  router.get('/messages', messagesLimiter, async (request, response) => {
     const listInput = {
       accountId: request.query.accountId ? String(request.query.accountId) : null,
       folder: request.query.folder,

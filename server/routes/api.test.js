@@ -847,6 +847,39 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
   assert.ok(health.memory.rssBytes > 0);
 });
 
+test('GET /api/messages returns 429 with Retry-After when the poller quota is exceeded', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-limit-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+    pollerRateLimit: true,
+    messagesPerMinute: 3,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal((await fetch(`${origin}/api/messages?folder=inbox`)).status, 200);
+  }
+  const limited = await fetch(`${origin}/api/messages?folder=inbox`);
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get('retry-after'), '60');
+  assert.equal((await limited.json()).error.code, 'RATE_LIMITED');
+});
+
 test('POST /api/sync returns 202 without waiting for IMAP and coalesces callers', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-sync-'));
   const config = {

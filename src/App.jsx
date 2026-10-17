@@ -28,6 +28,13 @@ import { collectKnownPeople } from './mail/people.js';
 import { PANEL_EASE_MS, prefersReducedMotion, usePresence } from './mail/presence.js';
 import { mergeOpenThread, nextThreadAfterRemoval, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
 import { sanitizeSignatureHtml } from './mail/signature.js';
+import {
+  mailboxQueryKey,
+  mailboxReloadNeedsAccounts,
+  mailboxReloadNeedsSession,
+  nextActiveAccount,
+  shouldStartMailboxLoad,
+} from './mail/mailbox-load.js';
 import { syncResultStatus, syncSkippedMessageCount, syncWasAccepted } from './mail/sync.js';
 import { authenticateWithPasskey, passkeysSupported, registerPasskey } from './passkeys.js';
 import { clampIndex, shortcutAction } from './shortcuts.js';
@@ -93,6 +100,10 @@ export default function App() {
   const mailboxInFlightRef = useRef(0);
   const mailEtagRef = useRef('');
   const syncInFlightRef = useRef(false);
+  const accountsRef = useRef(accounts);
+  accountsRef.current = accounts;
+  const lastMailboxStartedAtRef = useRef(0);
+  const mailboxQueryInFlightRef = useRef('');
   const demoDraftsRef = useRef([]);
   const demoDraftsSeededRef = useRef(false);
   const [savedDrafts, setSavedDrafts] = useState([]);
@@ -295,7 +306,21 @@ export default function App() {
   }, []);
 
   const loadMailbox = useCallback(async ({ keepSelection = true, silent = false } = {}) => {
-    if (silent && mailboxInFlightRef.current) return;
+    const queryKey = mailboxQueryKey({
+      folder: activeFolder,
+      accountId: activeAccount?.id,
+      category: activeCategory,
+      personFlag: activePersonFlag,
+      query: debouncedQuery,
+      accessToken,
+      sessionStamp,
+    });
+    if (!shouldStartMailboxLoad({
+      inFlight: mailboxInFlightRef.current,
+      silent,
+      sameQuery: mailboxQueryInFlightRef.current === queryKey,
+      lastStartedAt: lastMailboxStartedAtRef.current,
+    })) return;
     if (!silent) {
       deepAbortRef.current?.abort();
       const previousJob = deepSearchRef.current?.jobId;
@@ -303,15 +328,19 @@ export default function App() {
     }
     const requestId = ++loadRequestRef.current;
     mailboxInFlightRef.current += 1;
+    mailboxQueryInFlightRef.current = queryKey;
+    lastMailboxStartedAtRef.current = Date.now();
     if (!silent) setLoading(true);
     try {
       let session = null;
-      try {
-        session = await api('/session');
-      } catch (sessionError) {
-        if (sessionError.status === 401 || sessionError.status === 403) throw sessionError;
+      if (mailboxReloadNeedsSession(silent)) {
+        try {
+          session = await api('/session');
+        } catch (sessionError) {
+          if (sessionError.status === 401 || sessionError.status === 403) throw sessionError;
+        }
+        if (session?.keyMode) setKeyMode(session.keyMode);
       }
-      if (session?.keyMode) setKeyMode(session.keyMode);
       if (session?.protected && !session.authenticated) {
         setOffline(false);
         setAuthRequired(true);
@@ -337,7 +366,9 @@ export default function App() {
       const draftParams = new URLSearchParams();
       if (activeAccount?.id) draftParams.set('accountId', activeAccount.id);
       const [accountData, mailData, draftData] = await Promise.all([
-        api('/accounts'),
+        mailboxReloadNeedsAccounts(silent, accountsRef.current.length)
+          ? api('/accounts')
+          : Promise.resolve({ accounts: accountsRef.current }),
         api(`/messages?${params.toString()}`, { etag: mailEtagRef.current, acceptNotModified: true }),
         api(`/drafts${draftParams.toString() ? `?${draftParams}` : ''}`).catch(() => ({ drafts: [] })),
       ]);
@@ -347,7 +378,9 @@ export default function App() {
         return;
       }
       if (mailData?.etag) mailEtagRef.current = mailData.etag;
-      const nextAccounts = getArray(accountData, ['accounts', 'items']).map(normalizeAccount);
+      const nextAccounts = mailboxReloadNeedsAccounts(silent, accountsRef.current.length)
+        ? getArray(accountData, ['accounts', 'items']).map(normalizeAccount)
+        : accountsRef.current;
       const rawThreads = getArray(mailData, ['threads', 'messages', 'items', 'data']);
       const nextThreads = rawThreads.map(normalizeThread);
       const isFreshSetup = nextAccounts.length === 0 && nextThreads.length === 0;
@@ -382,7 +415,7 @@ export default function App() {
         setAccounts(isFreshSetup ? [] : nextAccounts);
         // Null represents the unified inbox. Preserve an explicit per-account choice,
         // but start every newly loaded mailbox with all connected accounts visible.
-        setActiveAccount((current) => nextAccounts.find((item) => item.id === current?.id) || null);
+        setActiveAccount((current) => nextActiveAccount(current, nextAccounts));
         setThreads(isFreshSetup ? previewThreads : nextThreads);
         setMailTotal(isFreshSetup ? previewThreads.length : Number.isFinite(responseTotal) ? responseTotal : nextThreads.length);
         setCategoryCounts(isFreshSetup ? countSmartCategories(previewThreads) : nextCategoryCounts);
@@ -438,6 +471,10 @@ export default function App() {
         setSelectedThread(null);
         setSavedDrafts([]);
         setDeepSearch(null);
+      } else if (error.status === 429) {
+        // Old tabs and a tight reload loop hit the server-side poller limit.
+        // Keep the last mailbox; live-sync already backs off on thrown errors.
+        if (!silent) setNotice('Too many mailbox refreshes. Waiting a moment.');
       } else {
         // Keep the last confirmed mailbox intact. Preview data is only enabled
         // after a successful zero-account response, never as an outage fallback.
@@ -448,7 +485,7 @@ export default function App() {
       mailboxInFlightRef.current = Math.max(0, mailboxInFlightRef.current - 1);
       if (requestId === loadRequestRef.current) setLoading(false);
     }
-  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, beginDeepSearch, debouncedQuery, onboardingDismissed]);
+  }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, beginDeepSearch, debouncedQuery, onboardingDismissed, sessionStamp]);
 
   const lastChangeRef = useRef('');
   const liveSyncInboxes = useCallback(async () => {
@@ -497,6 +534,8 @@ export default function App() {
     onUnauthorized: handleLiveSyncUnauthorized,
   });
 
+  // Query primitives only. `loadMailbox` also closes over beginDeepSearch and
+  // onboardingDismissed; those must not start another /api/messages pass.
   useEffect(() => { loadMailbox({ keepSelection: false }); }, [activeFolder, activeAccount?.id, activeCategory, activePersonFlag, debouncedQuery, accessToken, sessionStamp]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
