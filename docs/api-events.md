@@ -4,7 +4,7 @@ Omarchy aMail bar plugin `io.github.nova-centauri.amail` v0.2.0 (`daemon.mjs`, U
 
 ## Discovery
 
-`GET /api/health` is unauthenticated (container probes). Capability flags only; no accounts or mailbox contents.
+`GET /api/health` is unauthenticated (container probes). Capability flags only; no accounts or mailbox contents. The handler does not query SQLite or take mailbox/IMAP locks — it must answer while a long IMAP pass is on the event loop.
 
 ```json
 {
@@ -59,14 +59,16 @@ Two naming sets are emitted together so this server matches both the plugin’s 
 | Name | When | JSON payload |
 | --- | --- | --- |
 | `hello` | On every connect | `{ heartbeatMs, gap, changedAt }` |
-| `change-version` | `repos.changes.stamp().changedAt` moved | `{ changedAt }` |
+| `change-version` | listing content stamp (`messageAt` / `accountAt`) moved | `{ changedAt }` |
 | `new-mail` | `messages.updated_at` max moved | `{ changedAt }` |
 | `message.new` | same as `new-mail` (plugin) | `{ changedAt }` |
-| `sync-status` | `sync_state.synced_at` moved, or global sync `inFlight` flipped | `{ changedAt, state, inFlight? }` |
+| `sync-status` | global sync `inFlight` flipped | `{ changedAt, state, inFlight? }` |
 | `sync.mailbox` | same as `sync-status` (plugin) | `{ changedAt, state?, inFlight? }` |
 | `account.updated` | `accounts.updated_at` max moved | `{ changedAt }` |
 
-`state` on sync events is `started` / `done` for in-flight transitions, or `updated` when the stored sync cursor moved. `changedAt` is the same ISO stamp that `/api/changes` and the `/api/messages` ETag hash.
+`state` on sync events is `started` / `done` for in-flight transitions. Cursor-only `sync_state.synced_at` progress does **not** emit and does **not** bump the listing/`changedAt` stamp the plugin uses to refetch. `changedAt` on these events is `max(messageAt, accountAt)` — the same value hashed into the `/api/messages` ETag — not the raw `repos.changes.stamp().changedAt` (which also tracks the IMAP cursor).
+
+Named refetch events are coalesced: the first burst in a quiet window goes out immediately, then at most one flush every **15s**. A 399s IMAP pass would otherwise emit `message.new` / `sync.mailbox` on every 250ms stamp tick, and each event makes a 0.3.0 push client `GET /api/messages` again.
 
 The plugin treats `message.new`, `message.state`, `message.sent`, `sync.mailbox`, and `account.added|removed|updated` as “refetch the inbox list”. Unknown names (including `change-version` / `new-mail` / `sync-status`) only keep the connection alive. Payloads do not include bodies.
 

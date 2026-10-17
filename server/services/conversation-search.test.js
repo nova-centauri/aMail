@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildConversationSearch, escapeLike, listingNeedsThreadStats } from './conversation-search.js';
+import { buildConversationSearch, cheapInboxPredicate, escapeLike, listingNeedsThreadStats } from './conversation-search.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
 
 test('LIKE metacharacters are escaped for SQL contains matches', () => {
@@ -84,7 +84,13 @@ test('default inbox listing skips attachment JSON and the full stats window', ()
   assert.equal(cheap.cheap, true);
   assert.doesNotMatch(cheap.pageSql, /json_array_length/);
   assert.doesNotMatch(cheap.pageSql, /has_attachment/);
+  assert.doesNotMatch(cheap.pageSql, /attachments_json/);
+  assert.doesNotMatch(cheap.pageSql, /html_body/);
   assert.match(cheap.pageSql, /FROM latest/);
+  assert.match(cheap.pageSql, /AS MATERIALIZED/);
+  assert.match(cheap.pageSql, /COALESCE\(m\.is_draft, 0\) = 0/);
+  assert.match(cheap.pageSql, /INDEXED BY idx_messages_inbox_list/);
+  assert.match(cheapInboxPredicate('m'), /COALESCE\(m\.is_draft, 0\) = 0/);
   assert.match(cheap.pageSql, /LIMIT @limit OFFSET @offset/);
 
   const legacy = buildConversationSearch({

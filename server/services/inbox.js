@@ -41,6 +41,18 @@ export const parsePageSize = (value, fallback = DEFAULT_PAGE_SIZE) => {
   return Math.min(MAX_PAGE_SIZE, Math.max(1, number));
 };
 
+/**
+ * Listing/ETag version. Sync-cursor bumps (`sync_state.synced_at`) do not
+ * change the inbox, so pollers that never send If-None-Match can still hit
+ * the in-process cache after a 45s POST /api/sync.
+ */
+export function listContentStamp(stamp = {}) {
+  if (stamp == null) return '';
+  if (typeof stamp === 'string') return stamp;
+  const times = [stamp.messageAt, stamp.accountAt].filter(Boolean).sort();
+  return times.at(-1) || '';
+}
+
 export function conversationListEtag(changedAt, input = {}) {
   const raw = JSON.stringify({
     v: changedAt || '',
@@ -188,7 +200,7 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
 
 export const sumFolderCounts = (accounts, repos) => {
   const ids = accounts.map((account) => account.id).filter(Boolean);
-  const changedAt = repos.changes?.stamp?.()?.changedAt || '';
+  const changedAt = listContentStamp(repos.changes?.stamp?.() || {});
   const cacheKey = `${changedAt}:${[...ids].sort().join(',')}`;
   const folderCache = cachesFor(repos).folders;
   const cached = folderCache.get(cacheKey);
@@ -316,7 +328,7 @@ export async function listConversations(repos, {
   const personFlag = normalizePersonFlag(personFlagInput, loadPersonFlags(repos));
   const page = parseNumber(pageInput, 1, 1, 100_000);
   const pageSize = parsePageSize(pageSizeInput, DEFAULT_PAGE_SIZE);
-  const changedAt = repos.changes?.stamp?.()?.changedAt || '';
+  const changedAt = listContentStamp(repos.changes?.stamp?.() || {});
   const resultCacheKey = JSON.stringify({
     changedAt,
     accountId,
@@ -397,20 +409,22 @@ export async function listConversations(repos, {
     forceLegacy,
   };
   const search = await conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds });
-  const byThread = new Map();
-  for (const message of repos.messages.forThreads(search.threadIds, {
-    folder,
-    mailbox: String(mailbox || 'INBOX'),
-    includeBodies: false,
-  })) {
-    const existing = byThread.get(message.threadId);
-    const messageTime = String(message.sentAt || message.receivedAt || message.createdAt);
-    const existingTime = String(existing?.latest?.sentAt || existing?.latest?.receivedAt || existing?.latest?.createdAt || '');
-    if (!existing) {
-      byThread.set(message.threadId, { latest: message, messages: [message] });
-    } else {
-      existing.messages.push(message);
-      if (messageTime > existingTime) existing.latest = message;
+  const latestByThread = typeof repos.messages.latestForThreads === 'function'
+    ? repos.messages.latestForThreads(search.threadIds, {
+      folder,
+      mailbox: String(mailbox || 'INBOX'),
+    })
+    : new Map();
+  if (!latestByThread.size && search.threadIds.length) {
+    for (const message of repos.messages.forThreads(search.threadIds, {
+      folder,
+      mailbox: String(mailbox || 'INBOX'),
+      includeBodies: false,
+    })) {
+      const existing = latestByThread.get(message.threadId);
+      const messageTime = String(message.sentAt || message.receivedAt || message.createdAt);
+      const existingTime = String(existing?.sentAt || existing?.receivedAt || existing?.createdAt || '');
+      if (!existing || messageTime > existingTime) latestByThread.set(message.threadId, message);
     }
   }
   const categoryCounts = emptyCategoryCounts();
@@ -420,12 +434,11 @@ export async function listConversations(repos, {
   const threadsById = typeof repos.threads.getMany === 'function'
     ? repos.threads.getMany(search.threadIds)
     : new Map(search.threadIds.map((id) => [id, repos.threads.get(id)]));
-  // Filtering still uses all candidate messages in each conversation. Only
-  // visible rows need their stored, whole-thread unread/analyzed aggregates.
+  // Visible rows use the stored thread aggregates. Latest-message envelopes
+  // skip attachment blobs so SQLCipher does not decrypt inline parts.
   const pageItems = search.threadIds.map((threadId) => {
-    const grouped = byThread.get(threadId);
-    if (!grouped) return null;
-    const { latest: latestMessage, messages } = grouped;
+    const latestMessage = latestByThread.get(threadId);
+    if (!latestMessage) return null;
     const thread = threadsById.get(latestMessage.threadId);
     const latestAt = latestMessage.sentAt || latestMessage.receivedAt || latestMessage.createdAt;
     return {
@@ -437,13 +450,13 @@ export async function listConversations(repos, {
       latestMessageId: latestMessage.id,
       messageCount: thread?.messageCount || 1,
       unreadCount: thread?.unreadCount || 0,
-      unanalyzedCount: thread ? thread.unanalyzedCount : messages.filter((message) => !message.isAnalyzed).length,
+      unanalyzedCount: thread?.unanalyzedCount || 0,
       participants: thread?.participants || [latestMessage.from],
       latestAt,
       snippet: latestMessage.snippet,
-      hasAttachments: Boolean(latestMessage.attachments?.length) || messages.some((message) => message.attachments?.length),
+      hasAttachments: Boolean(latestMessage.hasAttachments || latestMessage.attachments?.length),
       isRead: (thread?.unreadCount || 0) === 0,
-      isAnalyzed: thread ? thread.unanalyzedCount === 0 : messages.every((message) => message.isAnalyzed),
+      isAnalyzed: (thread?.unanalyzedCount || 0) === 0,
       isStarred: thread?.isStarred ?? latestMessage.isStarred,
       ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
     };

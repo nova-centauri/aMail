@@ -8,7 +8,7 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { conversationListEtag, ifNoneMatchHits, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listContentStamp, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
 import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
@@ -26,11 +26,13 @@ import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
 import { buildHealthExtras } from '../services/runtime-health.js';
 import {
+  BARE_MESSAGES_PER_MINUTE,
   MESSAGES_PER_MINUTE,
   SYNC_PER_MINUTE,
   passthrough,
   pollerRateLimit,
   pollerRateLimitEnabled,
+  requestHasIfNoneMatch,
 } from '../middleware/poller-limit.js';
 
 function initials(value) {
@@ -188,6 +190,10 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
 
   app.get('/api/health', (_request, response) => {
+    // Container probes. Must not query SQLite, take mailbox locks, or wait
+    // on IMAP: a long sync may be on this thread, and this handler has to
+    // still return. Extras are process memory, fs.stat of the db files, and
+    // in-memory mailService.runtimeStatus().
     const status = keyStatus();
     response.json({
       status: 'ok',
@@ -328,6 +334,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
 
   const messagesLimiter = pollerRateLimitEnabled(config)
     ? pollerRateLimit({ limit: Number(config.messagesPerMinute) || MESSAGES_PER_MINUTE })
+    : passthrough;
+  const bareMessagesLimiter = pollerRateLimitEnabled(config)
+    ? pollerRateLimit({
+      limit: Number(config.bareMessagesPerMinute) || BARE_MESSAGES_PER_MINUTE,
+      skip: requestHasIfNoneMatch,
+    })
     : passthrough;
   const syncLimiter = pollerRateLimitEnabled(config)
     ? pollerRateLimit({ limit: Number(config.syncPerMinute) || SYNC_PER_MINUTE })
@@ -517,7 +529,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json(flagsPayload(savePersonFlags(repos, input ?? [])));
   });
 
-  router.get('/messages', messagesLimiter, async (request, response) => {
+  router.get('/messages', bareMessagesLimiter, messagesLimiter, async (request, response) => {
     const listInput = {
       accountId: request.query.accountId ? String(request.query.accountId) : null,
       folder: request.query.folder,
@@ -528,7 +540,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       query: request.query.q,
       mailbox: request.query.mailbox,
     };
-    const stamp = repos.changes.stamp()?.changedAt || '';
+    const stamp = listContentStamp(repos.changes.stamp() || {});
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
     if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {

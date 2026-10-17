@@ -9,7 +9,10 @@ import {
   createMailService,
   discoverSearchMailboxes,
   discoverSyncMailboxes,
+  runInYieldingChunks,
   sqliteConstraintReason,
+  SYNC_WRITE_YIELD_BATCH,
+  yieldEventLoop,
 } from './mail-service.js';
 import { encryptJson } from './crypto.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
@@ -70,6 +73,32 @@ test('implicit TLS ports do not also request STARTTLS', () => {
   const credentials = { password: 'test-password' };
   assert.equal(buildImapOptions(account, credentials, config).doSTARTTLS, undefined);
   assert.equal(buildSmtpOptions(account, credentials, config).requireTLS, false);
+});
+
+test('IMAP write batches yield so a health probe can run between sqlite chunks', async () => {
+  assert.equal(SYNC_WRITE_YIELD_BATCH, 8);
+  const order = [];
+  const health = new Promise((resolve) => {
+    setImmediate(() => {
+      order.push('health');
+      resolve();
+    });
+  });
+  await runInYieldingChunks([1, 2, 3, 4, 5], (chunk) => {
+    order.push(`write:${chunk.join(',')}`);
+  }, { chunkSize: 2 });
+  await health;
+  assert.deepEqual(order, ['write:1,2', 'health', 'write:3,4', 'write:5']);
+  await yieldEventLoop();
+});
+
+test('IMAP sync yields the event loop between parse and write batches', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./mail-service.js', import.meta.url), 'utf8');
+  assert.match(source, /await runInYieldingChunks\(payloads, persistChunk/);
+  assert.match(source, /await yieldEventLoop\(\)/);
+  assert.match(source, /SYNC_SCAN_YIELD_EVERY/);
+  assert.match(source, /SYNC_WRITE_YIELD_BATCH/);
 });
 
 test('unsaved settings test verifies IMAP and SMTP without reading repositories', async () => {

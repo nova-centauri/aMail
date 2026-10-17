@@ -4,8 +4,17 @@ import { LEGACY_SESSION_COOKIE, SESSION_COOKIE } from '../config.js';
 export const POLLER_RATE_WINDOW_MS = 60_000;
 /** One focused tab at 20s is 3/min. 15 stops the 3s tight loop (~20/min) without blocking folder clicks. */
 export const MESSAGES_PER_MINUTE = 15;
+/**
+ * Omarchy v0.2.0 polls GET /api/messages every 10s with no If-None-Match.
+ * 4/min still covers a 15s human refresh and 429s the 10s plugin loop.
+ */
+export const BARE_MESSAGES_PER_MINUTE = 4;
 /** Old clients POST /sync on every mailbox reload. A real IMAP pass is single-flight; this caps the waiters. */
 export const SYNC_PER_MINUTE = 8;
+
+export function requestHasIfNoneMatch(request) {
+  return Boolean(String(request.headers?.['if-none-match'] || '').trim());
+}
 
 function cookieValue(request, name) {
   const pairs = String(request.headers?.cookie || '').split(';');
@@ -64,6 +73,7 @@ export function passthrough(_request, _response, next) {
 export function pollerRateLimit({
   limit,
   windowMs = POLLER_RATE_WINDOW_MS,
+  skip,
 } = {}) {
   return rateLimit({
     windowMs,
@@ -71,6 +81,7 @@ export function pollerRateLimit({
     standardHeaders: 'draft-8',
     legacyHeaders: false,
     keyGenerator: pollerClientKey,
+    skip,
     handler(request, response, _next, options) {
       const retryAfterSec = retryAfterSeconds(options.windowMs || windowMs);
       response.set('Retry-After', String(retryAfterSec));

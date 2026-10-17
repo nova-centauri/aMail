@@ -13,6 +13,7 @@ import {
   openDatabase,
 } from './db.js';
 import { deriveSubkey } from './services/crypto.js';
+import { buildConversationSearch } from './services/conversation-search.js';
 
 function tempConfig(t, extra = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-db-'));
@@ -436,8 +437,23 @@ test('retention prune clears old bodies and keeps headers, and a change stamp mo
 test('inbox listing installs the covering poller index', (t) => {
   const db = createDatabase(tempConfig(t));
   t.after(() => db.close());
-  const names = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_inbox_list'`).all();
-  assert.equal(names.length, 1);
+  const index = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_inbox_list'`).get();
+  assert.ok(index);
+  assert.match(index.sql, /smart_category/);
+  assert.match(index.sql, /snoozed_until/);
+  const built = buildConversationSearch({
+    accountIds: ['acct-1'],
+    folder: 'inbox',
+    hideQuiet: true,
+    limit: 60,
+    offset: 0,
+    nowIso: '2026-10-17T00:00:00.000Z',
+  });
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${built.pageSql}`).all(built.params)
+    .map((row) => row.detail)
+    .join('\n');
+  assert.match(plan, /idx_messages_inbox_list/);
+  assert.doesNotMatch(plan, /idx_messages_folder/);
 });
 
 test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {

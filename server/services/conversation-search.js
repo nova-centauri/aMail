@@ -72,13 +72,28 @@ export function listingNeedsThreadStats(input = {}) {
   );
 }
 
-function cheapListingSql({ accountSql, hideQuiet, category }) {
+/**
+ * Same predicates as idx_messages_inbox_list so SQLCipher can satisfy the
+ * poller window from skinny index pages instead of decrypting html_body.
+ */
+export function cheapInboxPredicate(alias) {
+  const a = alias;
+  return `${a}.mailbox = 'INBOX'
+    AND ${a}.is_archived = 0
+    AND ${a}.is_trashed = 0
+    AND ${a}.is_spam = 0
+    AND COALESCE(${a}.is_draft, 0) = 0
+    AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)`;
+}
+
+function cheapListingSql({ accountSql, hideQuiet, category, folder }) {
+  const rankedWhere = folder === 'inbox' ? cheapInboxPredicate('m') : folderPredicate('m');
   const headedWhere = [
     hideQuiet ? "latest_category <> 'ops_quiet'" : '',
     category ? 'latest_category = @category' : '',
   ].filter(Boolean);
   const headedWhereSql = headedWhere.length ? `WHERE ${headedWhere.join('\n      AND ')}` : '';
-  const cte = `WITH latest AS (
+  const cte = `WITH latest AS MATERIALIZED (
       SELECT thread_id, account_id, latest_at, latest_category
       FROM (
         SELECT
@@ -90,9 +105,9 @@ function cheapListingSql({ accountSql, hideQuiet, category }) {
             PARTITION BY m.account_id, m.thread_id
             ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.id DESC
           ) AS rk
-        FROM messages m
+        FROM messages m${folder === 'inbox' ? ' INDEXED BY idx_messages_inbox_list' : ''}
         WHERE ${accountSql}
-          AND ${folderPredicate('m')}
+          AND ${rankedWhere}
       ) ranked
       WHERE rk = 1
     )`;
@@ -253,7 +268,7 @@ export function buildConversationSearch(input = {}) {
     return {
       params,
       empty: false,
-      ...cheapListingSql({ accountSql, hideQuiet, category }),
+      ...cheapListingSql({ accountSql, hideQuiet, category, folder }),
     };
   }
 

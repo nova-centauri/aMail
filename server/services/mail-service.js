@@ -64,9 +64,29 @@ const ATTACHMENT_FAILURE_CODES = new Set([
   'ENOTFOUND', 'EAI_AGAIN', 'ETHROTTLE', 'NOCONNECTION',
 ]);
 const SYNC_WRITE_CHUNK = 50;
+// better-sqlite3 upserts are synchronous. Cap a write burst so /api/health
+// can run between chunks instead of waiting for a whole IMAP page.
+export const SYNC_WRITE_YIELD_BATCH = 8;
+export const SYNC_SCAN_YIELD_EVERY = 32;
 // Sources per UID FETCH. Bounds the bytes in flight to this many capped
 // messages while replacing one round trip per message with one per chunk.
 const SYNC_SOURCE_CHUNK = 25;
+
+export function yieldEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+export async function runInYieldingChunks(items, handleChunk, {
+  chunkSize = SYNC_WRITE_YIELD_BATCH,
+  yieldFn = yieldEventLoop,
+} = {}) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const size = Math.max(1, Number(chunkSize) || SYNC_WRITE_YIELD_BATCH);
+  for (let index = 0; index < items.length; index += size) {
+    await handleChunk(items.slice(index, index + size), index);
+    await yieldFn();
+  }
+}
 const DEFAULT_SYNC_PASS_BUDGET_MS = 60_000;
 const DEFAULT_SYNC_ACCOUNT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_SYNC_CONCURRENCY = 3;
@@ -927,9 +947,7 @@ export function createMailService({
     let remaining = 0;
     const pendingWrites = [];
 
-    const persistPayloads = (payloads) => {
-      assertAccountGeneration(account.id, generation);
-      if (!payloads.length) return;
+    const persistChunk = (payloads) => {
       const write = () => {
         for (const payload of payloads) {
           try {
@@ -956,9 +974,15 @@ export function createMailService({
       else write();
     };
 
-    const flushWrites = () => {
+    const persistPayloads = async (payloads) => {
+      assertAccountGeneration(account.id, generation);
+      if (!payloads.length) return;
+      await runInYieldingChunks(payloads, persistChunk, { chunkSize: SYNC_WRITE_YIELD_BATCH });
+    };
+
+    const flushWrites = async () => {
       if (!pendingWrites.length) return;
-      persistPayloads(pendingWrites.splice(0, pendingWrites.length));
+      await persistPayloads(pendingWrites.splice(0, pendingWrites.length));
     };
 
     const saveProgress = () => {
@@ -986,7 +1010,7 @@ export function createMailService({
         });
         if (payload) {
           pendingWrites.push(payload);
-          if (pendingWrites.length >= SYNC_WRITE_CHUNK) flushWrites();
+          if (pendingWrites.length >= SYNC_WRITE_CHUNK) await flushWrites();
         }
       } catch (error) {
         assertAccountGeneration(account.id, generation);
@@ -1040,6 +1064,9 @@ export function createMailService({
         } else {
           await ingestSource(message, source);
         }
+        // Parsing is CPU-bound on this thread; yield so /api/health can run
+        // inside a 25-message FETCH instead of after a whole mailbox page.
+        await yieldEventLoop();
       }
       // Expunged between the size scan and this FETCH.
       skippedUnavailable += chunk.length - seen.size;
@@ -1073,6 +1100,7 @@ export function createMailService({
         // Size-only scan: a few bytes per message, no bodies, so oversized mail
         // is rejected without transferring it. UIDs arrive in ascending order.
         const scanned = [];
+        let scannedSinceYield = 0;
         for await (const message of client.fetch(`${firstUid}:${endUid}`, { uid: true, size: true }, { uid: true })) {
           const uid = Number(message.uid || 0);
           // `n:m` can return the last message when nothing newer exists.
@@ -1080,6 +1108,11 @@ export function createMailService({
           if (!scanDrafts && uid <= lastUid) continue;
           const size = Number(message.size);
           scanned.push({ uid, size: Number.isSafeInteger(size) && size >= 0 ? size : null });
+          scannedSinceYield += 1;
+          if (scannedSinceYield >= SYNC_SCAN_YIELD_EVERY) {
+            scannedSinceYield = 0;
+            await yieldEventLoop();
+          }
         }
         const candidates = [];
         for (const candidate of scanned) {
@@ -1102,14 +1135,14 @@ export function createMailService({
           for (let index = 0; index < wanted.length; index += SYNC_SOURCE_CHUNK) {
             await fetchSources(wanted.slice(index, index + SYNC_SOURCE_CHUNK));
           }
-          flushWrites();
+          await flushWrites();
           processed += page.length;
           lastUid = Math.max(lastUid, page.at(-1).uid);
           // Persist each page so a restart or a later failure resumes here.
           saveProgress();
           // better-sqlite3 writes are synchronous; yield so /api/health and
           // /api/messages are not starved for the rest of a long IMAP pass.
-          await new Promise((resolve) => setImmediate(resolve));
+          await yieldEventLoop();
           if (Date.now() - startedAt >= passBudgetMs) break;
         }
         remaining = candidates.length - processed;
@@ -1144,7 +1177,7 @@ export function createMailService({
       };
     } catch (error) {
       assertAccountGeneration(account.id, generation);
-      flushWrites();
+      await flushWrites();
       repos.sync.save({
         account_id: account.id,
         mailbox,

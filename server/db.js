@@ -36,6 +36,13 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
   smart_category_reason, source_imported, created_at, updated_at`;
 
+/** Inbox list hydrate: no bodies, no attachment blobs. */
+const LIST_ENVELOPE_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_message_id, subject, from_name, from_email,
+  to_json, cc_json, bcc_json, reply_to_json, sent_at, received_at, snippet, labels_json,
+  is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent, is_draft,
+  analyzed_at, analyzed_by, smart_category, smart_category_reason, source_imported,
+  created_at, updated_at`;
+
 function publicAccount(row) {
   if (!row) return null;
   return {
@@ -110,6 +117,19 @@ function publicMessage(row) {
 
 function publicMessageMetadata(row) {
   const { htmlBody: _html, textBody: _text, ...message } = publicMessage(row);
+  return message;
+}
+
+function publicListEnvelope(row) {
+  if (!row) return null;
+  const message = publicMessageMetadata({
+    ...row,
+    attachments_json: '[]',
+    html_body: '',
+    text_body: '',
+    references_json: row.references_json || '[]',
+  });
+  message.hasAttachments = Boolean(row.has_attachment);
   return message;
 }
 
@@ -483,8 +503,9 @@ function initSchema(db) {
       ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
     CREATE INDEX IF NOT EXISTS idx_messages_review_account_order
       ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
+    DROP INDEX IF EXISTS idx_messages_inbox_list;
     CREATE INDEX IF NOT EXISTS idx_messages_inbox_list
-      ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id)
+      ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id, smart_category, snoozed_until)
       WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0;
   `);
 
@@ -1508,6 +1529,47 @@ export function createRepositories(db) {
         if (!ids.length) return [];
         return db.prepare(`SELECT ${SEARCH_INDEX_COLUMNS} FROM messages WHERE thread_id IN (${ids.map(() => '?').join(',')})`)
           .all(...ids);
+      },
+      latestForThreads(threadIds = [], { folder = 'inbox', mailbox = 'INBOX' } = {}) {
+        const ids = [...new Set((threadIds || []).filter(Boolean))];
+        if (!ids.length) return new Map();
+        const placeholders = ids.map(() => '?').join(',');
+        const folderCase = `CASE ?
+                  WHEN 'inbox' THEN mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+                  WHEN 'starred' THEN is_starred = 1 AND is_trashed = 0
+                  WHEN 'sent' THEN is_sent = 1 AND is_trashed = 0
+                  WHEN 'drafts' THEN is_draft = 1 AND is_trashed = 0 AND is_spam = 0
+                  WHEN 'snoozed' THEN snoozed_until > ? AND is_trashed = 0 AND is_spam = 0
+                  WHEN 'all' THEN is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0
+                  WHEN 'trash' THEN is_trashed = 1
+                  WHEN 'spam' THEN is_spam = 1 AND is_trashed = 0
+                  WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+                  ELSE mailbox = ? AND is_trashed = 0 AND is_spam = 0
+                END`;
+        const sql = `SELECT ${LIST_ENVELOPE_COLUMNS}, flags.has_attachment
+          FROM messages
+          JOIN (
+            SELECT thread_id,
+              MAX(CASE WHEN json_valid(attachments_json) AND json_array_length(attachments_json) > 0 THEN 1 ELSE 0 END) AS has_attachment
+            FROM messages
+            WHERE thread_id IN (${placeholders}) AND ${folderCase}
+            GROUP BY thread_id
+          ) flags USING (thread_id)
+          WHERE id IN (
+            SELECT id FROM (
+              SELECT id, ROW_NUMBER() OVER (
+                PARTITION BY thread_id
+                ORDER BY COALESCE(sent_at, received_at, created_at) DESC, id DESC
+              ) AS rk
+              FROM messages
+              WHERE thread_id IN (${placeholders}) AND ${folderCase}
+            ) ranked
+            WHERE rk = 1
+          )`;
+        const nowValue = now();
+        const folderParams = [folder, nowValue, nowValue, nowValue, mailbox];
+        const rows = db.prepare(sql).all(...ids, ...folderParams, ...ids, ...folderParams);
+        return new Map(rows.map((row) => [row.thread_id, publicListEnvelope(row)]));
       },
       forThreads(threadIds = [], { folder = '', mailbox = 'INBOX', includeBodies = true } = {}) {
         const ids = [...new Set(threadIds.filter(Boolean))];
