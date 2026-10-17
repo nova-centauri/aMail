@@ -430,8 +430,45 @@ test('retention prune clears old bodies and keeps headers, and a change stamp mo
   assert.equal(kept.subject, 'Keep headers');
   const after = repos.changes.stamp();
   assert.ok(after.changedAt >= before.changedAt);
+  assert.ok(after.version >= before.version);
   repos.sync.recordSkip({ account_id: account.id, mailbox: 'INBOX', uid: 5, reason: 'UNIQUE messages.account_id, mailbox, uid' });
   repos.checkpointWal();
+});
+
+test('change stamp reads are in-memory after boot and do not scan messages', (t) => {
+  const config = tempConfig(t);
+  const db = createDatabase(config);
+  const executed = [];
+  const tracked = new Proxy(db, {
+    get(target, property) {
+      if (property === 'prepare') return (sql) => {
+        const statement = target.prepare(sql);
+        return new Proxy(statement, {
+          get(prepared, method) {
+            const value = prepared[method];
+            if (['all', 'get', 'run'].includes(method)) return (...args) => {
+              executed.push(sql);
+              return value.apply(prepared, args);
+            };
+            return typeof value === 'function' ? value.bind(prepared) : value;
+          },
+        });
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const repos = createRepositories(tracked);
+  t.after(() => repos.close());
+  seedAccount(repos);
+  const scans = (sql) => /MAX\s*\(\s*(updated_at|synced_at)\s*\)/i.test(sql)
+    && /FROM\s+(messages|accounts|sync_state)\b/i.test(sql);
+  executed.length = 0;
+  const first = repos.changes.stamp();
+  const second = repos.changes.stamp();
+  assert.deepEqual(second, first);
+  assert.equal(executed.filter(scans).length, 0, executed.filter(scans)[0]);
+  assert.ok(first.version >= 1);
 });
 
 test('inbox listing installs the covering poller index', (t) => {

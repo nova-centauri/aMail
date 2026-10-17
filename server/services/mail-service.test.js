@@ -1980,7 +1980,7 @@ test('IMAP sync stores provider Drafts as drafts and keeps them out of the inbox
   await service.close();
 });
 
-test('Drafts sync backfills UIDs below a caught-up high-water mark', async () => {
+test('periodic Drafts sync does not scan below a caught-up high-water mark', async () => {
   const source = Buffer.from([
     'From: Steven Barrett <steven@midstatelitho.com>',
     'To: Steven Barrett <steven@midstatelitho.com>',
@@ -2004,16 +2004,16 @@ test('Drafts sync backfills UIDs below a caught-up high-water mark', async () =>
   });
 
   const result = await service.syncAccount('sync-account', { mailbox: '[Gmail]/Drafts' });
-  assert.equal(result.imported, 1);
-  assert.equal(result.mailboxes[0].role, 'drafts');
-  assert.equal(state.savedMessages.length, 1);
+  assert.equal(result.imported, 0);
+  assert.equal(result.mailboxes[0].plan, 'unchanged');
+  assert.equal(state.fetchCalls.length, 0);
+  assert.equal(state.savedMessages.length, 0);
+
+  const full = await service.syncAccount('sync-account', { mailbox: '[Gmail]/Drafts', force: true, mode: 'full' });
+  assert.equal(full.imported, 1);
   assert.equal(state.savedMessages[0].uid, 12);
   assert.equal(state.savedMessages[0].is_draft, 1);
   assert.equal(state.savedMessages[0].mailbox, '[Gmail]/Drafts');
   assert.equal(state.savedMessages[0].subject, 'Open quote');
-
-  const again = await service.syncAccount('sync-account', { mailbox: '[Gmail]/Drafts', force: true });
-  assert.equal(again.imported, 0);
-  assert.equal(state.savedMessages.length, 1);
   await service.close();
 });

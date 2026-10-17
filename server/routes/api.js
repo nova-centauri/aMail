@@ -8,7 +8,7 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { conversationListEtag, ifNoneMatchHits, listContentStamp, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listCacheToken, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
 import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
@@ -554,7 +554,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       logger: request.log,
       label: 'api_messages',
     });
-    const stamp = listContentStamp(repos.changes.stamp() || {});
+    const change = repos.changes.stamp() || {};
+    const stamp = listCacheToken(change);
     timing.mark('stamp');
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
@@ -566,6 +567,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     }
     const listing = await listConversations(repos, {
       ...listInput,
+      changedAt: stamp,
       mailService,
       searchSource: 'human',
       signal: request.signal,

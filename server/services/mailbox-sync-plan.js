@@ -43,30 +43,23 @@ export function planMailboxSync({
   const full = mode === 'full' || uidValidityChanged;
   const cursor = full ? 0 : Math.max(0, Number(lastUid) || 0);
 
-  const newestWindow = () => {
+  const newestWindow = (kind = 'initial', extra = {}) => {
     const firstUid = latestUid > 0 ? Math.max(1, latestUid - page + 1) : 1;
     return {
-      kind: latestUid > 0 ? 'initial' : 'unchanged',
+      kind: latestUid > 0 ? kind : 'unchanged',
       firstUid,
       endUid: latestUid,
       scanDrafts: false,
+      jumpCursor: false,
+      ...extra,
     };
   };
 
+  const jumpHoles = ['drafts', 'trash', 'spam'].includes(role);
+
   if (full) {
-    if (role === 'drafts') {
-      return {
-        kind: 'new-uids',
-        reason: uidValidityChanged ? 'uidvalidity' : 'full',
-        firstUid: 1,
-        endUid: Math.max(1, latestUid),
-        resetCursor: true,
-        uidValidityChanged,
-        scanDrafts: true,
-      };
-    }
     return {
-      ...newestWindow(),
+      ...newestWindow('initial'),
       reason: uidValidityChanged ? 'uidvalidity' : 'full',
       resetCursor: true,
       uidValidityChanged,
@@ -74,24 +67,12 @@ export function planMailboxSync({
   }
 
   // Never-synced mailbox: newest page only. Periodic must not backfill history.
-  if ((Number(lastUid) || 0) === 0 && role !== 'drafts') {
+  if ((Number(lastUid) || 0) === 0) {
     return {
-      ...newestWindow(),
+      ...newestWindow('initial'),
       reason: 'first-sync',
       resetCursor: false,
       uidValidityChanged: false,
-    };
-  }
-
-  if (role === 'drafts' && latestUid > 0) {
-    return {
-      kind: 'new-uids',
-      reason: cursor > 0 && latestUid <= cursor ? 'drafts-backfill' : 'uidnext',
-      firstUid: 1,
-      endUid: latestUid,
-      resetCursor: false,
-      uidValidityChanged: false,
-      scanDrafts: true,
     };
   }
 
@@ -119,14 +100,27 @@ export function planMailboxSync({
     };
   }
 
+  const firstUid = cursor + 1;
+  const gap = latestUid - firstUid + 1;
+  // Gmail Drafts/Trash UIDNEXT races ahead of sparse live UIDs. Walking the
+  // hole with FETCH 1:latest (or lastUid+1:latest) is the 50-100s pass.
+  if (jumpHoles && gap > page) {
+    return {
+      ...newestWindow('new-uids', { jumpCursor: true }),
+      reason: 'uidnext-window',
+      resetCursor: false,
+      uidValidityChanged: false,
+    };
+  }
   return {
     kind: 'new-uids',
     reason: 'uidnext',
-    firstUid: cursor + 1,
+    firstUid,
     endUid: latestUid,
     resetCursor: false,
     uidValidityChanged: false,
     scanDrafts: false,
+    jumpCursor: false,
   };
 }
 

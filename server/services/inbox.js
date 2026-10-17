@@ -14,6 +14,7 @@ import { publicAttachmentMeta } from './compose-attachments.js';
 import { createHash } from 'node:crypto';
 import { NotFoundError, ValidationError } from '../errors.js';
 import { shouldSearchProvider } from '../mail/imap-search.js';
+import { listCacheToken } from './change-version.js';
 
 export const DEFAULT_PAGE_SIZE = 50;
 export const MAX_PAGE_SIZE = 200;
@@ -52,6 +53,8 @@ export function listContentStamp(stamp = {}) {
   const times = [stamp.messageAt, stamp.accountAt].filter(Boolean).sort();
   return times.at(-1) || '';
 }
+
+export { listCacheToken };
 
 export function conversationListEtag(changedAt, input = {}) {
   const raw = JSON.stringify({
@@ -198,10 +201,10 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
   return repos.messages.searchConversations(listArgs);
 }
 
-export const sumFolderCounts = (accounts, repos) => {
+export const sumFolderCounts = (accounts, repos, changedAt = null) => {
   const ids = accounts.map((account) => account.id).filter(Boolean);
-  const changedAt = listContentStamp(repos.changes?.stamp?.() || {});
-  const cacheKey = `${changedAt}:${[...ids].sort().join(',')}`;
+  const token = changedAt || listCacheToken(repos.changes?.stamp?.() || {}) || listContentStamp(repos.changes?.stamp?.() || {});
+  const cacheKey = `${token}:${[...ids].sort().join(',')}`;
   const folderCache = cachesFor(repos).folders;
   const cached = folderCache.get(cacheKey);
   if (cached) return cached;
@@ -321,6 +324,7 @@ export async function listConversations(repos, {
   signal = null,
   extraThreadIds: extraThreadIdsInput = null,
   forceLegacy = false,
+  changedAt: changedAtInput = null,
 } = {}) {
   const parsedQuery = parseMailboxQuery(String(queryInput || '').trim().slice(0, 800));
   const folder = normalizeFolder(parsedQuery.folder || folderInput);
@@ -328,7 +332,9 @@ export async function listConversations(repos, {
   const personFlag = normalizePersonFlag(personFlagInput, loadPersonFlags(repos));
   const page = parseNumber(pageInput, 1, 1, 100_000);
   const pageSize = parsePageSize(pageSizeInput, DEFAULT_PAGE_SIZE);
-  const changedAt = listContentStamp(repos.changes?.stamp?.() || {});
+  const changedAt = changedAtInput
+    || listCacheToken(repos.changes?.stamp?.() || {})
+    || listContentStamp(repos.changes?.stamp?.() || {});
   const resultCacheKey = JSON.stringify({
     changedAt,
     accountId,
@@ -387,7 +393,7 @@ export async function listConversations(repos, {
       page,
       pageSize,
       categoryCounts: emptyCategoryCounts(),
-      folderCounts: sumFolderCounts(accounts, repos),
+      folderCounts: sumFolderCounts(accounts, repos, changedAt),
       personFlag: personFlag?.id || null,
       personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
     };
@@ -467,7 +473,7 @@ export async function listConversations(repos, {
     page,
     pageSize,
     categoryCounts,
-    folderCounts: sumFolderCounts(accounts, repos),
+    folderCounts: sumFolderCounts(accounts, repos, changedAt),
     personFlag: personFlag?.id || null,
     personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
   };

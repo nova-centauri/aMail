@@ -68,7 +68,7 @@ Two naming sets are emitted together so this server matches both the plugin’s 
 
 `state` on sync events is `started` / `done` for in-flight transitions. Cursor-only `sync_state.synced_at` progress does **not** emit and does **not** bump the listing/`changedAt` stamp the plugin uses to refetch. `changedAt` on these events is `max(messageAt, accountAt)` — the same value hashed into the `/api/messages` ETag — not the raw `repos.changes.stamp().changedAt` (which also tracks the IMAP cursor).
 
-Named refetch events are coalesced: the first burst in a quiet window goes out immediately, then at most one flush every **15s**. A 399s IMAP pass would otherwise emit `message.new` / `sync.mailbox` on every 250ms stamp tick, and each event makes a 0.3.0 push client `GET /api/messages` again.
+Named refetch events are coalesced: the first burst in a quiet window goes out immediately, then at most one flush every **15s**. Writers push stamp changes; the hub does not poll SQL on a timer.
 
 The plugin treats `message.new`, `message.state`, `message.sent`, `sync.mailbox`, and `account.added|removed|updated` as “refetch the inbox list”. Unknown names (including `change-version` / `new-mail` / `sync-status`) only keep the connection alive. Payloads do not include bodies.
 

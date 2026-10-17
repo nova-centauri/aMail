@@ -154,7 +154,12 @@ parentPort.on('message', async (msg) => {
         imported = Boolean(repos.messages.upsert(payload));
       }
     }
-    parentPort.postMessage({ id: msg.id, ok: true, imported });
+    parentPort.postMessage({
+      id: msg.id,
+      ok: true,
+      imported,
+      stamp: imported && typeof repos.changes?.stamp === 'function' ? repos.changes.stamp() : null,
+    });
   } catch (error) {
     parentPort.postMessage({ id: msg.id, ok: false, imported: false, error: String(error?.message || error) });
   }
