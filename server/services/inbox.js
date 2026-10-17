@@ -56,6 +56,23 @@ export function conversationListEtag(changedAt, input = {}) {
   return `W/"${createHash('sha1').update(raw).digest('base64url')}"`;
 }
 
+function normalizeEtag(value) {
+  let text = String(value || '').trim();
+  if (text.startsWith('W/') || text.startsWith('w/')) text = text.slice(2).trim();
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) text = text.slice(1, -1);
+  return text;
+}
+
+/** Weak/strong ETags and comma-lists, so Node `fetch` without cookies can 304. */
+export function ifNoneMatchHits(header, etag) {
+  const raw = String(header || '').trim();
+  if (!raw || !etag) return false;
+  if (raw === '*') return true;
+  const wanted = normalizeEtag(etag);
+  if (!wanted) return false;
+  return raw.split(',').some((part) => normalizeEtag(part) === wanted);
+}
+
 export function clearConversationListCache(repos = null) {
   if (repos) {
     cachesByRepos.delete(repos);

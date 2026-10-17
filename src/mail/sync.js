@@ -1,4 +1,15 @@
+export function syncWasAccepted(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  return payload.accepted === true
+    || payload.state === 'started'
+    || payload.state === 'in-flight'
+    || payload.state === 'queued'
+    || payload.state === 'recent'
+    || payload.state === 'cooling';
+}
+
 export function syncResultStatus(payload) {
+  if (syncWasAccepted(payload) && payload?.result == null && payload?.results == null) return 'accepted';
   const source = payload?.result ?? payload?.results ?? payload;
   const results = Array.isArray(source) ? source : source ? [source] : [];
   if (!results.length) return 'ok';

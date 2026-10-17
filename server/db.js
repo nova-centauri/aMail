@@ -1580,12 +1580,11 @@ export function createRepositories(db) {
     },
     changes: {
       stamp() {
-        const times = [
-          queries.maxMessageUpdated.get()?.t,
-          queries.maxSyncSynced.get()?.t,
-          queries.maxAccountUpdated.get()?.t,
-        ].filter(Boolean).sort();
-        return { changedAt: times.at(-1) || null };
+        const messageAt = queries.maxMessageUpdated.get()?.t || null;
+        const syncAt = queries.maxSyncSynced.get()?.t || null;
+        const accountAt = queries.maxAccountUpdated.get()?.t || null;
+        const times = [messageAt, syncAt, accountAt].filter(Boolean).sort();
+        return { changedAt: times.at(-1) || null, messageAt, syncAt, accountAt };
       },
     },
     retention: {

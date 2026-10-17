@@ -8,7 +8,8 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { conversationListEtag, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
@@ -23,6 +24,14 @@ import { sanitizeComposeHtml } from '../utils/signature.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
+import { buildHealthExtras } from '../services/runtime-health.js';
+import {
+  MESSAGES_PER_MINUTE,
+  SYNC_PER_MINUTE,
+  passthrough,
+  pollerRateLimit,
+  pollerRateLimitEnabled,
+} from '../middleware/poller-limit.js';
 
 function initials(value) {
   return String(value || '?').split(/[\s@._-]+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join('').toUpperCase() || '?';
@@ -100,9 +109,49 @@ function wantsEventStream(request) {
   return String(request.headers.accept || '').includes('text/event-stream');
 }
 
-function writeSse(response, event, data) {
+function writeSse(response, event, data, id) {
   if (response.writableEnded || response.destroyed) return;
+  if (id != null) response.write(`id: ${id}\n`);
   response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function writeSseComment(response, comment = '') {
+  if (response.writableEnded || response.destroyed) return;
+  response.write(`:${comment}\n\n`);
+}
+
+function attachMailboxEventStream(request, response, hub) {
+  response.status(200);
+  response.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.flushHeaders?.();
+  request.socket?.setTimeout?.(0);
+  request.socket?.setNoDelay?.(true);
+
+  const lastEventId = request.get('last-event-id') || request.query.lastEventId;
+  const replay = hub.replaySince(lastEventId);
+  writeSse(response, 'hello', {
+    heartbeatMs: hub.heartbeatMs,
+    gap: replay.gap,
+    changedAt: hub.changedAt?.() || null,
+  }, hub.seq() || undefined);
+  for (const item of replay.events) writeSse(response, item.event, item.data, item.id);
+
+  const send = (payload) => writeSse(response, payload.event, payload.data, payload.id);
+  const unsubscribe = hub.subscribe(send);
+  const heartbeat = setInterval(() => writeSseComment(response, ' heartbeat'), hub.heartbeatMs);
+  heartbeat.unref?.();
+
+  const onClose = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  request.once('close', onClose);
+  request.once('aborted', onClose);
 }
 
 function attachDeepSearchStream(request, response, deepSearch, job) {
@@ -133,7 +182,7 @@ function attachDeepSearchStream(request, response, deepSearch, job) {
   });
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null }) {
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null }) {
   // In keyslot mode `config` is a proxy whose key material throws while the
   // harness is locked, so health reads only static settings plus vault status.
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
@@ -157,6 +206,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       remoteContentDirectDevelopmentOnly: Boolean(config.allowDirectRemoteContent),
       webauthnRpId: config.webauthnRpId || null,
       webauthnOrigins: config.webauthnOrigins || [],
+      ...buildHealthExtras({ config, mailService, locked: status.locked }),
     });
   });
 
@@ -276,6 +326,18 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.send(result.body);
   });
 
+  const messagesLimiter = pollerRateLimitEnabled(config)
+    ? pollerRateLimit({ limit: Number(config.messagesPerMinute) || MESSAGES_PER_MINUTE })
+    : passthrough;
+  const syncLimiter = pollerRateLimitEnabled(config)
+    ? pollerRateLimit({ limit: Number(config.syncPerMinute) || SYNC_PER_MINUTE })
+    : passthrough;
+  const eventsHub = mailboxEvents || createMailboxEventHub({
+    repos,
+    mailService,
+    pollMs: config.eventsPollMs,
+    heartbeatMs: config.eventsHeartbeatMs,
+  });
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const startDeepSearchJob = (input, owner = 'human') => searchJobs.start({
     query: input.q ?? input.query,
@@ -397,25 +459,39 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     serveAvatar(response, account || { display_name: request.params.email, email: request.params.email });
   });
   router.post('/accounts/:id/test', async (request, response) => response.json({ result: await mailService.testAccount(request.params.id) }));
-  router.post('/accounts/:id/sync', async (request, response) => {
-    const result = await mailService.syncAccount(request.params.id, {
+  router.post('/accounts/:id/sync', syncLimiter, (request, response) => {
+    const force = Boolean(request.body?.force);
+    const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
       maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
-      force: Boolean(request.body?.force),
-    });
-    response.json({ result });
+      force,
+      // Manual refresh retries a failing account; background drain does not.
+      retryFailed: force,
+    };
+    const accepted = typeof mailService.enqueueSyncAccount === 'function'
+      ? mailService.enqueueSyncAccount(request.params.id, options)
+      : { accepted: true, state: 'started', accountId: request.params.id, sync: null };
+    response.status(202).json(accepted);
   });
-  router.post('/sync', async (request, response) => {
-    const results = await mailService.syncAll({
+  router.post('/sync', syncLimiter, (request, response) => {
+    const force = Boolean(request.body?.force);
+    const options = {
       mailbox: request.body?.mailbox ? String(request.body.mailbox) : undefined,
       limit: parseNumber(request.body?.limit, config.syncBatchSize, 1, 1000),
       // Pollers pass maxAgeSeconds to accept a run that finished this recently
       // instead of starting another; the manual refresh sends force.
       maxAgeMs: parseNumber(request.body?.maxAgeSeconds, 0, 0, 3600) * 1000,
-      force: Boolean(request.body?.force),
-    });
-    response.json({ results });
+      force,
+      retryFailed: force,
+    };
+    const accepted = typeof mailService.enqueueSyncAll === 'function'
+      ? mailService.enqueueSyncAll(options)
+      : { accepted: true, state: 'started', sync: null };
+    response.status(202).json(accepted);
+  });
+  router.get('/events', (request, response) => {
+    attachMailboxEventStream(request, response, eventsHub);
   });
   router.get('/changes', (request, response) => {
     const since = String(request.query.since || '');
@@ -441,7 +517,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json(flagsPayload(savePersonFlags(repos, input ?? [])));
   });
 
-  router.get('/messages', async (request, response) => {
+  router.get('/messages', messagesLimiter, async (request, response) => {
     const listInput = {
       accountId: request.query.accountId ? String(request.query.accountId) : null,
       folder: request.query.folder,
@@ -455,7 +531,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const stamp = repos.changes.stamp()?.changedAt || '';
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
-    if (request.headers['if-none-match'] === etag) {
+    if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {
       response.status(304).end();
       return;
     }

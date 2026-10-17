@@ -32,7 +32,9 @@ export function createHarness({ config, logger }) {
   function startPolling(mailService) {
     const plan = backgroundReceiptPlan(config);
     if (pollTimer || !plan.enabled) return;
-    const poll = ({ force = false } = {}) => mailService.syncAll({ maxAgeMs: config.syncMinIntervalMs || 0, force })
+    const poll = ({ force = false, retryFailed = false } = {}) => mailService.syncAll({
+      maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed,
+    })
       .then((results) => {
         // A pass that ran out of budget with mail still waiting continues
         // shortly instead of leaving the backlog for the next interval.
@@ -40,7 +42,9 @@ export function createHarness({ config, logger }) {
         if (backlog > 0 && pollTimer && !drainTimer) {
           drainTimer = setTimeout(() => {
             drainTimer = null;
-            poll({ force: true });
+            // Drain remaining mail without retrying accounts that just failed
+            // IMAP (force only bypasses the recent-result floor).
+            poll({ force: true, retryFailed: false });
           }, BACKLOG_DRAIN_DELAY_MS);
           drainTimer.unref();
         }
