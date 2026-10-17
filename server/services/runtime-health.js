@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { backgroundReceiptPlan } from '../mail/receipt-path.js';
 
 export function emptyRuntimeStatus() {
   return {
@@ -48,8 +49,17 @@ export function readRuntimeStatus(mailService, { locked = false } = {}) {
   return emptyRuntimeStatus();
 }
 
+export function healthFeatureFlags(config = {}) {
+  const features = ['events'];
+  if (backgroundReceiptPlan(config).preferIdle) features.push('idle');
+  return features;
+}
+
 export function buildHealthExtras({ config, mailService, locked = false } = {}) {
+  const preferIdle = backgroundReceiptPlan(config).preferIdle;
   return {
+    features: healthFeatureFlags(config),
+    ...(preferIdle ? { idle: { enabled: true } } : {}),
     memory: processMemorySnapshot(),
     database: databaseFileStats(config?.dbPath),
     sync: readRuntimeStatus(mailService, { locked }),

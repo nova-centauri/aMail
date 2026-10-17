@@ -9,6 +9,7 @@ import { createDatabase, createRepositories } from '../db.js';
 import { ServiceUnavailableError } from '../errors.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerApi } from './api.js';
+import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { decryptJson } from '../services/crypto.js';
 import { serializeAccountInput } from '../services/account-input.js';
 
@@ -96,6 +97,7 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(health.releaseSha, config.releaseSha);
   // Health answers unauthenticated, so it must not describe the mailbox.
   assert.equal(Object.hasOwn(health, 'accounts'), false);
+  assert.ok(Array.isArray(health.features) && health.features.includes('events'));
 
   const emptyChanges = await fetch(`${origin}/api/changes`);
   assert.equal(emptyChanges.status, 200);
@@ -837,6 +839,7 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
   assert.equal(health.status, 'ok');
   assert.equal(health.releaseSha, config.releaseSha);
   assert.equal(Object.hasOwn(health, 'accounts'), false);
+  assert.deepEqual(health.features, ['events']);
   assert.equal(health.sync.inFlight, true);
   assert.equal(health.sync.queueDepth, 3);
   assert.equal(health.sync.oldestStartedAt, '2026-10-17T12:00:00.000Z');
@@ -983,3 +986,164 @@ test('POST /api/sync returns 202 without waiting for IMAP and coalesces callers'
   assert.equal(accountBody.accepted, true);
   assert.equal(accountBody.accountId, 'acct-1');
 });
+
+function pluginHeaders(token, extra = {}) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: extra.Accept || 'application/json',
+    ...extra,
+  };
+}
+
+async function readSseEvent(reader, decoder, leftovers, timeoutMs = 2_000) {
+  let buffer = leftovers.buffer;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let index = buffer.indexOf('\n\n');
+    if (index < 0) {
+      const remaining = Math.max(1, deadline - Date.now());
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), remaining)),
+      ]);
+      if (result.timeout) continue;
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
+      continue;
+    }
+    const block = buffer.slice(0, index);
+    buffer = buffer.slice(index + 2);
+    leftovers.buffer = buffer;
+    if (!block.trim() || block.startsWith(':')) continue;
+    let type = 'message';
+    let id = 0;
+    let data = '';
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) type = line.slice(6).trim();
+      else if (line.startsWith('id:')) id = Number(line.slice(3).trim()) || 0;
+      else if (line.startsWith('data:')) data += line.slice(5).trim();
+    }
+    return { type, id, data: data ? JSON.parse(data) : null };
+  }
+  leftovers.buffer = buffer;
+  throw new Error('timed out waiting for SSE event');
+}
+
+test('GET /api/messages 304 works for a cookie-less Bearer node client on the plugin query', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-plugin-etag-'));
+  const token = 'omarchy-plugin-token';
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: token,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', avatar_blob: null, avatar_mime: null,
+    color: '#1a73e8', provider: 'custom', imap_host: 'imap.example.test', imap_port: 993,
+    imap_secure: 1, smtp_host: 'smtp.example.test', smtp_port: 465, smtp_secure: 1,
+    credential_ciphertext: 'fixture', signature: '', sync_enabled: 0,
+  });
+  const thread = repos.threads.create({
+    account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-01-01T00:00:00.000Z',
+  });
+  repos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello',
+    fromEmail: 'friend@example.test', timestamp: '2026-01-01T00:00:00.000Z',
+  }));
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const pluginQuery = '/api/messages?folder=inbox&pageSize=60';
+  assert.equal((await fetch(`${origin}${pluginQuery}`)).status, 401);
+
+  const first = await fetch(`${origin}${pluginQuery}`, { headers: pluginHeaders(token) });
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get('set-cookie'), null);
+  const etag = first.headers.get('etag');
+  assert.ok(etag);
+  assert.equal((await first.json()).pageSize, 60);
+
+  const notModified = await fetch(`${origin}${pluginQuery}`, {
+    headers: pluginHeaders(token, { 'If-None-Match': etag }),
+  });
+  assert.equal(notModified.status, 304);
+  assert.equal(await notModified.text(), '');
+
+  const strong = await fetch(`${origin}${pluginQuery}`, {
+    headers: pluginHeaders(token, { 'If-None-Match': etag.replace(/^W\//, '') }),
+  });
+  assert.equal(strong.status, 304);
+});
+
+test('GET /api/events is Bearer-gated SSE and pushes mailbox events', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-events-'));
+  const token = 'omarchy-plugin-token';
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: token,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const hub = createMailboxEventHub({
+    repos,
+    mailService: { runtimeStatus: () => ({ inFlight: false }) },
+    pollMs: 20,
+    heartbeatMs: 1_000,
+  });
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false }, mailboxEvents: hub });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    hub.close();
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  assert.equal((await fetch(`${origin}/api/events`, { headers: { Accept: 'text/event-stream' } })).status, 401);
+
+  const controller = new AbortController();
+  const response = await fetch(`${origin}/api/events`, {
+    headers: pluginHeaders(token, { Accept: 'text/event-stream' }),
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type') || '', /text\/event-stream/);
+  const leftovers = { buffer: '' };
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  try {
+    const hello = await readSseEvent(reader, decoder, leftovers);
+    assert.equal(hello.type, 'hello');
+    assert.equal(hello.data.heartbeatMs, 1_000);
+    assert.equal(hello.data.gap, false);
+
+    hub.publish('message.new', { changedAt: '2026-10-17T12:00:00.000Z' });
+    const next = await readSseEvent(reader, decoder, leftovers);
+    assert.equal(next.type, 'message.new');
+    assert.equal(next.data.changedAt, '2026-10-17T12:00:00.000Z');
+    assert.ok(next.id >= 1);
+  } finally {
+    controller.abort();
+  }
+});
+

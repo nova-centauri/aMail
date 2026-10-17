@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { conversationListEtag, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-'));
@@ -474,4 +474,16 @@ test('unchanged inbox listings reuse the change-version cache and keep a stable 
     conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
     conversationListEtag(stamp, { folder: 'inbox', pageSize: 50 }),
   );
+});
+
+test('If-None-Match matches weak ETags the way Node fetch sends them', () => {
+  const etag = conversationListEtag('2026-10-17T00:00:00.000Z', { folder: 'inbox', pageSize: 60 });
+  assert.equal(ifNoneMatchHits(etag, etag), true);
+  assert.equal(ifNoneMatchHits(etag.replace(/^W\//, ''), etag), true);
+  assert.equal(ifNoneMatchHits(` ${etag} `, etag), true);
+  assert.equal(ifNoneMatchHits(`"${etag.replace(/^W\/"/, '').replace(/"$/, '')}"`, etag), true);
+  assert.equal(ifNoneMatchHits(`W/"other", ${etag}`, etag), true);
+  assert.equal(ifNoneMatchHits('*', etag), true);
+  assert.equal(ifNoneMatchHits('W/"nope"', etag), false);
+  assert.equal(ifNoneMatchHits('', etag), false);
 });

@@ -49,6 +49,17 @@ test('health extras never include mailbox or account fields', () => {
   assert.equal(Object.hasOwn(extras, 'accounts'), false);
   assert.equal(Object.hasOwn(extras.sync, 'accounts'), false);
   assert.equal(Object.hasOwn(extras.sync, 'email'), false);
+  assert.deepEqual(extras.features, ['events']);
+  assert.equal(Object.hasOwn(extras, 'idle'), false);
+});
+
+test('health advertises idle only when the background receipt plan is on', () => {
+  const extras = buildHealthExtras({
+    config: { dbPath: '/tmp/does-not-exist-amail.sqlite', syncIntervalMinutes: 15 },
+  });
+  assert.deepEqual(extras.features, ['events', 'idle']);
+  assert.deepEqual(extras.idle, { enabled: true });
+  assert.equal(Object.hasOwn(extras.idle, 'accounts'), false);
 });
 
 test('a locked harness reports an empty sync snapshot even if the mail service would throw', () => {

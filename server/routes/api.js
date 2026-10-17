@@ -8,7 +8,8 @@ import {
   parseAvatar,
   serializeAccountInput,
 } from '../services/account-input.js';
-import { conversationListEtag, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
+import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
@@ -108,9 +109,49 @@ function wantsEventStream(request) {
   return String(request.headers.accept || '').includes('text/event-stream');
 }
 
-function writeSse(response, event, data) {
+function writeSse(response, event, data, id) {
   if (response.writableEnded || response.destroyed) return;
+  if (id != null) response.write(`id: ${id}\n`);
   response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function writeSseComment(response, comment = '') {
+  if (response.writableEnded || response.destroyed) return;
+  response.write(`:${comment}\n\n`);
+}
+
+function attachMailboxEventStream(request, response, hub) {
+  response.status(200);
+  response.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  response.flushHeaders?.();
+  request.socket?.setTimeout?.(0);
+  request.socket?.setNoDelay?.(true);
+
+  const lastEventId = request.get('last-event-id') || request.query.lastEventId;
+  const replay = hub.replaySince(lastEventId);
+  writeSse(response, 'hello', {
+    heartbeatMs: hub.heartbeatMs,
+    gap: replay.gap,
+    changedAt: hub.changedAt?.() || null,
+  }, hub.seq() || undefined);
+  for (const item of replay.events) writeSse(response, item.event, item.data, item.id);
+
+  const send = (payload) => writeSse(response, payload.event, payload.data, payload.id);
+  const unsubscribe = hub.subscribe(send);
+  const heartbeat = setInterval(() => writeSseComment(response, ' heartbeat'), hub.heartbeatMs);
+  heartbeat.unref?.();
+
+  const onClose = () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  request.once('close', onClose);
+  request.once('aborted', onClose);
 }
 
 function attachDeepSearchStream(request, response, deepSearch, job) {
@@ -141,7 +182,7 @@ function attachDeepSearchStream(request, response, deepSearch, job) {
   });
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null }) {
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null }) {
   // In keyslot mode `config` is a proxy whose key material throws while the
   // harness is locked, so health reads only static settings plus vault status.
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
@@ -291,6 +332,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   const syncLimiter = pollerRateLimitEnabled(config)
     ? pollerRateLimit({ limit: Number(config.syncPerMinute) || SYNC_PER_MINUTE })
     : passthrough;
+  const eventsHub = mailboxEvents || createMailboxEventHub({
+    repos,
+    mailService,
+    pollMs: config.eventsPollMs,
+    heartbeatMs: config.eventsHeartbeatMs,
+  });
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const startDeepSearchJob = (input, owner = 'human') => searchJobs.start({
     query: input.q ?? input.query,
@@ -443,6 +490,9 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       : { accepted: true, state: 'started', sync: null };
     response.status(202).json(accepted);
   });
+  router.get('/events', (request, response) => {
+    attachMailboxEventStream(request, response, eventsHub);
+  });
   router.get('/changes', (request, response) => {
     const since = String(request.query.since || '');
     const stamp = repos.changes.stamp();
@@ -481,7 +531,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const stamp = repos.changes.stamp()?.changedAt || '';
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
-    if (request.headers['if-none-match'] === etag) {
+    if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {
       response.status(304).end();
       return;
     }
