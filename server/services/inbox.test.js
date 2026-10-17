@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { listConversations } from './inbox.js';
+import { conversationListEtag, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-'));
@@ -75,7 +75,9 @@ test('conversation pages omit large bodies, avoid candidate totals, and enrich o
     assert.equal(page.total, 6);
     assert.equal(page.categoryCounts.primary, 6);
     assert.deepEqual(page.messages.map((item) => item.id), [ids[3], ids[2]]);
-    assert.equal(executed.filter((sql) => sql === 'SELECT * FROM threads WHERE id = ?').length, 2);
+    const threadLookups = executed.filter((sql) => /FROM threads WHERE id/.test(sql));
+    assert.equal(threadLookups.length, 1);
+    assert.match(threadLookups[0], /IN \(/);
     assert.equal(executed.some((sql) => sql.startsWith('SELECT COUNT(*) AS count FROM messages m')), false);
     const candidateSql = executed.filter((sql) => /FROM messages(?: m)?\s+WHERE/.test(sql) && /^SELECT (?:m\.)?id,/.test(sql));
     assert.equal(candidateSql.length, 1);
@@ -124,7 +126,9 @@ test('pagination preserves matching against older messages and whole-thread stat
     assert.equal(page.messages[0].isRead, false);
     assert.equal(page.messages[0].isAnalyzed, false);
     assert.equal(page.messages[0].isStarred, true);
-    assert.equal(executed.filter((sql) => sql === 'SELECT * FROM threads WHERE id = ?').length, 1);
+    const threadLookups = executed.filter((sql) => /FROM threads WHERE id/.test(sql));
+    assert.equal(threadLookups.length, 1);
+    assert.match(threadLookups[0], /IN \(/);
   }
   assert.equal((await listConversations(repos, { query: 'from:older@example.test is:analyzed' })).total, 0);
 });
@@ -431,4 +435,43 @@ test('provider Drafts messages list with local drafts and stay out of the inbox'
   assert.equal(inbox.messages.some((message) => message.subject === 'Q3 budget notes'), false);
   assert.ok(inbox.messages.some((message) => message.subject === 'Lab standup notes'));
   assert.equal(inbox.folderCounts.drafts, 2);
+});
+
+test('page sizes clamp to a default and a maximum', () => {
+  assert.equal(parsePageSize(undefined), 50);
+  assert.equal(parsePageSize('9999'), MAX_PAGE_SIZE);
+  assert.equal(parsePageSize('0'), 1);
+  assert.equal(parsePageSize('-3'), 1);
+});
+
+function isInboxListingSql(sql) {
+  return /WITH\s+(latest|ranked|scoped)\b/i.test(sql)
+    || /FROM threads WHERE id/i.test(sql)
+    || /thread_id IN/i.test(sql)
+    || /json_array_length/i.test(sql)
+    || /ROW_NUMBER\(\)/i.test(sql);
+}
+
+test('unchanged inbox listings reuse the change-version cache and keep a stable ETag', async (t) => {
+  const { repos, executed, add, thread } = fixture(t);
+  add(thread('Cached'));
+  const first = await listConversations(repos, { folder: 'inbox', pageSize: 25 });
+  assert.equal(first.pageSize, 25);
+  assert.equal(first.total, 1);
+  assert.ok(executed.some(isInboxListingSql));
+  executed.length = 0;
+  const second = await listConversations(repos, { folder: 'inbox', pageSize: 25 });
+  assert.equal(second.total, 1);
+  assert.deepEqual(second.messages.map((item) => item.id), first.messages.map((item) => item.id));
+  const listingSql = executed.filter(isInboxListingSql);
+  assert.equal(listingSql.length, 0, listingSql[0] || 'cache hit ran a listing query');
+  const stamp = repos.changes.stamp().changedAt;
+  assert.equal(
+    conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
+    conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
+  );
+  assert.notEqual(
+    conversationListEtag(stamp, { folder: 'inbox', pageSize: 25 }),
+    conversationListEtag(stamp, { folder: 'inbox', pageSize: 50 }),
+  );
 });

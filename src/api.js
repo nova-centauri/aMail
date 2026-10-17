@@ -3,17 +3,22 @@ import { getAccessToken } from './storage.js';
 export const API_BASE = (import.meta.env.VITE_API_BASE || '/api').replace(/\/$/, '');
 
 export async function api(path, options = {}) {
-  const hasBody = options.body !== undefined;
+  const { etag, acceptNotModified = false, headers: extraHeaders, ...fetchOptions } = options;
+  const hasBody = fetchOptions.body !== undefined;
   const accessToken = getAccessToken();
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'same-origin',
-    ...options,
+    ...fetchOptions,
     headers: {
       ...(hasBody ? { 'Content-Type': 'application/json' } : {}),
       ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-      ...(options.headers || {}),
+      ...(etag ? { 'If-None-Match': etag } : {}),
+      ...(extraHeaders || {}),
     },
   });
+  if (response.status === 304 && acceptNotModified) {
+    return { notModified: true, etag: response.headers.get('etag') };
+  }
   if (!response.ok) {
     const contentType = response.headers.get('content-type') || '';
     let detail = null;
@@ -36,7 +41,11 @@ export async function api(path, options = {}) {
   }
   if (response.status === 204) return null;
   const contentType = response.headers.get('content-type') || '';
-  return contentType.includes('application/json') ? response.json() : response.text();
+  const body = contentType.includes('application/json') ? await response.json() : await response.text();
+  if (acceptNotModified && body && typeof body === 'object' && !Array.isArray(body)) {
+    return { ...body, notModified: false, etag: response.headers.get('etag') };
+  }
+  return body;
 }
 
 export function parseSseBlock(block) {

@@ -19,7 +19,7 @@ import { demoAccounts, demoDraftThreads, demoMailboxThreads } from './mail/demo.
 import { normalizeFreshDraft, pruneDismissedFreshDrafts, visibleFreshDrafts } from './mail/fresh-drafts.js';
 import { querySupportsDeepSearch } from './mail/deep-search.js';
 import { countSmartCategories, filterVisibleThreads, findPersonFlag } from './mail/filter.js';
-import { LIVE_SYNC_MAX_AGE_SECONDS, useLiveMailboxSync } from './mail/live-sync.js';
+import { isUnauthorizedError, useLiveMailboxSync } from './mail/live-sync.js';
 import { composeWindowKey, shouldDismissCompose } from './mail/compose-session.js';
 import { quotedComposeHtml } from './mail/html.js';
 import { bodiesToFill } from './mail/open-message.js';
@@ -90,6 +90,8 @@ export default function App() {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const searchRef = useRef(null);
   const loadRequestRef = useRef(0);
+  const mailboxInFlightRef = useRef(0);
+  const mailEtagRef = useRef('');
   const syncInFlightRef = useRef(false);
   const demoDraftsRef = useRef([]);
   const demoDraftsSeededRef = useRef(false);
@@ -293,10 +295,14 @@ export default function App() {
   }, []);
 
   const loadMailbox = useCallback(async ({ keepSelection = true, silent = false } = {}) => {
-    deepAbortRef.current?.abort();
-    const previousJob = deepSearchRef.current?.jobId;
-    if (previousJob) api(`/search/deep/${encodeURIComponent(previousJob)}`, { method: 'DELETE' }).catch(() => {});
+    if (silent && mailboxInFlightRef.current) return;
+    if (!silent) {
+      deepAbortRef.current?.abort();
+      const previousJob = deepSearchRef.current?.jobId;
+      if (previousJob) api(`/search/deep/${encodeURIComponent(previousJob)}`, { method: 'DELETE' }).catch(() => {});
+    }
     const requestId = ++loadRequestRef.current;
+    mailboxInFlightRef.current += 1;
     if (!silent) setLoading(true);
     try {
       let session = null;
@@ -332,10 +338,15 @@ export default function App() {
       if (activeAccount?.id) draftParams.set('accountId', activeAccount.id);
       const [accountData, mailData, draftData] = await Promise.all([
         api('/accounts'),
-        api(`/messages?${params.toString()}`),
+        api(`/messages?${params.toString()}`, { etag: mailEtagRef.current, acceptNotModified: true }),
         api(`/drafts${draftParams.toString() ? `?${draftParams}` : ''}`).catch(() => ({ drafts: [] })),
       ]);
       if (requestId !== loadRequestRef.current) return;
+      if (mailData?.notModified) {
+        setOffline(false);
+        return;
+      }
+      if (mailData?.etag) mailEtagRef.current = mailData.etag;
       const nextAccounts = getArray(accountData, ['accounts', 'items']).map(normalizeAccount);
       const rawThreads = getArray(mailData, ['threads', 'messages', 'items', 'data']);
       const nextThreads = rawThreads.map(normalizeThread);
@@ -412,7 +423,8 @@ export default function App() {
       }
     } catch (error) {
       if (requestId !== loadRequestRef.current) return;
-      if (error.status === 401 || error.status === 403) {
+      if (isUnauthorizedError(error)) {
+        mailEtagRef.current = '';
         setOffline(false);
         setAuthRequired(true);
         setAuthenticated(false);
@@ -433,34 +445,25 @@ export default function App() {
         setNotice('aMail is offline. Showing the last mailbox loaded from this server.');
       }
     } finally {
+      mailboxInFlightRef.current = Math.max(0, mailboxInFlightRef.current - 1);
       if (requestId === loadRequestRef.current) setLoading(false);
     }
   }, [accessToken, activeAccount?.id, activeCategory, activePersonFlag, activeFolder, beginDeepSearch, debouncedQuery, onboardingDismissed]);
 
   const lastChangeRef = useRef('');
-  const liveSyncInboxes = useCallback(async ({ immediate } = {}) => {
+  const liveSyncInboxes = useCallback(async () => {
     if (isDemo || authRequired || !authenticated) return;
     if (syncInFlightRef.current) return;
     syncInFlightRef.current = true;
-    let reload = Boolean(immediate);
+    let reload = false;
     try {
-      if (immediate) {
-        await api('/sync', { method: 'POST', body: JSON.stringify({ mailbox: 'INBOX', maxAgeSeconds: LIVE_SYNC_MAX_AGE_SECONDS }) });
-        const stamp = await api('/changes').catch(() => null);
-        if (stamp?.changedAt) lastChangeRef.current = stamp.changedAt;
-        reload = true;
-      } else {
-        const since = lastChangeRef.current;
-        const query = since ? `?since=${encodeURIComponent(since)}` : '';
-        // Local cache only. IMAP IDLE and the server's inbox probe import new
-        // mail; this tick just notices that the cache changed.
-        const payload = await api(`/changes${query}`);
-        if (payload?.changedAt) lastChangeRef.current = payload.changedAt;
-        reload = Boolean(payload?.changed);
-      }
-    } catch {
-      // Keep the current mailbox. A later tick or a manual refresh will retry.
-      reload = false;
+      const since = lastChangeRef.current;
+      const query = since ? `?since=${encodeURIComponent(since)}` : '';
+      // Local cache only. IMAP IDLE and the server's inbox probe import new
+      // mail; this tick never starts an IMAP pass and never swallows 401.
+      const payload = await api(`/changes${query}`);
+      if (payload?.changedAt) lastChangeRef.current = payload.changedAt;
+      reload = Boolean(since && payload?.changed);
     } finally {
       try {
         if (reload) await loadMailbox({ keepSelection: true, silent: true });
@@ -470,9 +473,28 @@ export default function App() {
     }
   }, [authRequired, authenticated, isDemo, loadMailbox]);
 
+  const handleLiveSyncUnauthorized = useCallback(() => {
+    mailEtagRef.current = '';
+    lastChangeRef.current = '';
+    setOffline(false);
+    setAuthRequired(true);
+    setAuthenticated(false);
+    setAccessOpen(true);
+    setIsDemo(false);
+    setAccounts([]);
+    setThreads([]);
+    setMailTotal(0);
+    setCategoryCounts(countSmartCategories([]));
+    setFolderCounts({ ...EMPTY_FOLDER_COUNTS });
+    setSelectedThread(null);
+    setSavedDrafts([]);
+    setDeepSearch(null);
+  }, []);
+
   useLiveMailboxSync({
     enabled: authenticated && !authRequired && !isDemo,
     onSync: liveSyncInboxes,
+    onUnauthorized: handleLiveSyncUnauthorized,
   });
 
   useEffect(() => { loadMailbox({ keepSelection: false }); }, [activeFolder, activeAccount?.id, activeCategory, activePersonFlag, debouncedQuery, accessToken, sessionStamp]); // eslint-disable-line react-hooks/exhaustive-deps

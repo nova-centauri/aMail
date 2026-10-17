@@ -1055,6 +1055,9 @@ export function createMailService({
           lastUid = Math.max(lastUid, page.at(-1).uid);
           // Persist each page so a restart or a later failure resumes here.
           saveProgress();
+          // better-sqlite3 writes are synchronous; yield so /api/health and
+          // /api/messages are not starved for the rest of a long IMAP pass.
+          await new Promise((resolve) => setImmediate(resolve));
           if (Date.now() - startedAt >= passBudgetMs) break;
         }
         remaining = candidates.length - processed;

@@ -433,6 +433,13 @@ test('retention prune clears old bodies and keeps headers, and a change stamp mo
   repos.checkpointWal();
 });
 
+test('inbox listing installs the covering poller index', (t) => {
+  const db = createDatabase(tempConfig(t));
+  t.after(() => db.close());
+  const names = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_inbox_list'`).all();
+  assert.equal(names.length, 1);
+});
+
 test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {
   const db = createDatabase(tempConfig(t));
   const repos = createRepositories(db);
