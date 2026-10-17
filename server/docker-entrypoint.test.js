@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { promisify } from 'node:util';
@@ -41,4 +43,13 @@ test('env-mode entrypoint does not inject hosted runtime flags', async () => {
     await runEntrypoint({ AMAIL_KEY_MODE: 'env', NODE_OPTIONS: '--enable-source-maps', UV_THREADPOOL_SIZE: '4' }),
     '--enable-source-maps|4',
   );
+});
+
+test('AMAIL_CPU_PROF adds Node --cpu-prof and a profile directory', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-cpu-prof-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const out = await runEntrypoint({ AMAIL_KEY_MODE: 'env', AMAIL_CPU_PROF: '1', AMAIL_DATA_DIR: dataDir });
+  assert.match(out, /--cpu-prof /);
+  assert.match(out, /cpu-profiles/);
+  assert.equal(fs.existsSync(path.join(dataDir, 'cpu-profiles')), true);
 });

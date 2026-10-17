@@ -33,7 +33,7 @@ export function createHarness({ config, logger }) {
     const plan = backgroundReceiptPlan(config);
     if (pollTimer || !plan.enabled) return;
     const poll = ({ force = false, retryFailed = false } = {}) => mailService.syncAll({
-      maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed,
+      maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed, mode: 'incremental',
     })
       .then((results) => {
         // A pass that ran out of budget with mail still waiting continues

@@ -21,7 +21,10 @@ export function processMemorySnapshot(usage = process.memoryUsage()) {
   };
 }
 
-export function databaseFileStats(dbPath) {
+const STATS_TTL_MS = 30_000;
+const statsCache = new Map();
+
+export function databaseFileStats(dbPath, { now = Date.now, ttlMs = STATS_TTL_MS } = {}) {
   const sizeOf = (file) => {
     try {
       return fs.statSync(file).size;
@@ -30,11 +33,15 @@ export function databaseFileStats(dbPath) {
     }
   };
   if (!dbPath) return { bytes: 0, walBytes: 0, shmBytes: 0 };
-  return {
+  const cached = statsCache.get(dbPath);
+  if (cached && now() - cached.at < ttlMs) return cached.value;
+  const value = {
     bytes: sizeOf(dbPath),
     walBytes: sizeOf(`${dbPath}-wal`),
     shmBytes: sizeOf(`${dbPath}-shm`),
   };
+  statsCache.set(dbPath, { at: now(), value });
+  return value;
 }
 
 export function readRuntimeStatus(mailService, { locked = false } = {}) {

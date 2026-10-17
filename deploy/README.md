@@ -367,14 +367,18 @@ starve a shared host; raise the first for very large mailboxes.
 
 CPU is spent almost entirely in IMAP passes. New inbox mail arrives over IMAP
 IDLE. The fallback is a UIDNEXT probe every 60 seconds (concurrency-capped,
-no body download unless the inbox moved). A focused tab reloads from the
-local cache about every 20 seconds. The server
-coalesces concurrent full syncs, enforces a 60-second minimum interval
-(`AMAIL_SYNC_MIN_INTERVAL_MS`) on those full passes, and returns a pass that
-finished inside that window. Agents that poll should pass `maxAgeSeconds` to
-`sync_mail` (or `POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES`
-is the full-folder pass, not the inbox wait (15 minutes in keyslot mode, 5 in
-the supplied `.env.example`).
+no body download unless the inbox moved). Periodic `SYNC_INTERVAL_MINUTES`
+passes are incremental (UIDNEXT, and CONDSTORE/MODSEQ when the server offers
+it): they do not re-download already-synced UIDs. Parse and SQLCipher writes
+run on a worker thread so `/api/health` can still answer. A focused tab
+reloads from the local cache about every 20 seconds. The server coalesces
+concurrent syncs, enforces a 60-second minimum interval
+(`AMAIL_SYNC_MIN_INTERVAL_MS`), and returns a pass that finished inside that
+window. Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
+`POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES` is the
+folder walk, not the inbox wait (15 minutes in keyslot mode, 5 in the
+supplied `.env.example`). Set `AMAIL_DEBUG_TIMING=1` for per-phase logs, or
+`AMAIL_CPU_PROF=1` to write Node `--cpu-prof` files under the data directory.
 
 ## Continuous integration
 

@@ -135,6 +135,12 @@ export function loadConfig(env = process.env) {
     // Keep one IMAP TCP session per account this long after the last use so
     // the next pass skips the TLS handshake. 0 logs out immediately (tests).
     imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),
+    // Phase logs for health, listings, and IMAP passes. CPU_PROF also asks
+    // the image entrypoint to add Node --cpu-prof.
+    debugTiming: boolean(readEnv(env, 'DEBUG_TIMING'), false) || boolean(env.AMAIL_DEBUG_TIMING, false),
+    cpuProf: boolean(readEnv(env, 'CPU_PROF'), false) || boolean(env.AMAIL_CPU_PROF, false),
+    // Parse + SQLCipher writes on a worker thread. Tests turn this off.
+    syncWorker: boolean(readEnv(env, 'SYNC_WORKER'), env.NODE_ENV !== 'test'),
     // 0 disables background polling. Otherwise this is the full-folder pass
     // (Sent, Drafts, and the rest). New inbox mail does not wait for it:
     // pooled IMAP IDLE pushes, and a 60-second UIDNEXT probe is the fallback.
