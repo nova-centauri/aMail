@@ -521,7 +521,11 @@ export function createMailService({
   compileMessage = compileRfc822Message,
   createMessageId = () => `<${randomUUID()}@amail.local>`,
 }) {
-  const ingest = createSyncIngest({ config, logger });
+  const ingest = createSyncIngest({
+    config,
+    logger,
+    onStamp: (stamp) => repos.changes?.applyRemote?.(stamp),
+  });
   const failedImapClients = new WeakSet();
   const newImapClient = (account, credentials, { pooled = false } = {}) => {
     const client = new ImapClient(buildImapOptions(account, credentials, config, { pooled }));
@@ -659,10 +663,12 @@ export function createMailService({
     }
     const connecting = openPooledClient(account, credentials, existing, generation);
     poolConnecting.set(account.id, connecting);
+    notifySyncFlight();
     try {
       return await connecting;
     } finally {
       if (poolConnecting.get(account.id) === connecting) poolConnecting.delete(account.id);
+      notifySyncFlight();
     }
   }
 
@@ -934,7 +940,7 @@ export function createMailService({
     };
   }
 
-  async function syncMailbox({ account, client, descriptor, limit, generation, mode = 'incremental' }) {
+  async function syncMailbox({ account, client, descriptor, limit, generation, mode = 'incremental', statusPreview = null }) {
     const { mailbox, role, allMailMirror = false } = descriptor;
     const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
       ? config.syncMaxMessageBytes
@@ -1113,6 +1119,7 @@ export function createMailService({
     });
 
     async function readStatus() {
+      if (statusPreview) return statusPreview;
       if (typeof client.status !== 'function') return null;
       try {
         const status = await client.status(mailbox, { uidNext: true, uidValidity: true, highestModseq: true });
@@ -1275,7 +1282,8 @@ export function createMailService({
         timing.mark(`page_${page.firstUid}_${page.endUid}`);
         if (Date.now() - startedAt >= passBudgetMs) break;
       }
-      remaining = scanDrafts ? 0 : Math.max(0, (plan.endUid || 0) - lastUid);
+      if (plan.jumpCursor) lastUid = Math.max(lastUid, plan.endUid || lastUid);
+      remaining = (scanDrafts || plan.jumpCursor) ? 0 : Math.max(0, (plan.endUid || 0) - lastUid);
       if (remaining > 0) {
         logger.info({ accountId: account.id, mailbox, remaining }, 'IMAP mailbox backlog continues on the next pass');
       }
@@ -1356,10 +1364,30 @@ export function createMailService({
       const descriptors = singleMailbox
         ? [{ mailbox: explicitMailbox, role: folderForMailbox(explicitMailbox), allMailMirror: false }]
         : discoverSyncMailboxes(folders);
+      const statusByMailbox = new Map();
+      await Promise.all(descriptors.map(async (descriptor) => {
+        if (typeof client.status !== 'function') {
+          statusByMailbox.set(descriptor.mailbox, null);
+          return;
+        }
+        try {
+          const status = await client.status(descriptor.mailbox, { uidNext: true, uidValidity: true, highestModseq: true });
+          statusByMailbox.set(descriptor.mailbox, {
+            uidNext: Number(status?.uidNext) || 0,
+            uidValidity: Number(status?.uidValidity) || null,
+            highestModseq: status?.highestModseq != null ? String(status.highestModseq) : null,
+          });
+        } catch {
+          statusByMailbox.set(descriptor.mailbox, null);
+        }
+      }));
       const mailboxes = [];
       for (const descriptor of descriptors) {
         try {
-          mailboxes.push(await syncMailbox({ account, client, descriptor, limit, generation, mode }));
+          mailboxes.push(await syncMailbox({
+            account, client, descriptor, limit, generation, mode,
+            statusPreview: statusByMailbox.get(descriptor.mailbox) || null,
+          }));
         } catch {
           assertAccountGeneration(accountId, generation);
           const failed = { mailbox: descriptor.mailbox, role: descriptor.role, status: 'failed', imported: 0, error: 'IMAP_SYNC_FAILED' };
@@ -1452,6 +1480,7 @@ export function createMailService({
     const promise = withSyncDeadline(accountId, runSyncAccount(accountId, { mailbox, limit, mode }), generation);
     const entry = { promise, startedAt: Date.now(), accountId };
     accountInFlight.set(key, entry);
+    notifySyncFlight();
     try {
       const result = await promise;
       assertAccountGeneration(accountId, generation);
@@ -1469,6 +1498,7 @@ export function createMailService({
       throw error;
     } finally {
       if (accountInFlight.get(key) === entry) accountInFlight.delete(key);
+      notifySyncFlight();
     }
   }
 
@@ -1538,6 +1568,31 @@ export function createMailService({
   let inFlightSync = null;
   let lastFullSync = null;
   let settingsGeneration = 0;
+  const syncFlightListeners = new Set();
+  let lastNotifiedFlight = false;
+
+  function syncIsInFlight() {
+    return Boolean(inFlightSync) || accountInFlight.size > 0 || poolConnecting.size > 0;
+  }
+
+  function notifySyncFlight() {
+    const inFlight = syncIsInFlight();
+    if (inFlight === lastNotifiedFlight) return;
+    lastNotifiedFlight = inFlight;
+    for (const listener of syncFlightListeners) {
+      try {
+        listener(inFlight);
+      } catch {
+        // SSE must not fail the IMAP pass.
+      }
+    }
+  }
+
+  function onSyncFlight(listener) {
+    if (typeof listener !== 'function') return () => {};
+    syncFlightListeners.add(listener);
+    return () => syncFlightListeners.delete(listener);
+  }
   const syncKey = ({ mailbox, limit }) => {
     const target = typeof mailbox === 'string' && mailbox.trim() ? mailbox.trim() : 'INBOX';
     return `${target.toLowerCase() === 'inbox' ? 'INBOX' : target}\u0000${limit ?? config.syncBatchSize ?? ''}`;
@@ -1720,12 +1775,14 @@ export function createMailService({
     const generation = settingsGeneration;
     const promise = runSyncAll({ mailbox, limit, force, retryFailed, mode }).finally(() => afterSyncMaintenance());
     inFlightSync = { key, promise, startedAt: Date.now() };
+    notifySyncFlight();
     try {
       const results = await promise;
       if (generation === settingsGeneration) lastFullSync = { key, finishedAt: Date.now(), results };
       return results;
     } finally {
       inFlightSync = null;
+      notifySyncFlight();
     }
   }
 
@@ -1737,7 +1794,7 @@ export function createMailService({
     }
     const oldestStartedAtMs = started.length ? Math.min(...started) : null;
     return {
-      inFlight: Boolean(inFlightSync) || accountInFlight.size > 0 || poolConnecting.size > 0,
+      inFlight: syncIsInFlight(),
       queueDepth: accountInFlight.size + probeWaiters.length + poolConnecting.size,
       oldestStartedAt: oldestStartedAtMs ? new Date(oldestStartedAtMs).toISOString() : null,
       oldestAgeMs: oldestStartedAtMs == null ? null : Math.max(0, Date.now() - oldestStartedAtMs),
@@ -1816,6 +1873,7 @@ export function createMailService({
     poolConnecting.delete(accountId);
     accountCooldown.delete(accountId);
     for (const key of accountInFlight.keys()) if (key.startsWith(`${accountId}\u0000`)) accountInFlight.delete(key);
+    notifySyncFlight();
     for (const key of accountLastSync.keys()) if (key.startsWith(`${accountId}\u0000`)) accountLastSync.delete(key);
     const probeTimer = inboxProbeTimers.get(accountId);
     if (probeTimer) clearTimeout(probeTimer);
@@ -2560,6 +2618,7 @@ export function createMailService({
     enqueueSyncAll,
     enqueueSyncAccount,
     runtimeStatus,
+    onSyncFlight,
     probeInboxes,
     testSettings,
     testAccount,

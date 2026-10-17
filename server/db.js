@@ -14,6 +14,10 @@ import {
 const SMART_FILTER_FINGERPRINT_SETTING = 'smartFilterFingerprint';
 import { ftsDocument } from './services/fts.js';
 import { buildConversationSearch } from './services/conversation-search.js';
+import {
+  createChangeVersionStore,
+  stampFromRow,
+} from './services/change-version.js';
 
 const json = (value, fallback = []) => {
   if (value === null || value === undefined || value === '') return fallback;
@@ -330,6 +334,15 @@ function initSchema(db) {
       value_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS change_version (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL DEFAULT 0,
+      message_at TEXT,
+      sync_at TEXT,
+      account_at TEXT
+    );
+    INSERT OR IGNORE INTO change_version (id, version) VALUES (1, 0);
 
     CREATE TABLE IF NOT EXISTS passkeys (
       id TEXT PRIMARY KEY,
@@ -1074,6 +1087,14 @@ export function createRepositories(db) {
     maxMessageUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM messages'),
     maxSyncSynced: db.prepare('SELECT MAX(synced_at) AS t FROM sync_state'),
     maxAccountUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM accounts'),
+    changeVersionGet: db.prepare('SELECT * FROM change_version WHERE id = 1'),
+    changeVersionPut: db.prepare(`INSERT INTO change_version (id, version, message_at, sync_at, account_at)
+      VALUES (1, @version, @message_at, @sync_at, @account_at)
+      ON CONFLICT(id) DO UPDATE SET
+        version = excluded.version,
+        message_at = excluded.message_at,
+        sync_at = excluded.sync_at,
+        account_at = excluded.account_at`),
     pruneBodies: db.prepare(`UPDATE messages SET html_body = '', text_body = '', updated_at = @updated_at
       WHERE COALESCE(received_at, sent_at, created_at) < @cutoff
         AND (html_body != '' OR text_body != '')`),
@@ -1121,6 +1142,30 @@ export function createRepositories(db) {
   };
 
   let queueSearch = () => {};
+
+  function seedChangeStamp() {
+    const existing = queries.changeVersionGet.get();
+    const loaded = stampFromRow(existing);
+    if (loaded.version > 0 || loaded.messageAt || loaded.accountAt || loaded.syncAt) return existing;
+    const messageAt = queries.maxMessageUpdated.get()?.t || null;
+    const syncAt = queries.maxSyncSynced.get()?.t || null;
+    const accountAt = queries.maxAccountUpdated.get()?.t || null;
+    if (!messageAt && !syncAt && !accountAt) return existing || { version: 0 };
+    const seeded = {
+      version: 1,
+      message_at: messageAt,
+      sync_at: syncAt,
+      account_at: accountAt,
+    };
+    queries.changeVersionPut.run(seeded);
+    return seeded;
+  }
+
+  const changes = createChangeVersionStore({
+    load: seedChangeStamp,
+    persist: (row) => queries.changeVersionPut.run(row),
+    now,
+  });
 
   const recomputeThread = db.transaction((threadId) => {
     const thread = queries.threadById.get(threadId);
@@ -1173,6 +1218,7 @@ export function createRepositories(db) {
   const insertMessageRow = (row) => {
     queries.messageInsert.run(row);
     finishMessageWrite([row.thread_id], row.id);
+    changes.bump('message', row.updated_at);
     return publicMessage(queries.messageById.get(row.id));
   };
 
@@ -1182,6 +1228,7 @@ export function createRepositories(db) {
       ? [existing.thread_id]
       : [existing.thread_id, row.thread_id];
     finishMessageWrite(threads, existing.id);
+    changes.bump('message', row.updated_at);
     return publicMessage(queries.messageById.get(existing.id));
   };
 
@@ -1235,17 +1282,22 @@ export function createRepositories(db) {
         const id = randomUUID();
         const timestamp = now();
         queries.accountInsert.run({ id, created_at: timestamp, updated_at: timestamp, ...input });
+        changes.bump('account', timestamp);
         return publicAccount(queries.accountById.get(id));
       },
       update(id, input) {
         const existing = queries.accountById.get(id);
         if (!existing) return null;
-        queries.accountUpdate.run({ ...existing, ...input, id, updated_at: now() });
+        const timestamp = now();
+        queries.accountUpdate.run({ ...existing, ...input, id, updated_at: timestamp });
+        changes.bump('account', timestamp);
         return publicAccount(queries.accountById.get(id));
       },
       remove: (id) => {
         queueSearch({ accountRemoved: id });
-        return queries.accountDelete.run(id).changes > 0;
+        const removed = queries.accountDelete.run(id).changes > 0;
+        if (removed) changes.bump('account');
+        return removed;
       },
       markSynced(id) {
         const timestamp = now();
@@ -1449,9 +1501,10 @@ export function createRepositories(db) {
       setState(id, state) {
         const row = queries.messageById.get(id);
         if (!row) return null;
+        const timestamp = now();
         queries.messageState.run({
           id,
-          updated_at: now(),
+          updated_at: timestamp,
           is_read: state.isRead === undefined ? null : Number(Boolean(state.isRead)),
           is_starred: state.isStarred === undefined ? null : Number(Boolean(state.isStarred)),
           is_archived: state.isArchived === undefined ? null : Number(Boolean(state.isArchived)),
@@ -1464,13 +1517,16 @@ export function createRepositories(db) {
         });
         recomputeThread(row.thread_id);
         queueSearch({ messageIds: [id] });
+        changes.bump('message', timestamp);
         return publicMessage(queries.messageById.get(id));
       },
       relocate(id, { mailbox, uid }) {
         const row = queries.messageById.get(id);
         if (!row) return null;
-        queries.messageRelocate.run({ id, mailbox, uid, updated_at: now() });
+        const timestamp = now();
+        queries.messageRelocate.run({ id, mailbox, uid, updated_at: timestamp });
         queueSearch({ messageIds: [id] });
+        changes.bump('message', timestamp);
         return publicMessage(queries.messageById.get(id));
       },
       searchConversations({
@@ -1503,8 +1559,16 @@ export function createRepositories(db) {
           nowIso: now(),
         });
         if (built.empty) return { threadIds: [], total: 0, categoryCounts: [] };
-        const threadIds = db.prepare(built.pageSql).all(built.params).map((row) => row.threadId);
-        const total = Number(db.prepare(built.countSql).get(built.params)?.total) || 0;
+        const pageRows = db.prepare(built.pageSql).all(built.params);
+        const threadIds = pageRows.map((row) => row.threadId);
+        const pageTotal = built.cheap && pageRows.length && pageRows[0].total != null
+          ? Number(pageRows[0].total)
+          : null;
+        const total = pageTotal != null
+          ? pageTotal
+          : (built.cheap && (Number(built.params.offset) || 0) === 0 && !pageRows.length
+            ? 0
+            : (Number(db.prepare(built.countSql).get(built.params)?.total) || 0));
         const categoryCounts = db.prepare(built.categorySql).all(built.params);
         return { threadIds, total, categoryCounts };
       },
@@ -1635,7 +1699,10 @@ export function createRepositories(db) {
     },
     sync: {
       get: (accountId, mailbox) => queries.syncState.get(accountId, mailbox) || null,
-      save: (state) => queries.syncStateUpsert.run({ highest_modseq: null, ...state }),
+      save: (state) => {
+        queries.syncStateUpsert.run({ highest_modseq: null, ...state });
+        if (state?.synced_at) changes.bump('sync', state.synced_at);
+      },
       recordSkip(state) {
         queries.syncSkipUpsert.run({
           account_id: state.account_id,
@@ -1647,20 +1714,15 @@ export function createRepositories(db) {
       },
       clearSkips: (accountId, mailbox) => queries.syncSkipClear.run(accountId, mailbox),
     },
-    changes: {
-      stamp() {
-        const messageAt = queries.maxMessageUpdated.get()?.t || null;
-        const syncAt = queries.maxSyncSynced.get()?.t || null;
-        const accountAt = queries.maxAccountUpdated.get()?.t || null;
-        const times = [messageAt, syncAt, accountAt].filter(Boolean).sort();
-        return { changedAt: times.at(-1) || null, messageAt, syncAt, accountAt };
-      },
-    },
+    changes,
     retention: {
       // Clears stored bodies only. The contentless FTS index keeps tokens until
       // the next upsert, which is what lets pruned mail stay searchable.
       pruneBodies(cutoffIso) {
-        return queries.pruneBodies.run({ cutoff: cutoffIso, updated_at: now() }).changes;
+        const timestamp = now();
+        const pruned = queries.pruneBodies.run({ cutoff: cutoffIso, updated_at: timestamp }).changes;
+        if (pruned > 0) changes.bump('message', timestamp);
+        return pruned;
       },
     },
     drafts: {
@@ -1671,15 +1733,22 @@ export function createRepositories(db) {
         const id = randomUUID();
         const timestamp = now();
         queries.draftInsert.run({ id, created_at: timestamp, updated_at: timestamp, ...input });
+        changes.bump('message', timestamp);
         return publicDraft(queries.draftById.get(id));
       },
       update(id, input) {
         const existing = queries.draftById.get(id);
         if (!existing) return null;
-        queries.draftUpdate.run({ ...existing, ...input, id, updated_at: now() });
+        const timestamp = now();
+        queries.draftUpdate.run({ ...existing, ...input, id, updated_at: timestamp });
+        changes.bump('message', timestamp);
         return publicDraft(queries.draftById.get(id));
       },
-      remove: (id) => queries.draftDelete.run(id).changes > 0,
+      remove: (id) => {
+        const removed = queries.draftDelete.run(id).changes > 0;
+        if (removed) changes.bump('message');
+        return removed;
+      },
     },
     settings: {
       list: () => Object.fromEntries(queries.settingList.all().map((row) => [row.key, json(row.value_json, null)])),

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { conversationListEtag, ifNoneMatchHits, listContentStamp, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
+import { conversationListEtag, ifNoneMatchHits, listCacheToken, listContentStamp, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-'));
@@ -481,7 +481,7 @@ test('sync-cursor-only stamp changes do not bust the inbox list cache or ETag', 
   add(thread('Cached'));
   const first = await listConversations(repos, { folder: 'inbox', pageSize: 60 });
   assert.equal(first.total, 1);
-  const etag = conversationListEtag(listContentStamp(repos.changes.stamp()), { folder: 'inbox', pageSize: 60 });
+  const etag = conversationListEtag(listCacheToken(repos.changes.stamp()), { folder: 'inbox', pageSize: 60 });
   executed.length = 0;
   repos.sync.save({
     account_id: account.id,
@@ -500,7 +500,7 @@ test('sync-cursor-only stamp changes do not bust the inbox list cache or ETag', 
   assert.deepEqual(second.messages.map((item) => item.id), first.messages.map((item) => item.id));
   assert.equal(executed.filter(isInboxListingSql).length, 0, executed.filter(isInboxListingSql)[0]);
   assert.equal(
-    conversationListEtag(listContentStamp(stamp), { folder: 'inbox', pageSize: 60 }),
+    conversationListEtag(listCacheToken(stamp), { folder: 'inbox', pageSize: 60 }),
     etag,
   );
   add(thread('Arrived after sync'));

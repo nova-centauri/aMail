@@ -58,13 +58,15 @@ from each supported folder (200 by default). This is a recent-mail client
 rather than a full historical migration tool; increase the value (up to 1000)
 before connecting an account if you need a larger initial window.
 
-After that first pass, every message above a folder's high-water mark is
+After that first pass, inbox/sent mail above a folder's high-water mark is
 imported, oldest first, in pages of `AMAIL_SYNC_BATCH_SIZE`. A burst larger
 than one page is never skipped: a pass keeps paging for up to
 `AMAIL_SYNC_PASS_BUDGET_MS` (60 s) and the background poller picks up any
-remainder a few seconds later. Up to `AMAIL_SYNC_CONCURRENCY` accounts (3)
-synchronize at once, and an account whose server stops answering is cut off
-after `AMAIL_SYNC_ACCOUNT_TIMEOUT_MS` (10 minutes) so it cannot stall the rest.
+remainder a few seconds later. Gmail Drafts, Trash, and Spam with a UID gap
+larger than one page take only the newest window instead of scanning the
+hole. Up to `AMAIL_SYNC_CONCURRENCY` accounts (3) synchronize at once, and an
+account whose server stops answering is cut off after
+`AMAIL_SYNC_ACCOUNT_TIMEOUT_MS` (10 minutes) so it cannot stall the rest.
 
 ## Upgrading from GigaMail
 

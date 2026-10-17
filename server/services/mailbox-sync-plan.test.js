@@ -75,6 +75,35 @@ test('a first window and a UIDVALIDITY change import only the newest page', () =
   assert.equal(rotated.endUid, 12);
 });
 
+test('periodic drafts and trash do not scan 1:latest when the cursor is caught up', () => {
+  const drafts = planMailboxSync({
+    lastUid: 4048,
+    uidValidity: 41,
+    previousUidValidity: 41,
+    uidNext: 13,
+    limit: 200,
+    role: 'drafts',
+    mode: 'incremental',
+  });
+  assert.equal(drafts.kind, 'unchanged');
+  assert.equal(drafts.scanDrafts, false);
+
+  const trashGap = planMailboxSync({
+    lastUid: 10,
+    uidValidity: 1,
+    previousUidValidity: 1,
+    uidNext: 50_001,
+    limit: 200,
+    role: 'trash',
+    mode: 'incremental',
+  });
+  assert.equal(trashGap.kind, 'new-uids');
+  assert.equal(trashGap.reason, 'uidnext-window');
+  assert.equal(trashGap.jumpCursor, true);
+  assert.equal(trashGap.endUid, 50_000);
+  assert.ok(trashGap.firstUid > 10);
+});
+
 test('CONDSTORE flag catch-up runs only when UIDNEXT is unchanged and MODSEQ moved', () => {
   const flags = planMailboxSync({
     lastUid: 10,

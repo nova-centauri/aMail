@@ -1,19 +1,21 @@
-import { listContentStamp } from './inbox.js';
+import { listCacheToken } from './change-version.js';
 
 export const MAILBOX_EVENT_HEARTBEAT_MS = 20_000;
-export const MAILBOX_EVENT_POLL_MS = 250;
+/** Legacy interval. The hub is push-driven; SQL is never polled on this tick. */
+export const MAILBOX_EVENT_POLL_MS = 0;
 export const MAILBOX_EVENT_BUFFER = 64;
 /** Push clients refetch on each named event; cap bursts during a long IMAP pass. */
 export const MAILBOX_EVENT_COALESCE_MS = 15_000;
 
 export function emptyStamp() {
-  return { changedAt: null, messageAt: null, syncAt: null, accountAt: null };
+  return { version: 0, changedAt: null, messageAt: null, syncAt: null, accountAt: null };
 }
 
 export function readStamp(repos) {
   const stamp = repos?.changes?.stamp?.();
   if (!stamp || typeof stamp !== 'object') return emptyStamp();
   return {
+    version: Number(stamp.version) || 0,
     changedAt: stamp.changedAt || null,
     messageAt: stamp.messageAt || null,
     syncAt: stamp.syncAt || null,
@@ -21,9 +23,14 @@ export function readStamp(repos) {
   };
 }
 
+function contentTime(stamp = {}) {
+  const times = [stamp?.messageAt, stamp?.accountAt].filter(Boolean).sort();
+  return times.at(-1) || null;
+}
+
 /** Listing/ETag version: sync-cursor progress must not look like new mail. */
 export function listRefetchStamp(stamp = {}) {
-  return listContentStamp(stamp) || null;
+  return listCacheToken(stamp) || null;
 }
 
 export function mergeCoalescedEvents(pending) {
@@ -38,7 +45,7 @@ export function mergeCoalescedEvents(pending) {
 /**
  * Leading-edge emit, then at most one flush per interval. Push clients
  * refetch on `message.new` / `sync.mailbox`; a 399s IMAP pass would
- * otherwise fire those on every 250ms stamp tick.
+ * otherwise fire those on every writer bump.
  */
 export function createRefetchCoalescer({
   intervalMs = MAILBOX_EVENT_COALESCE_MS,
@@ -104,15 +111,15 @@ export function createRefetchCoalescer({
 export function eventsForStampChange(previous, next) {
   const before = previous || emptyStamp();
   const after = next || emptyStamp();
-  const contentAt = listRefetchStamp(after);
-  if (!contentAt || contentAt === listRefetchStamp(before)) return [];
-  const events = [{ event: 'change-version', data: { changedAt: contentAt } }];
+  if (!listRefetchStamp(after) || listRefetchStamp(after) === listRefetchStamp(before)) return [];
+  const changedAt = contentTime(after) || listRefetchStamp(after);
+  const events = [{ event: 'change-version', data: { changedAt } }];
   if (after.messageAt && after.messageAt !== before.messageAt) {
-    events.push({ event: 'new-mail', data: { changedAt: contentAt } });
-    events.push({ event: 'message.new', data: { changedAt: contentAt } });
+    events.push({ event: 'new-mail', data: { changedAt } });
+    events.push({ event: 'message.new', data: { changedAt } });
   }
   if (after.accountAt && after.accountAt !== before.accountAt) {
-    events.push({ event: 'account.updated', data: { changedAt: contentAt } });
+    events.push({ event: 'account.updated', data: { changedAt } });
   }
   return events;
 }
@@ -153,6 +160,9 @@ export function createMailboxEventHub({
   const buffer = [];
   let seq = 0;
   let timer = null;
+  let started = false;
+  let unsubChanges = null;
+  let unsubFlight = null;
   let lastStamp = emptyStamp();
   let lastInFlight = false;
 
@@ -191,21 +201,50 @@ export function createMailboxEventHub({
     coalescer.enqueue(eventsForStampChange(lastStamp, stamp));
     lastStamp = stamp;
     const inFlight = currentInFlight();
-    coalescer.enqueue(eventsForSyncFlight(lastInFlight, inFlight, listRefetchStamp(stamp)));
+    coalescer.enqueue(eventsForSyncFlight(lastInFlight, inFlight, contentTime(stamp) || listRefetchStamp(stamp)));
     lastInFlight = inFlight;
   }
 
+  function onWriterStamp(stamp) {
+    coalescer.enqueue(eventsForStampChange(lastStamp, stamp));
+    lastStamp = stamp && typeof stamp === 'object' ? {
+      changedAt: stamp.changedAt || null,
+      messageAt: stamp.messageAt || null,
+      syncAt: stamp.syncAt || null,
+      accountAt: stamp.accountAt || null,
+      version: Number(stamp.version) || 0,
+    } : emptyStamp();
+  }
+
+  function onFlight(isInFlight) {
+    coalescer.enqueue(eventsForSyncFlight(lastInFlight, isInFlight, contentTime(lastStamp) || listRefetchStamp(lastStamp)));
+    lastInFlight = Boolean(isInFlight);
+  }
+
   function start() {
-    if (timer) return;
+    if (started) return;
+    started = true;
     lastStamp = readStamp(repos);
     lastInFlight = currentInFlight();
-    timer = setInterval(tick, Math.max(20, Number(pollMs) || MAILBOX_EVENT_POLL_MS));
-    timer.unref?.();
+    unsubChanges = repos?.changes?.subscribe?.(onWriterStamp) || null;
+    unsubFlight = mailService?.onSyncFlight?.(onFlight) || null;
+    const interval = Number(pollMs);
+    // Push from writers is the default. An explicit pollMs is only for tests
+    // that mutate a fake stamp object; it still reads the in-memory stamp.
+    if (interval > 0) {
+      timer = setInterval(tick, Math.max(20, interval));
+      timer.unref?.();
+    }
   }
 
   function stop() {
+    started = false;
     if (timer) clearInterval(timer);
     timer = null;
+    unsubChanges?.();
+    unsubChanges = null;
+    unsubFlight?.();
+    unsubFlight = null;
     coalescer.close();
   }
 
@@ -227,7 +266,8 @@ export function createMailboxEventHub({
       return replaySince(buffer, lastEventId, seq);
     },
     changedAt() {
-      return listRefetchStamp(readStamp(repos));
+      const stamp = readStamp(repos);
+      return contentTime(stamp) || listRefetchStamp(stamp);
     },
     seq() {
       return seq;

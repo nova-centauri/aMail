@@ -803,6 +803,76 @@ test('GET /api/messages returns 304 for an unchanged change-version and clamps p
   assert.equal(afterSync.status, 304);
 });
 
+test('GET /api/messages 304 runs no listing or stamp SQL', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-304-sql-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const executed = [];
+  const db = new Proxy(createDatabase(config), {
+    get(target, property) {
+      if (property === 'prepare') return (sql) => {
+        const statement = target.prepare(sql);
+        return new Proxy(statement, {
+          get(prepared, method) {
+            const value = prepared[method];
+            if (['all', 'get', 'run'].includes(method)) return (...args) => {
+              executed.push(sql);
+              return value.apply(prepared, args);
+            };
+            return typeof value === 'function' ? value.bind(prepared) : value;
+          },
+        });
+      };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const repos = createRepositories(db);
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', avatar_blob: null, avatar_mime: null,
+    color: '#1a73e8', provider: 'custom', imap_host: 'imap.example.test', imap_port: 993,
+    imap_secure: 1, smtp_host: 'smtp.example.test', smtp_port: 465, smtp_secure: 1,
+    credential_ciphertext: 'fixture', signature: '', sync_enabled: 0,
+  });
+  const thread = repos.threads.create({
+    account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-01-01T00:00:00.000Z',
+  });
+  repos.messages.upsert(messageInput({
+    accountId: account.id, threadId: thread.id, uid: 1, subject: 'Hello',
+    fromEmail: 'friend@example.test', timestamp: '2026-01-01T00:00:00.000Z',
+  }));
+  const app = express();
+  registerApi(app, { config, repos, mailService: {}, remoteContent: { canIssueTokens: false } });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const first = await fetch(`${origin}/api/messages?folder=inbox`);
+  assert.equal(first.status, 200);
+  const etag = first.headers.get('etag');
+  executed.length = 0;
+  const notModified = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
+  assert.equal(notModified.status, 304);
+  const listing = executed.filter((sql) => /WITH\s+latest/i.test(sql) || /idx_messages_inbox_list/i.test(sql));
+  const stampScan = executed.filter((sql) => /MAX\s*\(\s*(updated_at|synced_at)\s*\)/i.test(sql)
+    && /FROM\s+(messages|accounts|sync_state)\b/i.test(sql));
+  assert.equal(listing.length, 0, listing[0] || '304 ran listing SQL');
+  assert.equal(stampScan.length, 0, stampScan[0] || '304 scanned change stamps');
+  assert.equal(executed.filter((sql) => /\bFROM\s+messages\b/i.test(sql)).length, 0);
+});
+
 test('GET /api/health reports sync queue, db/WAL size, and memory without mailbox data', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-health-'));
   const config = {

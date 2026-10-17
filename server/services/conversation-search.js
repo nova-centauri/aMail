@@ -114,7 +114,8 @@ function cheapListingSql({ accountSql, hideQuiet, category, folder }) {
   return {
     cheap: true,
     pageSql: `${cte}
-      SELECT thread_id AS threadId
+      SELECT thread_id AS threadId,
+        (SELECT COUNT(*) FROM latest ${headedWhereSql}) AS total
       FROM latest
       ${headedWhereSql}
       ORDER BY latest_at DESC, thread_id DESC
