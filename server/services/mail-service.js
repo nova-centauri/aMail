@@ -521,17 +521,31 @@ function defaultScheduleTimeout(ms, fn) {
   return () => clearTimeout(timer);
 }
 
+const SYNC_TIMEOUT_CODES = new Set(['IMAP_SYNC_TIMEOUT', 'IMAP_MAILBOX_TIMEOUT']);
+
+function isFailedSyncResult(item) {
+  return item?.status === 'failed' && !item?.coolingDown;
+}
+
 function summarizeSyncResults(results) {
   const list = Array.isArray(results) ? results : results ? [results] : [];
+  const failed = list.filter(isFailedSyncResult).length;
   return {
     accounts: list.length,
     imported: list.reduce((sum, item) => sum + (Number(item?.imported) || 0), 0),
-    failed: list.filter((item) => item?.status === 'failed' && !item?.coolingDown).length,
+    ok: list.filter((item) => !isFailedSyncResult(item) && !item?.coolingDown).length,
+    failed,
+    timedOut: list.filter((item) => isFailedSyncResult(item) && SYNC_TIMEOUT_CODES.has(item?.error)).length,
     remaining: list.reduce((sum, item) => sum + (Number(item?.remaining) || 0), 0),
     status: list.some((item) => item?.status === 'failed')
       ? (list.some((item) => item?.status !== 'failed') ? 'partial' : 'failed')
       : (list.some((item) => item?.status === 'partial') ? 'partial' : 'ok'),
   };
+}
+
+function syncJobDurationMs(job) {
+  const started = Date.parse(job?.startedAt);
+  return Number.isFinite(started) ? Math.max(0, Date.now() - started) : 0;
 }
 
 export function createMailService({
@@ -1937,6 +1951,15 @@ export function createMailService({
     drainTimer.unref?.();
   }
 
+  function logSyncJobFinished(job, fields) {
+    logger.info({
+      event: 'sync_job_finished',
+      jobId: job.id,
+      durationMs: syncJobDurationMs(job),
+      ...fields,
+    }, 'Sync job finished');
+  }
+
   function finishSyncJob(job, promise, { warnMessage, accountId } = {}) {
     void promise.then((result) => {
       const summary = summarizeSyncResults(result);
@@ -1945,9 +1968,25 @@ export function createMailService({
         result: summary,
         error: summary.status === 'failed' ? 'IMAP_SYNC_FAILED' : null,
       });
+      logSyncJobFinished(job, {
+        accounts: summary.accounts,
+        ok: summary.ok,
+        failed: summary.failed,
+        timedOut: summary.timedOut,
+        status: summary.status,
+      });
     }).catch((error) => {
-      jobBoard.finish(job, { status: 'error', error: cleanupError(error) });
-      logger.warn({ err: cleanupError(error), ...(accountId ? { accountId } : {}) }, warnMessage);
+      const cleaned = cleanupError(error);
+      const timedOut = SYNC_TIMEOUT_CODES.has(error?.code) ? 1 : 0;
+      jobBoard.finish(job, { status: 'error', error: cleaned });
+      logger.warn({ err: cleaned, ...(accountId ? { accountId } : {}) }, warnMessage);
+      logSyncJobFinished(job, {
+        accounts: accountId ? 1 : 0,
+        ok: 0,
+        failed: 1,
+        timedOut,
+        status: 'error',
+      });
     });
   }
 
@@ -1979,7 +2018,7 @@ export function createMailService({
     }
     const job = jobBoard.create({ kind: 'all', status: state === 'queued' ? 'queued' : 'running' });
     job.status = 'running';
-    logger.info({ event: 'sync_job_start', jobId: job.id, kind: 'all', state }, 'Background mail sync queued');
+    logger.info({ event: 'sync_job_started', jobId: job.id, kind: 'all', state }, 'Sync job started');
     const work = syncAll(options);
     if (inFlightSync && !inFlightSync.job) inFlightSync.job = job;
     finishSyncJob(job, work, { warnMessage: 'Background mail sync failed' });
@@ -2009,7 +2048,7 @@ export function createMailService({
       return enqueueEnvelope(state, pending.job, { accountId });
     }
     const job = jobBoard.create({ kind: 'account', accountId, status: 'running' });
-    logger.info({ event: 'sync_job_start', jobId: job.id, kind: 'account', accountId, state }, 'Background account sync queued');
+    logger.info({ event: 'sync_job_started', jobId: job.id, kind: 'account', accountId, state }, 'Sync job started');
     const work = syncAccount(accountId, options);
     const inflight = accountInFlight.get(key);
     if (inflight && !inflight.job) inflight.job = job;

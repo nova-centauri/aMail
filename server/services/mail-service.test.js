@@ -601,11 +601,20 @@ test('a hung IMAP session is closed at the deadline and does not block later syn
     syncAccountTimeoutMs: 50,
   });
 
+  const accepted = service.enqueueSyncAll({ force: true });
   const [result] = await service.syncAll({ force: true });
   assert.equal(result.status, 'failed');
   assert.equal(result.error, 'IMAP_SYNC_TIMEOUT');
   assert.equal(state.clients[0].closed, true);
   assert.ok(state.logs.some((entry) => entry.message === 'IMAP synchronization exceeded its deadline; connection closed'));
+  const started = state.logs.find((entry) => entry.fields?.event === 'sync_job_started');
+  const finished = state.logs.find((entry) => entry.fields?.event === 'sync_job_finished');
+  assert.equal(started?.fields.jobId, accepted.jobId);
+  assert.equal(finished?.fields.jobId, accepted.jobId);
+  assert.equal(finished?.fields.accounts, 1);
+  assert.equal(finished?.fields.ok, 0);
+  assert.equal(finished?.fields.failed, 1);
+  assert.equal(finished?.fields.timedOut, 1);
 
   // The next pass opens a fresh session instead of waiting on the dead one.
   const [again] = await service.syncAll({ force: true });
@@ -948,6 +957,20 @@ test('enqueueSyncAll returns before IMAP finishes and coalesces a second caller'
     assert.equal(state.connects, 1);
     assert.equal(service.runtimeStatus().inFlight, false);
     assert.equal(service.runtimeStatus().oldestStartedAt, null);
+    const started = state.logs.filter((entry) => entry.fields?.event === 'sync_job_started');
+    const finished = state.logs.filter((entry) => entry.fields?.event === 'sync_job_finished');
+    assert.equal(started.length, 1);
+    assert.equal(started[0].message, 'Sync job started');
+    assert.equal(started[0].fields.jobId, first.jobId);
+    assert.equal(finished.length, 1);
+    assert.equal(finished[0].message, 'Sync job finished');
+    assert.equal(finished[0].fields.jobId, first.jobId);
+    assert.equal(finished[0].fields.accounts, 1);
+    assert.equal(finished[0].fields.ok, 1);
+    assert.equal(finished[0].fields.failed, 0);
+    assert.equal(finished[0].fields.timedOut, 0);
+    assert.equal(typeof finished[0].fields.durationMs, 'number');
+    assert.ok(finished[0].fields.durationMs >= 0);
     assert.ok(state.logs.some((entry) => entry.message === 'IMAP full synchronization finished'));
     assert.ok(state.logs.some((entry) => entry.message === 'IMAP account synchronization finished'));
   } finally {
