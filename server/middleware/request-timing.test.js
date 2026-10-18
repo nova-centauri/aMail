@@ -8,6 +8,7 @@ import {
   requestStartFields,
   requestTiming,
   requestTimingFields,
+  sanitizeMessagesQuery,
   shouldLogRequestTiming,
 } from './request-timing.js';
 import { createInFlightRegistry } from '../services/in-flight-requests.js';
@@ -81,6 +82,67 @@ test('requestTiming emits one info line for a slow poller request', async () => 
   assert.equal(lines[1].fields.ip, '198.51.100.4');
   assert.equal(lines[1].fields.userAgent, 'vitest');
   assert.equal(Object.hasOwn(lines[1].fields, 'headers'), false);
+  assert.equal(Object.hasOwn(lines[1].fields, 'query'), false);
+});
+
+test('sanitizeMessagesQuery keeps folder/page/operators and drops search text', () => {
+  const sanitized = sanitizeMessagesQuery({
+    folder: 'inbox',
+    page: '3',
+    pageSize: '60',
+    category: 'github_ci',
+    q: 'from:ada@example.test invoice secret-deal',
+    flag: 'ada',
+    accountId: 'acct-1',
+    mailbox: 'INBOX',
+  });
+  assert.deepEqual(sanitized, {
+    folder: 'inbox',
+    page: 3,
+    pageSize: 60,
+    category: 'github_ci',
+    hasQuery: true,
+    queryChars: 'from:ada@example.test invoice secret-deal'.length,
+    operators: ['from', 'text'],
+    hasFlag: true,
+    hasAccountId: true,
+    mailbox: 'INBOX',
+  });
+  assert.equal(JSON.stringify(sanitized).includes('ada@example.test'), false);
+  assert.equal(JSON.stringify(sanitized).includes('secret-deal'), false);
+});
+
+test('GET /api/messages slower than 500ms logs sanitized query params', () => {
+  const lines = [];
+  const request = {
+    method: 'GET',
+    originalUrl: '/api/messages?folder=inbox&q=from%3Aada@example.test',
+    query: { folder: 'inbox', q: 'from:ada@example.test quarterly numbers' },
+    headers: { 'user-agent': 'vitest' },
+    log: { info(fields, message) { lines.push({ fields, message }); } },
+  };
+  const response = new EventEmitter();
+  response.statusCode = 200;
+  requestTiming({
+    slowMs: 50,
+    now: (() => {
+      let tick = 0n;
+      return () => {
+        tick += 600_000_000n;
+        return tick;
+      };
+    })(),
+  })(request, response, () => {});
+  response.emit('finish');
+  const slow = lines.find((line) => line.fields.event === 'slow_request');
+  assert.ok(slow);
+  assert.equal(slow.fields.path, '/api/messages');
+  assert.ok(slow.fields.durationMs >= 500);
+  assert.equal(slow.fields.query.folder, 'inbox');
+  assert.equal(slow.fields.query.hasQuery, true);
+  assert.deepEqual(slow.fields.query.operators, ['from', 'text']);
+  assert.equal(JSON.stringify(slow.fields).includes('ada@example.test'), false);
+  assert.equal(JSON.stringify(slow.fields).includes('quarterly'), false);
 });
 
 test('request start records MCP tool name and leaves an in-flight row until finish', () => {

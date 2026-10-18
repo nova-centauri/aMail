@@ -491,6 +491,7 @@ test('inbox listing installs the covering poller index', (t) => {
     .join('\n');
   assert.match(plan, /idx_messages_inbox_list/);
   assert.doesNotMatch(plan, /idx_messages_folder/);
+  assert.doesNotMatch(plan, /MATERIALIZE latest/);
 });
 
 test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {

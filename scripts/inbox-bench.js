@@ -3,19 +3,19 @@
  *
  *   npm run bench
  *
- * Prints before/after timings for the legacy conversation CTE vs the cheap
- * inbox path on a 20-account, 30k-message mailbox. Wall-clock numbers are
- * informational; CI uses structural cache/ETag/limit tests instead.
+ * Prints before/after timings for the windowed latest-per-thread COUNT path
+ * vs the bounded per-account inbox walk on a 20-account, 200k-message mailbox.
+ * Wall-clock numbers are informational; CI uses messages-list-bench.test.js.
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createDatabase, createRepositories } from '../server/db.js';
-import { buildConversationSearch } from '../server/services/conversation-search.js';
+import { buildConversationSearch, cheapWindowedListingSql } from '../server/services/conversation-search.js';
 import { conversationListEtag, listConversations, parsePageSize } from '../server/services/inbox.js';
 
 const ACCOUNT_COUNT = 20;
-const MESSAGES_PER_ACCOUNT = 1_500;
+const MESSAGES_PER_ACCOUNT = 10_000;
 
 function seedLargeMailbox(db, { accounts = ACCOUNT_COUNT, messagesPerAccount = MESSAGES_PER_ACCOUNT } = {}) {
   const insertAccount = db.prepare(`INSERT INTO accounts (
@@ -102,33 +102,35 @@ try {
     offset: 0,
     nowIso: '2026-09-18T00:00:00.000Z',
   });
-  const legacySql = buildConversationSearch({
-    accountIds,
-    folder: 'inbox',
-    hideQuiet: true,
-    forceLegacy: true,
-    limit: 50,
-    offset: 0,
-    nowIso: '2026-09-18T00:00:00.000Z',
-  });
+  const windowedSql = {
+    params: { ...cheapSql.params },
+    ...cheapWindowedListingSql({
+      accountSql: `m.account_id IN (${accountIds.map((_, index) => `@headAccount${index}`).join(', ')})`,
+      hideQuiet: true,
+      category: '',
+      folder: 'inbox',
+    }),
+  };
   const cheapPlan = db.prepare(`EXPLAIN QUERY PLAN ${cheapSql.pageSql}`).all(cheapSql.params);
   const planText = cheapPlan.map((row) => row.detail).join(' | ');
+  const windowedPlan = db.prepare(`EXPLAIN QUERY PLAN ${windowedSql.pageSql}`).all(windowedSql.params)
+    .map((row) => row.detail)
+    .join(' | ');
 
-  const runLegacySql = () => {
-    db.prepare(legacySql.pageSql).all(legacySql.params);
-    db.prepare(legacySql.countSql).get(legacySql.params);
-    db.prepare(legacySql.categorySql).all(legacySql.params);
+  const runWindowedSql = () => {
+    db.prepare(windowedSql.pageSql).all(windowedSql.params);
+    db.prepare(windowedSql.categorySql).all(windowedSql.params);
   };
   const runCheapSql = () => {
     db.prepare(cheapSql.pageSql).all(cheapSql.params);
-    db.prepare(cheapSql.countSql).get(cheapSql.params);
     db.prepare(cheapSql.categorySql).all(cheapSql.params);
   };
 
-  runLegacySql();
+  runWindowedSql();
   runCheapSql();
-  const before = timeMs(runLegacySql);
+  const before = timeMs(runWindowedSql);
   const after = timeMs(runCheapSql);
+  const folders = timeMs(() => repos.messages.folderCountsForAccounts(accountIds));
   const assembled = await timeMsAsync(() => listConversations(repos, { folder: 'inbox', pageSize: 50 }));
   const assembledAfter = await timeMsAsync(() => listConversations(repos, { folder: 'inbox', pageSize: 50 }));
   const cached = assembledAfter.result;
@@ -138,8 +140,9 @@ try {
   const report = {
     accounts: ACCOUNT_COUNT,
     messages: totalMessages,
-    beforeLegacySqlMs: Number(before.durationMs.toFixed(2)),
-    afterCheapSqlMs: Number(after.durationMs.toFixed(2)),
+    beforeWindowedSqlMs: Number(before.durationMs.toFixed(2)),
+    afterBoundedSqlMs: Number(after.durationMs.toFixed(2)),
+    folderCountsMs: Number(folders.durationMs.toFixed(2)),
     afterListConversationsMs: Number(assembled.durationMs.toFixed(2)),
     cachedListConversationsMs: Number(assembledAfter.durationMs.toFixed(2)),
     speedupSql: before.durationMs > 0 ? Number((before.durationMs / Math.max(after.durationMs, 0.01)).toFixed(1)) : null,
@@ -147,6 +150,7 @@ try {
     total: cached.total,
     etag,
     plan: planText,
+    beforePlan: windowedPlan,
   };
   console.log(JSON.stringify(report, null, 2));
 } finally {

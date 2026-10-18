@@ -445,7 +445,7 @@ test('page sizes clamp to a default and a maximum', () => {
 });
 
 function isInboxListingSql(sql) {
-  return /WITH\s+(latest|ranked|scoped)\b/i.test(sql)
+  return /WITH\s+(latest|ranked|scoped|heads)\b/i.test(sql)
     || /FROM threads WHERE id/i.test(sql)
     || /thread_id IN/i.test(sql)
     || /json_array_length/i.test(sql)
@@ -518,12 +518,13 @@ test('default inbox listing SQL materializes once and hydrates without bodies or
   assert.equal(page.pageSize, 60);
   assert.equal(page.messages[0].hasAttachments, true);
   assert.equal(Object.hasOwn(page.messages[0], 'htmlBody'), false);
-  const listing = executed.filter((sql) => /WITH\s+latest/i.test(sql));
+  const listing = executed.filter((sql) => /WITH\s+heads/i.test(sql));
   assert.ok(listing.length >= 1);
   for (const sql of listing) {
-    assert.match(sql, /MATERIALIZED/);
+    assert.doesNotMatch(sql, /MATERIALIZED/);
     assert.doesNotMatch(sql, /attachments_json/);
     assert.doesNotMatch(sql, /html_body/);
+    assert.match(sql, /LIMIT @probe/);
   }
   const hydrate = executed.filter((sql) => /json_array_length\(attachments_json\)/.test(sql));
   assert.equal(hydrate.length, 1);

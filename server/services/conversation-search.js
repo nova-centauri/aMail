@@ -86,7 +86,16 @@ export function cheapInboxPredicate(alias) {
     AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)`;
 }
 
-function cheapListingSql({ accountSql, hideQuiet, category, folder }) {
+export function listingProbe(limit, offset) {
+  const need = Math.max(1, (Number(limit) || 50) + (Number(offset) || 0));
+  return Math.min(20_000, need + Math.ceil(need * 0.25) + 16);
+}
+
+/**
+ * Previous cheap inbox path: window every inbox row, materialize latest-per-thread,
+ * then COUNT(*) that set. Kept so the bench can show the production stall.
+ */
+export function cheapWindowedListingSql({ accountSql, hideQuiet, category, folder }) {
   const rankedWhere = folder === 'inbox' ? cheapInboxPredicate('m') : folderPredicate('m');
   const headedWhere = [
     hideQuiet ? "latest_category <> 'ops_quiet'" : '',
@@ -113,6 +122,7 @@ function cheapListingSql({ accountSql, hideQuiet, category, folder }) {
     )`;
   return {
     cheap: true,
+    deriveTotalFromCategories: false,
     pageSql: `${cte}
       SELECT thread_id AS threadId,
         (SELECT COUNT(*) FROM latest ${headedWhereSql}) AS total
@@ -129,6 +139,84 @@ function cheapListingSql({ accountSql, hideQuiet, category, folder }) {
       WHERE latest_category IS NOT NULL AND latest_category <> 'ops_quiet'
       GROUP BY latest_category`,
   };
+}
+
+/**
+ * Default inbox poller: walk the covering index newest-first per account and
+ * stop after a small probe. A 20-account IN() cannot use that order, so each
+ * account is a bounded LIMIT and the union is merged in SQL.
+ */
+function cheapInboxListingSql({ ids, hideQuiet, category, params }) {
+  const probe = listingProbe(params.limit, params.offset);
+  params.probe = probe;
+  const arms = ids.map((id, index) => {
+    params[`headAccount${index}`] = id;
+    return `SELECT thread_id, latest_at, latest_category FROM (
+        SELECT
+          m.thread_id AS thread_id,
+          COALESCE(m.sent_at, m.received_at, m.created_at) AS latest_at,
+          m.smart_category AS latest_category
+        FROM messages m INDEXED BY idx_messages_inbox_list
+        WHERE m.account_id = @headAccount${index}
+          AND ${cheapInboxPredicate('m')}
+        ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.thread_id DESC, m.id DESC
+        LIMIT @probe
+      )`;
+  }).join('\n      UNION ALL\n      ');
+  const headedWhere = [
+    hideQuiet ? "latest_category <> 'ops_quiet'" : '',
+    category ? 'latest_category = @category' : '',
+  ].filter(Boolean);
+  const headedAndSql = headedWhere.length ? `AND ${headedWhere.join('\n      AND ')}` : '';
+  const accountIn = ids.map((_, index) => `@headAccount${index}`).join(', ');
+  const latestCte = `WITH latest AS (
+      SELECT thread_id, latest_category FROM (
+        SELECT
+          m.thread_id AS thread_id,
+          m.smart_category AS latest_category,
+          ROW_NUMBER() OVER (
+            PARTITION BY m.account_id, m.thread_id
+            ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.id DESC
+          ) AS rk
+        FROM messages m INDEXED BY idx_messages_inbox_list
+        WHERE m.account_id IN (${accountIn})
+          AND ${cheapInboxPredicate('m')}
+      ) ranked
+      WHERE rk = 1
+    )`;
+  return {
+    cheap: true,
+    deriveTotalFromCategories: true,
+    pageSql: `WITH heads AS (
+      SELECT thread_id, latest_at, latest_category,
+        ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY latest_at DESC) AS rk
+      FROM (
+      ${arms}
+      )
+    )
+      SELECT thread_id AS threadId
+      FROM heads
+      WHERE rk = 1
+      ${headedAndSql}
+      ORDER BY latest_at DESC, thread_id DESC
+      LIMIT @limit OFFSET @offset`,
+    countSql: `${latestCte}
+      SELECT COUNT(*) AS total FROM latest
+      WHERE 1 = 1
+      ${headedAndSql}`,
+    categorySql: `${latestCte}
+      SELECT latest_category AS category, COUNT(*) AS count
+      FROM latest
+      WHERE latest_category IS NOT NULL AND latest_category <> 'ops_quiet'
+      GROUP BY latest_category`,
+  };
+}
+
+function cheapListingSql({ accountSql, hideQuiet, category, folder, ids, params, forceWindowed }) {
+  if (folder === 'inbox' && !forceWindowed) {
+    return cheapInboxListingSql({ ids, hideQuiet, category, params });
+  }
+  return cheapWindowedListingSql({ accountSql, hideQuiet, category, folder });
 }
 
 /**
@@ -150,6 +238,7 @@ export function buildConversationSearch(input = {}) {
     limit = 50,
     offset = 0,
     nowIso,
+    forceWindowed = false,
   } = input;
   const params = {
     folder,
@@ -269,7 +358,15 @@ export function buildConversationSearch(input = {}) {
     return {
       params,
       empty: false,
-      ...cheapListingSql({ accountSql, hideQuiet, category, folder }),
+      ...cheapListingSql({
+        accountSql,
+        hideQuiet,
+        category,
+        folder,
+        ids,
+        params,
+        forceWindowed,
+      }),
     };
   }
 
