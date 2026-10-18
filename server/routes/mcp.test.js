@@ -314,6 +314,7 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     'send_message',
     'message_action',
     'sync_mail',
+    'get_sync_job',
     'test_account',
     'add_account',
     'update_account',
@@ -601,4 +602,47 @@ test('get_attachment authenticates and returns bounded exact bytes for one verif
   assert.deepEqual(mutations, []);
   assert.equal(message.isRead, false);
   assert.equal(message.isAnalyzed, false);
+});
+
+test('MCP sync_mail returns queued before any IMAP work', async (t) => {
+  let imapStarted = false;
+  const jobs = new Map();
+  const mailService = {
+    enqueueSyncAll() {
+      const job = { jobId: 'sync_1_test', status: 'running', kind: 'all' };
+      jobs.set(job.jobId, job);
+      return { accepted: true, state: 'started', status: 'queued', jobId: job.jobId, job, sync: { inFlight: true } };
+    },
+    async syncAll() { imapStarted = true; return []; },
+    async syncAccount() { imapStarted = true; return {}; },
+    getSyncJob(id) { return jobs.get(id) || null; },
+    latestSyncJob() { return [...jobs.values()].at(-1) || null; },
+  };
+  const app = express();
+  app.use(express.json());
+  registerMcp(app, { config: { accessToken: 'token', syncBatchSize: 50 }, repos: { accounts: { list: () => [] } }, mailService });
+  app.use(errorHandler({ error() {} }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const call = await mcpRpc(origin, {
+    token: 'token',
+    method: 'tools/call',
+    params: { name: 'sync_mail', arguments: {} },
+  });
+  assert.equal(call.response.status, 200);
+  const payload = JSON.parse(call.body.result.content[0].text);
+  assert.equal(payload.status, 'queued');
+  assert.equal(payload.jobId, 'sync_1_test');
+  assert.equal(imapStarted, false);
+  const poll = await mcpRpc(origin, {
+    token: 'token',
+    method: 'tools/call',
+    params: { name: 'get_sync_job', arguments: { jobId: payload.jobId } },
+    id: 2,
+  });
+  assert.equal(JSON.parse(poll.body.result.content[0].text).job.jobId, 'sync_1_test');
 });

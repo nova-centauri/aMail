@@ -7,6 +7,21 @@ import { AppError, NotFoundError, ValidationError } from '../errors.js';
 import { createSignedToken, readSignedToken } from './crypto.js';
 
 const MAX_REDIRECTS = 3;
+const PROXY_FAILURE_THRESHOLD = 3;
+const PROXY_COOLDOWN_MS = 60_000;
+
+export function nextProxyCooldown({
+  failures = 0,
+  now = Date.now(),
+  threshold = PROXY_FAILURE_THRESHOLD,
+  cooldownMs = PROXY_COOLDOWN_MS,
+} = {}) {
+  const nextFailures = failures + 1;
+  return {
+    failures: nextFailures,
+    coolingUntil: nextFailures >= threshold ? now + cooldownMs : 0,
+  };
+}
 const IMAGE_TYPES = new Set([
   'image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp',
 ]);
@@ -224,6 +239,8 @@ async function getViaProxy(url, config, proxyAgent) {
 }
 
 export function createRemoteContentService({ config, repos, logger }) {
+  let proxyFailures = 0;
+  let proxyCoolingUntil = 0;
   let proxyAgent = null;
   if (config.remoteContentProxyUrl) {
     let proxy;
@@ -269,13 +286,34 @@ export function createRemoteContentService({ config, repos, logger }) {
         503,
       );
     }
+    if (proxyAgent && Date.now() < proxyCoolingUntil) {
+      throw remoteError(
+        'The privacy proxy is temporarily unavailable. Mail still works; remote images are skipped.',
+        'REMOTE_CONTENT_PROXY_UNAVAILABLE',
+        503,
+      );
+    }
 
     let current = payload.u;
     for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
       const { url, addresses } = await validateUrl(current, { resolveDns: !proxyAgent });
-      const result = proxyAgent
-        ? await getViaProxy(url, config, proxyAgent)
-        : await getDirect(url, addresses, config);
+      let result;
+      try {
+        result = proxyAgent
+          ? await getViaProxy(url, config, proxyAgent)
+          : await getDirect(url, addresses, config);
+      } catch (error) {
+        if (proxyAgent) {
+          const cooled = nextProxyCooldown({ failures: proxyFailures, now: Date.now() });
+          proxyFailures = cooled.failures;
+          proxyCoolingUntil = cooled.coolingUntil;
+        }
+        throw error;
+      }
+      if (proxyAgent) {
+        proxyFailures = 0;
+        proxyCoolingUntil = 0;
+      }
       if (!result.redirect) return result;
       if (redirects === MAX_REDIRECTS) throw remoteError('Remote image redirected too many times.', 'REMOTE_CONTENT_TOO_MANY_REDIRECTS');
       try {

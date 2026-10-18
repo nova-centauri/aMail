@@ -1,4 +1,5 @@
 import { requestPath } from '../logging.js';
+import { globalInFlight, mcpCallMeta } from '../services/in-flight-requests.js';
 
 export const SLOW_REQUEST_MS = 250;
 export const POLLER_SAMPLE_RATE = 0.2;
@@ -42,18 +43,70 @@ export function requestTimingFields(request, response, durationMs) {
  * sample of the inbox poller routes so a live 3s loop can be identified
  * without logging query strings or credentials.
  */
-export function requestTiming({ slowMs = SLOW_REQUEST_MS, sampleRate = POLLER_SAMPLE_RATE, random = Math.random, now = () => process.hrtime.bigint() } = {}) {
+export function requestStartFields(request) {
+  const path = requestPath(request?.originalUrl || request?.url);
+  const mcp = path === '/mcp' ? mcpCallMeta(request?.body) : { mcpMethod: null, mcpTool: null };
+  return {
+    reqId: request?.id || request?.log?.bindings?.()?.reqId || null,
+    method: request?.method || null,
+    path,
+    mcpTool: mcp.mcpTool,
+    mcpMethod: mcp.mcpMethod,
+  };
+}
+
+function flushLogger(logger) {
+  try {
+    logger?.flush?.();
+  } catch {
+    // Best-effort: a hang after this line must still have a start record.
+  }
+}
+
+/**
+ * Log user-agent, client IP, route, and duration for slow requests and a
+ * sample of the inbox poller routes so a live 3s loop can be identified
+ * without logging query strings or credentials.
+ *
+ * Request-start lines (except /api/health) are flushed before the handler so a
+ * hung SQLite/IMAP call still leaves method/path/tool/id in the log.
+ */
+export function requestTiming({
+  slowMs = SLOW_REQUEST_MS,
+  sampleRate = POLLER_SAMPLE_RATE,
+  random = Math.random,
+  now = () => process.hrtime.bigint(),
+  inFlight = globalInFlight,
+} = {}) {
   return (request, response, next) => {
     const started = now();
-    response.on('finish', () => {
+    const startFields = requestStartFields(request);
+    const path = startFields.path;
+    const logger = request.log || request.app?.get?.('logger');
+    const tracked = inFlight?.begin?.({
+      reqId: startFields.reqId,
+      method: startFields.method,
+      path,
+      mcpTool: startFields.mcpTool,
+      mcpMethod: startFields.mcpMethod,
+    });
+    if (path !== '/api/health') {
+      logger?.info?.({ event: 'request_start', ...startFields }, 'Request started');
+      flushLogger(logger);
+    }
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      inFlight?.end?.(tracked?.reqId || startFields.reqId);
       const durationMs = Number(now() - started) / 1e6;
-      const path = requestPath(request.originalUrl || request.url);
       const decision = shouldLogRequestTiming(path, durationMs, { slowMs, sampleRate, random });
       if (!decision.log) return;
-      const fields = { event: decision.event, ...requestTimingFields(request, response, durationMs) };
-      const logger = request.log || request.app?.get?.('logger');
+      const fields = { event: decision.event, reqId: startFields.reqId, mcpTool: startFields.mcpTool, ...requestTimingFields(request, response, durationMs) };
       logger?.info?.(fields, decision.event === 'slow_request' ? 'Slow request' : 'Poller sample');
-    });
+    };
+    response.once('finish', done);
+    response.once('close', done);
     next();
   };
 }

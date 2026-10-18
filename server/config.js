@@ -114,6 +114,11 @@ export function loadConfig(env = process.env) {
     // defaults so an existing .env is unchanged.
     syncBatchSize: integer(readEnv(env, 'SYNC_BATCH_SIZE'), keyslotMode ? 100 : 200, { min: 1, max: 1000 }),
     syncTimeoutMs: integer(readEnv(env, 'SYNC_TIMEOUT_MS'), 60_000, { min: 5_000, max: 300_000 }),
+    imapConnectTimeoutMs: integer(readEnv(env, 'IMAP_CONNECT_TIMEOUT_MS'), 20_000, { min: 3_000, max: 120_000 }),
+    syncMailboxTimeoutMs: integer(readEnv(env, 'SYNC_MAILBOX_TIMEOUT_MS'), 45_000, { min: 0, max: 10 * 60_000 }),
+    syncMaxMessagesPerAccount: integer(readEnv(env, 'SYNC_MAX_MESSAGES_PER_ACCOUNT'), 500, { min: 1, max: 10_000 }),
+    eventLoopLagMs: integer(readEnv(env, 'EVENT_LOOP_LAG_MS'), 1_500, { min: 50, max: 30_000 }),
+    eventLoopStallLogMs: integer(readEnv(env, 'EVENT_LOOP_STALL_LOG_MS'), 3_000, { min: 200, max: 60_000 }),
     // The raw RFC822 source includes attachments. Keep each parse bounded so a
     // single unexpectedly large message cannot consume unrestricted memory.
     syncMaxMessageBytes: integer(readEnv(env, 'SYNC_MAX_MESSAGE_BYTES'), keyslotMode ? 5 * mib : 10 * mib, {
@@ -131,7 +136,7 @@ export function loadConfig(env = process.env) {
     syncConcurrency: integer(readEnv(env, 'SYNC_CONCURRENCY'), keyslotMode ? 1 : 3, { min: 1, max: 16 }),
     // Hard stop for one account's pass; its socket is closed so a server that
     // stops answering cannot stall every later sync. 0 disables.
-    syncAccountTimeoutMs: integer(readEnv(env, 'SYNC_ACCOUNT_TIMEOUT_MS'), 10 * 60_000, { min: 0, max: 60 * 60_000 }),
+    syncAccountTimeoutMs: integer(readEnv(env, 'SYNC_ACCOUNT_TIMEOUT_MS'), 120_000, { min: 0, max: 60 * 60_000 }),
     // Keep one IMAP TCP session per account this long after the last use so
     // the next pass skips the TLS handshake. 0 logs out immediately (tests).
     imapPoolIdleMs: integer(readEnv(env, 'IMAP_POOL_IDLE_MS'), 8 * 60_000, { min: 0, max: 30 * 60_000 }),

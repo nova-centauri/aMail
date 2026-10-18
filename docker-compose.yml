@@ -60,6 +60,10 @@ services:
     depends_on:
       typesense:
         condition: service_started
+    labels:
+      # Used only with `--profile autoheal`. Default false: the sidecar needs
+      # the Docker socket (root-equivalent on the host).
+      autoheal: ${AMAIL_AUTOHEAL:-false}
     healthcheck:
       test:
         - CMD
@@ -106,6 +110,9 @@ services:
 
   # This has no host port. Start it only with --profile privacy and set
   # REMOTE_CONTENT_PROXY_URL=http://tor-proxy:8118 for that same command.
+  # IMAP/SMTP never use it. aMail does not depends_on this service; if Tor
+  # cannot bootstrap (stuck at loading_descriptors), mail still works and
+  # remote images fail closed without blocking the event loop.
   tor-proxy:
     profiles:
       - privacy
@@ -138,13 +145,34 @@ services:
         - CMD-SHELL
         - >-
           nc -z -w 3 127.0.0.1 8118 &&
-          printf 'AUTHENTICATE\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n' |
+          printf 'AUTHENTICATE ""\r\nGETINFO status/bootstrap-phase\r\nQUIT\r\n' |
           nc -w 3 127.0.0.1 9051 |
           grep -q 'PROGRESS=100'
       interval: 15s
       timeout: 5s
       start_period: 45s
       retries: 12
+
+  # Opt-in. Restarts containers whose Docker HEALTHCHECK is unhealthy.
+  # Requires /var/run/docker.sock, which is root-equivalent on the host:
+  # anyone who can talk to that socket can start, stop, or exec any container.
+  # Enable with:
+  #   AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d
+  # aMail IMAP/SMTP do not need this. Use it only if you accept the socket
+  # trade-off instead of an external watch.
+  autoheal:
+    profiles:
+      - autoheal
+    image: willfarrell/autoheal:1.2.0
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 10
+      AUTOHEAL_START_PERIOD: 60
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - app-net
 
 volumes:
   # Upgrading from GigaMail? Point this at your existing volume instead:

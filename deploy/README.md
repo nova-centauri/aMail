@@ -66,7 +66,10 @@ remainder a few seconds later. Gmail Drafts, Trash, and Spam with a UID gap
 larger than one page take only the newest window instead of scanning the
 hole. Up to `AMAIL_SYNC_CONCURRENCY` accounts (3) synchronize at once, and an
 account whose server stops answering is cut off after
-`AMAIL_SYNC_ACCOUNT_TIMEOUT_MS` (10 minutes) so it cannot stall the rest.
+`AMAIL_SYNC_ACCOUNT_TIMEOUT_MS` (2 minutes) so it cannot stall the rest.
+IMAP connect is bounded by `AMAIL_IMAP_CONNECT_TIMEOUT_MS` (20 s), each
+mailbox FETCH by `AMAIL_SYNC_MAILBOX_TIMEOUT_MS` (45 s), and one pass
+imports at most `AMAIL_SYNC_MAX_MESSAGES_PER_ACCOUNT` (500) messages.
 
 ## Upgrading from GigaMail
 
@@ -145,8 +148,17 @@ This starts `tor-proxy` and passes
 `REMOTE_CONTENT_PROXY_URL=http://tor-proxy:8118` only to that launch. Neither
 its SOCKS nor HTTP proxy port is published to the Docker host. aMail can reach
 Privoxy over an internal network; Tor alone has a separate egress network,
-selected explicitly as Tor's default gateway. If the proxy is unavailable,
-remote-content requests fail closed rather than silently going direct.
+selected explicitly as Tor's default gateway. IMAP and SMTP never use
+`tor-proxy`. If the proxy is unavailable or stuck at a partial bootstrap
+(for example `Bootstrapped 50% (loading_descriptors)`), mail still works;
+remote-content requests fail closed rather than going direct, and after a few
+timeouts aMail cools down the proxy so image fetches return 503 immediately
+instead of waiting on a dead circuit.
+
+The compose healthcheck requires Tor `PROGRESS=100`. That is a real readiness
+signal, not a false negative: `CookieAuthentication 0` still needs
+`AUTHENTICATE ""` on the control port. An unhealthy relay does not take aMail
+down (`amail` does not `depends_on` it).
 
 Tor is a privacy aid, not a complete anonymity system. It does not anonymize
 IMAP/SMTP traffic, and remote images can still reveal message-specific data
@@ -376,7 +388,17 @@ run on a worker thread so `/api/health` can still answer. A focused tab
 reloads from the local cache about every 20 seconds. The server coalesces
 concurrent syncs, enforces a 60-second minimum interval
 (`AMAIL_SYNC_MIN_INTERVAL_MS`), and returns a pass that finished inside that
-window. Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
+window. `POST /api/sync`, MCP `sync_mail`, and the background scheduler enqueue a
+job and return immediately (`queued` / `already_running` plus `jobId`).
+Poll `get_sync_job` or `GET /api/sync/jobs/:jobId`. `/api/health` reports
+unhealthy (HTTP 503) when event-loop lag stays above
+`AMAIL_EVENT_LOOP_LAG_MS` or a single-flight sync is older than
+`AMAIL_SYNC_ACCOUNT_TIMEOUT_MS`. Docker already HEALTHCHECKs that endpoint.
+Restart-on-unhealthy is opt-in: `AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d`
+mounts `/var/run/docker.sock` into a sidecar (root-equivalent on the host).
+Leave that profile off unless you accept that trade-off.
+
+Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
 `POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES` is the
 folder walk, not the inbox wait (15 minutes in keyslot mode, 5 in the
 supplied `.env.example`). Set `AMAIL_DEBUG_TIMING=1` for per-phase logs, or
