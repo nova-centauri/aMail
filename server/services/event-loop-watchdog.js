@@ -34,8 +34,26 @@ export function watchdogSnapshot({
   };
 }
 
+/** Mutable histogram for tests: one stall, then reset() clears the window. */
+export function createTestHistogram({ meanMs = 0, maxMs = 0, p99Ms = 0 } = {}) {
+  const toNs = (ms) => Number(ms) * 1e6;
+  const state = { meanMs, maxMs, p99Ms };
+  return {
+    get mean() { return toNs(state.meanMs); },
+    get max() { return toNs(state.maxMs); },
+    percentile() { return toNs(state.p99Ms); },
+    reset() {
+      state.meanMs = 0;
+      state.maxMs = 0;
+      state.p99Ms = 0;
+    },
+  };
+}
+
 /**
  * Event-loop lag for /api/health. Does not query SQLite or take IMAP locks.
+ * Each sample is the delay since the last sample; the histogram is reset so a
+ * past stall cannot keep health at 503 or spam stall warnings.
  * Tests inject a histogram so they never wait on a real delay.
  */
 export function createEventLoopWatchdog({
@@ -46,41 +64,37 @@ export function createEventLoopWatchdog({
   enable = false,
   logger = null,
   inFlight = () => globalInFlight.list(),
-  now = () => Date.now(),
   scheduleInterval = null,
 } = {}) {
   const owned = !histogram;
   const h = histogram || monitorEventLoopDelay({ resolution: 20 });
   if (owned && enable && typeof h.enable === 'function') h.enable();
-  let lastStallLogAt = 0;
   let cancelInterval = () => {};
 
-  function snapshot({ oldestAgeMs = null } = {}) {
-    return watchdogSnapshot({
+  function sample({ oldestAgeMs = null } = {}) {
+    const snap = watchdogSnapshot({
       histogram: h,
       oldestAgeMs,
       stuckSyncMs,
       lagThresholdMs,
     });
+    if (typeof h.reset === 'function') h.reset();
+    return snap;
   }
 
   function check({ oldestAgeMs = null } = {}) {
-    const snap = snapshot({ oldestAgeMs });
+    const snap = sample({ oldestAgeMs });
     const stallMs = Number(stallLogMs) || DEFAULT_STALL_LOG_MS;
     const stalled = snap.eventLoopLagMaxMs >= stallMs
       || snap.eventLoopLagP99Ms >= stallMs
       || snap.stuckSync;
     if (stalled && logger?.warn) {
-      const at = now();
-      if (at - lastStallLogAt >= stallMs) {
-        lastStallLogAt = at;
-        const inflight = typeof inFlight === 'function' ? inFlight() : inFlight;
-        logger.warn({
-          event: 'event_loop_stall',
-          ...snap,
-          inFlight: inflight,
-        }, 'Event loop stall');
-      }
+      const inflight = typeof inFlight === 'function' ? inFlight() : inFlight;
+      logger.warn({
+        event: 'event_loop_stall',
+        ...snap,
+        inFlight: inflight,
+      }, 'Event loop stall');
     }
     return snap;
   }
@@ -97,7 +111,7 @@ export function createEventLoopWatchdog({
   }
 
   return {
-    snapshot,
+    snapshot: sample,
     check,
     disable() {
       cancelInterval();
