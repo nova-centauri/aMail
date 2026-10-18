@@ -5,10 +5,12 @@ import {
   clientIp,
   clientUserAgent,
   isPollerPath,
+  requestStartFields,
   requestTiming,
   requestTimingFields,
   shouldLogRequestTiming,
 } from './request-timing.js';
+import { createInFlightRegistry } from '../services/in-flight-requests.js';
 
 test('poller paths are identified without treating every API route as a poller', () => {
   assert.equal(isPollerPath('/api/messages'), true);
@@ -69,11 +71,45 @@ test('requestTiming emits one info line for a slow poller request', async () => 
     })(),
   })(request, response, () => {});
   response.emit('finish');
-  assert.equal(lines.length, 1);
-  assert.equal(lines[0].message, 'Slow request');
-  assert.equal(lines[0].fields.event, 'slow_request');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].message, 'Request started');
+  assert.equal(lines[0].fields.event, 'request_start');
   assert.equal(lines[0].fields.path, '/api/messages');
-  assert.equal(lines[0].fields.ip, '198.51.100.4');
-  assert.equal(lines[0].fields.userAgent, 'vitest');
-  assert.equal(Object.hasOwn(lines[0].fields, 'headers'), false);
+  assert.equal(lines[1].message, 'Slow request');
+  assert.equal(lines[1].fields.event, 'slow_request');
+  assert.equal(lines[1].fields.path, '/api/messages');
+  assert.equal(lines[1].fields.ip, '198.51.100.4');
+  assert.equal(lines[1].fields.userAgent, 'vitest');
+  assert.equal(Object.hasOwn(lines[1].fields, 'headers'), false);
+});
+
+test('request start records MCP tool name and leaves an in-flight row until finish', () => {
+  const lines = [];
+  const inFlight = createInFlightRegistry();
+  const request = {
+    id: 'req_mcp_1',
+    method: 'POST',
+    originalUrl: '/mcp',
+    body: { method: 'tools/call', params: { name: 'get_thread', arguments: { id: 't1' } } },
+    headers: {},
+    log: { info(fields, message) { lines.push({ fields, message }); } },
+  };
+  const response = new EventEmitter();
+  response.statusCode = 200;
+  requestTiming({ inFlight, now: () => 0n })(request, response, () => {});
+  assert.equal(lines[0].fields.mcpTool, 'get_thread');
+  assert.equal(inFlight.list()[0].mcpTool, 'get_thread');
+  response.emit('finish');
+  assert.equal(inFlight.size(), 0);
+});
+
+test('requestStartFields never copies MCP arguments', () => {
+  const fields = requestStartFields({
+    id: 'r1',
+    method: 'POST',
+    originalUrl: '/mcp',
+    body: { method: 'tools/call', params: { name: 'list_messages', arguments: { q: 'from:ada' } } },
+  });
+  assert.equal(fields.mcpTool, 'list_messages');
+  assert.equal(JSON.stringify(fields).includes('from:ada'), false);
 });

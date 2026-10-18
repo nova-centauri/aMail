@@ -3,7 +3,7 @@ FROM alpine:3.24
 ARG PROXY_UID=10002
 ARG PROXY_GID=10002
 
-RUN apk add --no-cache privoxy tor \
+RUN apk add --no-cache privoxy tor netcat-openbsd \
     && addgroup -g "${PROXY_GID}" -S torproxy \
     && adduser -u "${PROXY_UID}" -S -D -H -h /var/lib/tor -s /sbin/nologin -G torproxy torproxy \
     && mkdir -p /var/lib/tor \

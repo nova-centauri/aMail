@@ -196,6 +196,7 @@ function syncHarness({
   maxMessageBytes = 512, messages, sources, previousSync = null, uidValidity = 41, rejectUpsert = () => false, connectDelayMs = 0,
   imapPoolIdleMs, syncMinIntervalMs, connectFailure = false, fetchHangs = false, syncPassBudgetMs, syncAccountTimeoutMs,
   threadsBySubject = new Map(), folders = null, messagesByMailbox = null,
+  extraAccounts = [], hangHosts = null, scheduleTimeout, syncMailboxTimeoutMs, syncMaxMessagesPerAccount,
 }) {
   const account = {
     id: 'sync-account',
@@ -229,8 +230,10 @@ function syncHarness({
   state.messages = messages;
   state.sources = sources;
   class FakeImapClient extends EventEmitter {
-    constructor() {
+    constructor(options = {}) {
       super();
+      this.options = options;
+      this.host = options.host;
       state.clients.push(this);
     }
     async connect() {
@@ -281,15 +284,26 @@ function syncHarness({
         ? (messagesByMailbox[this.lockedMailbox] || [])
         : state.messages;
       const matches = pool.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
-      if (fetchHangs) {
+      const shouldHang = hangHosts ? hangHosts.has(this.host) : fetchHangs;
+      if (shouldHang) {
         this.fetching = true;
+        state.hanging = (state.hanging || 0) + 1;
+        if (this.closed) {
+          this.fetching = false;
+          throw new Error('Connection closed');
+        }
         // A real stuck socket is a live handle; without one the event loop
         // would drain before the (unref'd) deadline could fire.
         const socket = setInterval(() => {}, 1_000);
-        await new Promise((_, reject) => this.once('close', () => {
-          clearInterval(socket);
-          reject(new Error('Connection closed'));
-        }));
+        try {
+          await new Promise((_, reject) => this.once('close', () => {
+            clearInterval(socket);
+            reject(new Error('Connection closed'));
+          }));
+        } finally {
+          this.fetching = false;
+          state.hanging = Math.max(0, (state.hanging || 1) - 1);
+        }
       }
       this.fetching = true;
       try {
@@ -323,8 +337,8 @@ function syncHarness({
   }
   const repos = {
     accounts: {
-      getRaw: (id) => id === account.id ? account : null,
-      list: () => [{ id: account.id, syncEnabled: true }],
+      getRaw: (id) => [account, ...extraAccounts].find((item) => item.id === id) || null,
+      list: () => [account, ...extraAccounts].map((item) => ({ id: item.id, syncEnabled: true })),
       markSynced() {},
     },
     sync: {
@@ -364,10 +378,13 @@ function syncHarness({
       syncMinIntervalMs: syncMinIntervalMs ?? 0,
       syncPassBudgetMs: syncPassBudgetMs ?? 60_000,
       syncAccountTimeoutMs: syncAccountTimeoutMs ?? 60_000,
+      syncMailboxTimeoutMs: syncMailboxTimeoutMs ?? 0,
+      syncMaxMessagesPerAccount: syncMaxMessagesPerAccount ?? 10_000,
     },
     repos,
     logger,
     ImapClient: FakeImapClient,
+    ...(scheduleTimeout ? { scheduleTimeout } : {}),
   });
   return { service, state };
 }
@@ -917,11 +934,15 @@ test('enqueueSyncAll returns before IMAP finishes and coalesces a second caller'
     const first = service.enqueueSyncAll({ force: true });
     assert.equal(first.accepted, true);
     assert.equal(first.state, 'started');
+    assert.equal(typeof first.jobId, 'string');
+    assert.equal(first.status, 'queued');
     assert.equal(first.sync.inFlight, true);
     assert.equal(typeof first.sync.oldestStartedAt, 'string');
     assert.equal(typeof first.sync.oldestAgeMs, 'number');
     const second = service.enqueueSyncAll({ force: true });
     assert.equal(second.state, 'in-flight');
+    assert.equal(second.status, 'already_running');
+    assert.equal(second.jobId, first.jobId);
     const joined = await service.syncAll({ force: true });
     assert.equal(joined[0].accountId, 'sync-account');
     assert.equal(state.connects, 1);
@@ -929,6 +950,82 @@ test('enqueueSyncAll returns before IMAP finishes and coalesces a second caller'
     assert.equal(service.runtimeStatus().oldestStartedAt, null);
     assert.ok(state.logs.some((entry) => entry.message === 'IMAP full synchronization finished'));
     assert.ok(state.logs.some((entry) => entry.message === 'IMAP account synchronization finished'));
+  } finally {
+    await service.close();
+  }
+});
+
+test('a hung account times out without blocking the other account', async () => {
+  const hangAccount = {
+    id: 'hang-account',
+    email: 'hang@example.test',
+    display_name: 'Hang',
+    provider: 'custom',
+    imap_host: 'hang.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    smtp_host: 'hang.example.test',
+    smtp_port: 465,
+    smtp_secure: 1,
+    signature: '',
+    sync_enabled: 1,
+    credential_ciphertext: encryptJson({ username: 'hang@example.test', password: 'test-password' }, config.credentialKey),
+  };
+  const pending = [];
+  const { service, state } = syncHarness({
+    ...mailboxOf([1]),
+    extraAccounts: [hangAccount],
+    hangHosts: new Set(['hang.example.test']),
+    syncMailboxTimeoutMs: 45_000,
+    scheduleTimeout(ms, fn) {
+      if (ms === 45_000) {
+        pending.push(fn);
+        return () => {
+          const index = pending.indexOf(fn);
+          if (index >= 0) pending.splice(index, 1);
+        };
+      }
+      const timer = setTimeout(fn, ms);
+      timer.unref?.();
+      return () => clearTimeout(timer);
+    },
+  });
+  try {
+    const running = service.syncAll({ force: true });
+    await new Promise((resolve, reject) => {
+      const tick = () => {
+        // The healthy account cancels its mailbox deadline when it finishes,
+        // leaving only the hung account's timeout in `pending`.
+        if ((state.hanging || 0) > 0 && pending.length === 1) resolve();
+        else setImmediate(tick);
+      };
+      tick();
+      running.catch(reject);
+    });
+    for (const fire of [...pending]) fire();
+    const results = await running;
+    const hung = results.find((item) => item.accountId === 'hang-account');
+    const ok = results.find((item) => item.accountId === 'sync-account');
+    assert.equal(hung.status, 'failed');
+    assert.ok(['IMAP_MAILBOX_TIMEOUT', 'IMAP_SYNC_TIMEOUT', 'IMAP_SYNC_FAILED'].includes(hung.error));
+    assert.notEqual(ok.status, 'failed');
+    assert.equal(ok.accountId, 'sync-account');
+  } finally {
+    await service.close();
+  }
+});
+
+test('an account pass stops at the per-account message cap', async () => {
+  const { service, state } = syncHarness({
+    ...mailboxOf([1, 2, 3, 4, 5]),
+    maxMessageBytes: 4096,
+    syncMaxMessagesPerAccount: 2,
+  });
+  try {
+    const result = await service.syncAccount('sync-account', { force: true, limit: 100 });
+    assert.ok(result.imported <= 2);
+    assert.ok((result.remaining || 0) > 0 || result.mailboxes.some((item) => item.capped));
+    assert.ok(state.savedMessages.length <= 2);
   } finally {
     await service.close();
   }

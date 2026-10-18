@@ -1314,7 +1314,7 @@ export function createRepositories(db) {
           analyzedBy: row.analyzed_by || null } : null;
       })),
       getRaw: (id) => queries.messageById.get(id) || null,
-      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null } = {}) => {
+      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null, includeTotal = true } = {}) => {
         if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
           throw new RangeError('Review queue limit must be an integer from 1 to 200.');
         }
@@ -1324,7 +1324,9 @@ export function createRepositories(db) {
         const page = scoped
           ? (afterTimestamp === null ? queries.unanalyzedAccountMessages : queries.unanalyzedAccountMessagesAfter)
           : (afterTimestamp === null ? queries.unanalyzedMessages : queries.unanalyzedMessagesAfter);
-        const total = count.get({ accountId }).count;
+        // COUNT(*) over every unanalyzed row is a SQLCipher scan. Cursor
+        // pages skip it; hasMore still comes from the limit+1 fetch.
+        const total = includeTotal ? count.get({ accountId }).count : null;
         const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
         const items = rows.slice(0, limit).map(publicReviewMessage);
         return { items, total, hasMore: rows.length > limit };

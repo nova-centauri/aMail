@@ -80,10 +80,15 @@ test('density controls default to a 60s sync floor, an 8-minute IMAP pool, and n
   assert.equal(loadConfig({ AMAIL_RETAIN_DAYS: '30' }).retainDays, 30);
 });
 
-test('sync throughput controls default to a 60s page budget, 3 accounts at once, and a 10-minute deadline', () => {
+test('sync throughput controls default to a 60s page budget, 3 accounts at once, and a 2-minute deadline', () => {
   assert.equal(loadConfig({}).syncPassBudgetMs, 60_000);
   assert.equal(loadConfig({}).syncConcurrency, 3);
-  assert.equal(loadConfig({}).syncAccountTimeoutMs, 10 * 60_000);
+  assert.equal(loadConfig({}).syncAccountTimeoutMs, 120_000);
+  assert.equal(loadConfig({}).imapConnectTimeoutMs, 20_000);
+  assert.equal(loadConfig({}).syncMailboxTimeoutMs, 45_000);
+  assert.equal(loadConfig({}).syncMaxMessagesPerAccount, 500);
+  assert.equal(loadConfig({}).eventLoopLagMs, 1_500);
+  assert.equal(loadConfig({}).eventLoopStallLogMs, 3_000);
   assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot' }).syncConcurrency, 1);
   assert.equal(loadConfig({ AMAIL_SYNC_PASS_BUDGET_MS: '0' }).syncPassBudgetMs, 0);
   assert.equal(loadConfig({ AMAIL_SYNC_CONCURRENCY: '6' }).syncConcurrency, 6);

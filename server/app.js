@@ -10,8 +10,9 @@ import { createAuthenticator } from './middleware/auth.js';
 import { logSerializers } from './logging.js';
 import { requestTiming } from './middleware/request-timing.js';
 import { createDeepSearchService } from './services/deep-search.js';
+import { createEventLoopWatchdog } from './services/event-loop-watchdog.js';
 
-export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null }) {
+export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, eventLoopWatchdog = null }) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -24,7 +25,6 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
     // recorded (route, status, request id, scrubbed error).
     serializers: logSerializers,
   }));
-  app.use(requestTiming());
   app.use(helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {
@@ -46,9 +46,19 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   }));
   // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB encoded.
   app.use(express.json({ limit: '12mb', type: ['application/json', 'application/*+json'] }));
+  // After JSON parsing so MCP tool names are on the request-start line.
+  app.use(requestTiming());
 
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService, logger });
-  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth, vault, deepSearch: searchJobs });
+  const watchdog = eventLoopWatchdog || createEventLoopWatchdog({
+    lagThresholdMs: Number(config.eventLoopLagMs) || 1_500,
+    stuckSyncMs: Number(config.syncAccountTimeoutMs) || 0,
+    stallLogMs: Number(config.eventLoopStallLogMs) || 3_000,
+    logger,
+    enable: config.env !== 'test',
+  });
+  app.locals.eventLoopWatchdog = watchdog;
+  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog });
   registerMcp(app, { config, repos, mailService, remoteContent, auth, deepSearch: searchJobs });
   app.use('/api', notFound);
 

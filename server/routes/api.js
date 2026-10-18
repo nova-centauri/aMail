@@ -25,6 +25,7 @@ import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, Valida
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
 import { buildHealthExtras } from '../services/runtime-health.js';
+import { createEventLoopWatchdog } from '../services/event-loop-watchdog.js';
 import { createPhaseTimer, debugTimingEnabled } from '../services/debug-timing.js';
 import {
   BARE_MESSAGES_PER_MINUTE,
@@ -185,10 +186,17 @@ function attachDeepSearchStream(request, response, deepSearch, job) {
   });
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null }) {
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null, eventLoopWatchdog = null }) {
   // In keyslot mode `config` is a proxy whose key material throws while the
   // harness is locked, so health reads only static settings plus vault status.
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
+
+  const watchdog = eventLoopWatchdog || createEventLoopWatchdog({
+    lagThresholdMs: Number(config.eventLoopLagMs) || 1_500,
+    stuckSyncMs: Number(config.syncAccountTimeoutMs) || 0,
+    stallLogMs: Number(config.eventLoopStallLogMs) || 3_000,
+    enable: false,
+  });
 
   app.get('/api/health', (_request, response) => {
     // Container probes. Must not query SQLite, take mailbox locks, or wait
@@ -201,11 +209,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     });
     const status = keyStatus();
     timing.mark('keyStatus');
-    const extras = buildHealthExtras({ config, mailService, locked: status.locked });
+    const extras = buildHealthExtras({ config, mailService, locked: status.locked, watchdog });
     timing.mark('extras');
     timing.log();
-    response.json({
-      status: 'ok',
+    const healthy = extras.watchdog?.healthy !== false;
+    response.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ok' : 'unhealthy',
       version: '0.1.0',
       releaseSha: config.releaseSha || null,
       // Deliberately no account count or other mailbox-derived data: this
@@ -510,6 +519,14 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       ? mailService.enqueueSyncAll(options)
       : { accepted: true, state: 'started', sync: null };
     response.status(202).json(accepted);
+  });
+  router.get('/sync/jobs', (_request, response) => {
+    response.json({ job: mailService.latestSyncJob?.() || null });
+  });
+  router.get('/sync/jobs/:jobId', (request, response) => {
+    const job = mailService.getSyncJob?.(request.params.jobId);
+    if (!job) throw new NotFoundError('Sync job not found.');
+    response.json({ job });
   });
   router.get('/events', (request, response) => {
     attachMailboxEventStream(request, response, eventsHub);

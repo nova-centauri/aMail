@@ -11,8 +11,6 @@ import { createApp } from './app.js';
 import { createSearchEngine } from './services/search-engine.js';
 import { backgroundReceiptPlan, INBOX_PROBE_START_DELAY_MS } from './mail/receipt-path.js';
 
-const BACKLOG_DRAIN_DELAY_MS = 5_000;
-
 /**
  * Wire one aMail process. Both key modes share every service; they differ only
  * in where the key material comes from and when the database opens:
@@ -27,29 +25,22 @@ export function createHarness({ config, logger }) {
   let pollTimer = null;
   let probeTimer = null;
   let probeStartTimer = null;
-  let drainTimer = null;
+  let harnessApp = null;
 
   function startPolling(mailService) {
     const plan = backgroundReceiptPlan(config);
     if (pollTimer || !plan.enabled) return;
-    const poll = ({ force = false, retryFailed = false } = {}) => mailService.syncAll({
-      maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed, mode: 'incremental',
-    })
-      .then((results) => {
-        // A pass that ran out of budget with mail still waiting continues
-        // shortly instead of leaving the backlog for the next interval.
-        const backlog = (results || []).reduce((sum, result) => sum + (Number(result?.remaining) || 0), 0);
-        if (backlog > 0 && pollTimer && !drainTimer) {
-          drainTimer = setTimeout(() => {
-            drainTimer = null;
-            // Drain remaining mail without retrying accounts that just failed
-            // IMAP (force only bypasses the recent-result floor).
-            poll({ force: true, retryFailed: false });
-          }, BACKLOG_DRAIN_DELAY_MS);
-          drainTimer.unref();
-        }
-      })
-      .catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
+    const poll = ({ force = false, retryFailed = false } = {}) => {
+      if (typeof mailService.enqueueSyncAll === 'function') {
+        mailService.enqueueSyncAll({
+          maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed, mode: 'incremental',
+        });
+        return;
+      }
+      mailService.syncAll({
+        maxAgeMs: config.syncMinIntervalMs || 0, force, retryFailed, mode: 'incremental',
+      }).catch((error) => logger.warn({ err: error }, 'Background mail sync failed'));
+    };
     const probe = () => mailService.probeInboxes()
       .catch((error) => logger.warn({ err: error }, 'Inbox probe failed'));
     // IDLE on the pooled INBOX connection is the fast path. This probe is the
@@ -72,11 +63,10 @@ export function createHarness({ config, logger }) {
     if (pollTimer) clearInterval(pollTimer);
     if (probeTimer) clearInterval(probeTimer);
     if (probeStartTimer) clearTimeout(probeStartTimer);
-    if (drainTimer) clearTimeout(drainTimer);
     pollTimer = null;
     probeTimer = null;
     probeStartTimer = null;
-    drainTimer = null;
+    harnessApp?.locals?.eventLoopWatchdog?.disable?.();
   }
 
   /** Open the database and build the services that depend on it. */
@@ -108,6 +98,7 @@ export function createHarness({ config, logger }) {
     const passkeys = createPasskeyService({ config, repos: runtime.repos });
     const auth = createAuthenticator({ config });
     const app = createApp({ ...runtime, config, logger, passkeys, auth });
+    harnessApp = app;
     return {
       mode: 'env',
       app,
@@ -160,6 +151,7 @@ export function createHarness({ config, logger }) {
   const passkeys = createPasskeyService({ config, store: passkeyStoreFromKeyslots(keyslots), requestPrf: true });
   const auth = createAuthenticator({ config, vault });
   const app = createApp({ ...vault.runtime, logger, passkeys, auth, vault });
+  harnessApp = app;
 
   return {
     mode: 'keyslot',

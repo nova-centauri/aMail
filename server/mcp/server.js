@@ -3,6 +3,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import * as z from 'zod/v4';
 import { accountTestInput, serializeAccountInput } from '../services/account-input.js';
 import { listConversations, parseNumber } from '../services/inbox.js';
+import { clipMcpMessage, mapYielding, MCP_MAX_THREAD_ACTIONS, MCP_MAX_THREAD_MESSAGES } from './bounds.js';
+import { mcpEnqueueStatus } from '../services/sync-jobs.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { discoverAccountProvider, mailProviderCatalog } from '../utils/mail.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
@@ -87,12 +89,13 @@ function reviewCursor(cursor, accountId) {
   }
 }
 
-function updateTargets(repos, mailService, id, state) {
+async function updateTargets(repos, mailService, id, state) {
   const message = repos.messages.get(id);
-  if (message) return Promise.all([mailService.updateMessageState(message.id, state)]);
+  if (message) return [await mailService.updateMessageState(message.id, state)];
   const thread = repos.threads.get(id);
   if (!thread) throw new NotFoundError('Message or thread not found.');
-  return Promise.all(repos.messages.forThread(thread.id).map((item) => mailService.updateMessageState(item.id, state)));
+  const stored = repos.messages.forThread(thread.id).slice(0, MCP_MAX_THREAD_ACTIONS);
+  return mapYielding(stored, (item) => mailService.updateMessageState(item.id, state));
 }
 
 /** Match REST /accounts probe limits so MCP cannot become a LAN scanner. */
@@ -188,7 +191,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
 
   server.registerTool('list_messages', {
     title: 'List conversations',
-    description: 'List or search conversations with folder, accountId, category, q, page, and pageSize.',
+    description: 'List or search the local cache with folder, accountId, category, q, page, and pageSize. in:anywhere does not search IMAP here; use start_deep_search.',
     inputSchema: {
       folder: z.string().optional().describe('inbox, starred, snoozed, sent, drafts, all, trash, spam, or archive'),
       accountId: z.string().optional().describe('Limit to one account id'),
@@ -207,7 +210,9 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     pageSize: args.pageSize,
     query: args.q,
     mailService,
-    searchSource: 'mcp',
+    // Cache only. `in:anywhere` used to run a blocking IMAP SEARCH on this
+    // HTTP/MCP request; use start_deep_search for provider search.
+    searchSource: 'cache',
   })));
 
   server.registerTool('start_deep_search', {
@@ -310,8 +315,10 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
   }, async ({ id }) => runTool(async () => {
     let message = repos.messages.get(id);
     if (!message) throw new NotFoundError('Message not found.');
-    if (mailService?.hydrateMessageSource) message = await mailService.hydrateMessageSource(id);
-    return { message };
+    if (message.sourceImported === false && mailService?.hydrateMessageSource) {
+      message = await mailService.hydrateMessageSource(id);
+    }
+    return { message: clipMcpMessage(message) };
   }));
 
   server.registerTool('get_attachment', {
@@ -371,11 +378,20 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     const thread = repos.threads.get(id);
     if (!thread) throw new NotFoundError('Thread not found.');
     const stored = repos.messages.forThread(thread.id);
-    const messages = [];
-    for (const item of stored) {
-      messages.push(mailService?.hydrateMessageSource ? await mailService.hydrateMessageSource(item.id) : item);
-    }
-    return { thread: { ...thread, messages }, messages };
+    const capped = stored.slice(0, MCP_MAX_THREAD_MESSAGES);
+    const messages = await mapYielding(capped, async (item) => {
+      let message = item;
+      if (item.sourceImported === false && mailService?.hydrateMessageSource) {
+        message = await mailService.hydrateMessageSource(item.id);
+      }
+      return clipMcpMessage(message);
+    });
+    return {
+      thread: { ...thread, messages, messageCount: stored.length },
+      messages,
+      truncated: stored.length > MCP_MAX_THREAD_MESSAGES,
+      totalMessages: stored.length,
+    };
   }));
 
   server.registerTool('send_message', {
@@ -485,20 +501,23 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       if (!message || message.id !== id) throw new NotFoundError('Individual message not found.');
       return message;
     });
-    const receipts = [];
-    for (const message of selected) {
+    const receipts = await mapYielding(selected, async (message) => {
       const updated = await mailService.updateMessageState(message.id, {
         isAnalyzed: true, analyzedBy: String(by || ''),
       });
-      receipts.push({ id: updated.id, accountId: updated.accountId,
-        isAnalyzed: updated.isAnalyzed, remoteSync: updated.remoteSync });
-    }
+      return {
+        id: updated.id,
+        accountId: updated.accountId,
+        isAnalyzed: updated.isAnalyzed,
+        remoteSync: updated.remoteSync,
+      };
+    });
     return { messages: receipts };
   }));
 
   server.registerTool('sync_mail', {
     title: 'Sync mail',
-    description: 'Sync one account (accountId) or all accounts when accountId is omitted.',
+    description: 'Queue a background IMAP sync and return immediately. Poll get_sync_job with the jobId. status is queued or already_running.',
     inputSchema: {
       accountId: z.string().optional().describe('Account to sync; omit to sync all'),
       mailbox: z.string().optional(),
@@ -509,11 +528,36 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     const options = {
       mailbox: mailbox ? String(mailbox) : undefined,
       limit: parseNumber(limit, config.syncBatchSize, 1, 1000),
+      maxAgeMs: parseNumber(maxAgeSeconds, 0, 0, 3600) * 1000,
     };
-    if (accountId) {
-      return { result: await mailService.syncAccount(accountId, options) };
+    const enqueue = accountId
+      ? mailService.enqueueSyncAccount
+      : mailService.enqueueSyncAll;
+    if (typeof enqueue !== 'function') {
+      throw new ServiceUnavailableError('Background sync is not available.', 'SYNC_ENQUEUE_UNAVAILABLE');
     }
-    return { results: await mailService.syncAll({ ...options, maxAgeMs: parseNumber(maxAgeSeconds, 0, 0, 3600) * 1000 }) };
+    const accepted = accountId ? enqueue.call(mailService, accountId, options) : enqueue.call(mailService, options);
+    return {
+      status: accepted.status || mcpEnqueueStatus(accepted.state),
+      jobId: accepted.jobId,
+      state: accepted.state,
+      sync: accepted.sync || null,
+    };
+  }));
+
+  server.registerTool('get_sync_job', {
+    title: 'Poll a background sync job',
+    description: 'Read status for a jobId returned by sync_mail. Omit jobId to read the latest job.',
+    inputSchema: {
+      jobId: z.string().optional().describe('Job id from sync_mail; omit for the latest job'),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ jobId }) => runTool(async () => {
+    const job = jobId
+      ? mailService.getSyncJob?.(jobId)
+      : mailService.latestSyncJob?.();
+    if (jobId && !job) throw new NotFoundError('Sync job not found.');
+    return { job };
   }));
 
   server.registerTool('test_account', {

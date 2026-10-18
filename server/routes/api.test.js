@@ -9,6 +9,7 @@ import { createDatabase, createRepositories } from '../db.js';
 import { ServiceUnavailableError } from '../errors.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerApi } from './api.js';
+import { createEventLoopWatchdog } from '../services/event-loop-watchdog.js';
 import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { decryptJson } from '../services/crypto.js';
 import { serializeAccountInput } from '../services/account-input.js';
@@ -970,6 +971,39 @@ test('GET /api/health does not touch repos, sqlite, or mailbox locks', async (t)
   assert.equal(Object.hasOwn(health, 'accounts'), false);
 });
 
+test('GET /api/health is 503 when a single-flight sync is stuck past its deadline', async (t) => {
+  const watchdog = createEventLoopWatchdog({
+    lagThresholdMs: 1_500,
+    stuckSyncMs: 120_000,
+    histogram: { mean: 0, max: 0, percentile: () => 0 },
+  });
+  const app = express();
+  registerApi(app, {
+    config: { dbPath: '/tmp/does-not-exist-amail-stuck.sqlite', syncAccountTimeoutMs: 120_000, eventLoopLagMs: 1_500 },
+    repos: new Proxy({}, { get() { return () => null; } }),
+    mailService: {
+      runtimeStatus() {
+        return { inFlight: true, queueDepth: 1, oldestAgeMs: 180_000, oldestStartedAt: '2026-10-18T21:20:00.000Z' };
+      },
+    },
+    remoteContent: { canIssueTokens: false },
+    eventLoopWatchdog: watchdog,
+  });
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    watchdog.disable();
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${origin}/api/health`);
+  assert.equal(response.status, 503);
+  const health = await response.json();
+  assert.equal(health.status, 'unhealthy');
+  assert.equal(health.watchdog.stuckSync, true);
+  assert.equal(health.watchdog.healthy, false);
+});
+
 test('GET /api/messages without If-None-Match is capped tighter than ETag pollers', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-bare-limit-'));
   const config = {
@@ -1057,6 +1091,8 @@ test('POST /api/sync returns 202 without waiting for IMAP and coalesces callers'
       return {
         accepted: true,
         state: calls.length === 1 ? 'started' : 'in-flight',
+        jobId: 'sync_1_test',
+        status: calls.length === 1 ? 'queued' : 'already_running',
         sync: {
           inFlight: true,
           queueDepth: 1,
@@ -1109,6 +1145,7 @@ test('POST /api/sync returns 202 without waiting for IMAP and coalesces callers'
   const firstBody = await first.json();
   assert.equal(firstBody.accepted, true);
   assert.equal(firstBody.state, 'started');
+  assert.equal(firstBody.jobId, 'sync_1_test');
   assert.equal(Object.hasOwn(firstBody, 'results'), false);
   assert.equal(firstBody.sync.inFlight, true);
 

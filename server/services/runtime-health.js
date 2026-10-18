@@ -62,13 +62,18 @@ export function healthFeatureFlags(config = {}) {
   return features;
 }
 
-export function buildHealthExtras({ config, mailService, locked = false } = {}) {
+export function buildHealthExtras({ config, mailService, locked = false, watchdog = null } = {}) {
   const preferIdle = backgroundReceiptPlan(config).preferIdle;
+  const sync = readRuntimeStatus(mailService, { locked });
+  const watchdogSnap = watchdog?.snapshot
+    ? watchdog.snapshot({ oldestAgeMs: sync.oldestAgeMs })
+    : null;
   return {
     features: healthFeatureFlags(config),
     ...(preferIdle ? { idle: { enabled: true } } : {}),
     memory: processMemorySnapshot(),
     database: databaseFileStats(config?.dbPath),
-    sync: readRuntimeStatus(mailService, { locked }),
+    sync,
+    ...(watchdogSnap ? { watchdog: watchdogSnap } : {}),
   };
 }
