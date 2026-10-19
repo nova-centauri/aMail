@@ -1,9 +1,9 @@
 import { requestPath } from '../logging.js';
 import { globalInFlight, mcpCallMeta } from '../services/in-flight-requests.js';
-import { SLOW_MESSAGES_MS, sanitizeMessagesQuery } from '../services/messages-query-log.js';
+import { SLOW_MESSAGES_MS, sanitizeMessagesPhases, sanitizeMessagesQuery } from '../services/messages-query-log.js';
 
 export const SLOW_REQUEST_MS = 250;
-export { SLOW_MESSAGES_MS, sanitizeMessagesQuery };
+export { SLOW_MESSAGES_MS, sanitizeMessagesPhases, sanitizeMessagesQuery };
 export const POLLER_SAMPLE_RATE = 0.2;
 const POLLER_PREFIXES = ['/api/messages', '/api/changes', '/api/sync'];
 
@@ -107,6 +107,7 @@ export function requestTiming({
       const fields = { event: decision.event, reqId: startFields.reqId, mcpTool: startFields.mcpTool, ...requestTimingFields(request, response, durationMs) };
       if (path === '/api/messages' && durationMs >= SLOW_MESSAGES_MS) {
         fields.query = sanitizeMessagesQuery(request?.query);
+        fields.phases = sanitizeMessagesPhases(request?.messagesPhases);
       }
       logger?.info?.(fields, decision.event === 'slow_request' ? 'Slow request' : 'Poller sample');
     };

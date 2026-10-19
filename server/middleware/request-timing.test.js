@@ -8,6 +8,7 @@ import {
   requestStartFields,
   requestTiming,
   requestTimingFields,
+  sanitizeMessagesPhases,
   sanitizeMessagesQuery,
   shouldLogRequestTiming,
 } from './request-timing.js';
@@ -118,6 +119,20 @@ test('GET /api/messages slower than 500ms logs sanitized query params', () => {
     method: 'GET',
     originalUrl: '/api/messages?folder=inbox&q=from%3Aada@example.test',
     query: { folder: 'inbox', q: 'from:ada@example.test quarterly numbers' },
+    messagesPhases: {
+      cache: 'miss',
+      cacheHit: false,
+      stampMs: 1.2,
+      searchMs: 2100.4,
+      pageSqlMs: 1800.1,
+      categorySqlMs: 280.2,
+      countSqlMs: 0,
+      folderCountsMs: 90.6,
+      hydrateMs: 12.2,
+      typesenseMs: 0,
+      providerSearchMs: 0,
+      secretSql: 'SELECT * FROM messages',
+    },
     headers: { 'user-agent': 'vitest' },
     log: { info(fields, message) { lines.push({ fields, message }); } },
   };
@@ -141,8 +156,38 @@ test('GET /api/messages slower than 500ms logs sanitized query params', () => {
   assert.equal(slow.fields.query.folder, 'inbox');
   assert.equal(slow.fields.query.hasQuery, true);
   assert.deepEqual(slow.fields.query.operators, ['from', 'text']);
+  assert.deepEqual(slow.fields.phases, {
+    cache: 'miss',
+    cacheHit: false,
+    stampMs: 1,
+    searchMs: 2100,
+    pageSqlMs: 1800,
+    categorySqlMs: 280,
+    countSqlMs: 0,
+    folderCountsMs: 91,
+    hydrateMs: 12,
+    typesenseMs: 0,
+    providerSearchMs: 0,
+  });
   assert.equal(JSON.stringify(slow.fields).includes('ada@example.test'), false);
   assert.equal(JSON.stringify(slow.fields).includes('quarterly'), false);
+  assert.equal(JSON.stringify(slow.fields).includes('SELECT'), false);
+});
+
+test('sanitizeMessagesPhases drops unknown cache labels and non-numeric timings', () => {
+  assert.deepEqual(sanitizeMessagesPhases({ cache: 'hack', searchMs: 'nope', typesenseMs: 3.7 }), {
+    cache: 'miss',
+    cacheHit: false,
+    stampMs: 0,
+    searchMs: 0,
+    pageSqlMs: 0,
+    categorySqlMs: 0,
+    countSqlMs: 0,
+    folderCountsMs: 0,
+    hydrateMs: 0,
+    typesenseMs: 4,
+    providerSearchMs: 0,
+  });
 });
 
 test('request start records MCP tool name and leaves an in-flight row until finish', () => {

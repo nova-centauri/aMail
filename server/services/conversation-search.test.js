@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildConversationSearch, cheapInboxPredicate, cheapWindowedListingSql, escapeLike, listingNeedsThreadStats, listingProbe } from './conversation-search.js';
+import { buildConversationSearch, cheapInboxPredicate, escapeLike, listingNeedsThreadStats } from './conversation-search.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
 
 test('LIKE metacharacters are escaped for SQL contains matches', () => {
@@ -82,29 +82,16 @@ test('default inbox listing skips attachment JSON and the full stats window', ()
     nowIso: '2026-09-18T00:00:00.000Z',
   });
   assert.equal(cheap.cheap, true);
-  assert.equal(cheap.deriveTotalFromCategories, true);
   assert.doesNotMatch(cheap.pageSql, /json_array_length/);
   assert.doesNotMatch(cheap.pageSql, /has_attachment/);
   assert.doesNotMatch(cheap.pageSql, /attachments_json/);
   assert.doesNotMatch(cheap.pageSql, /html_body/);
-  assert.doesNotMatch(cheap.pageSql, /AS MATERIALIZED/);
-  assert.doesNotMatch(cheap.pageSql, /SELECT COUNT\(\*\) FROM latest/);
-  assert.match(cheap.pageSql, /FROM heads/);
-  assert.match(cheap.pageSql, /LIMIT @probe/);
+  assert.match(cheap.pageSql, /FROM latest/);
+  assert.match(cheap.pageSql, /AS MATERIALIZED/);
   assert.match(cheap.pageSql, /COALESCE\(m\.is_draft, 0\) = 0/);
   assert.match(cheap.pageSql, /INDEXED BY idx_messages_inbox_list/);
   assert.match(cheapInboxPredicate('m'), /COALESCE\(m\.is_draft, 0\) = 0/);
   assert.match(cheap.pageSql, /LIMIT @limit OFFSET @offset/);
-  assert.equal(cheap.params.probe, listingProbe(50, 0));
-
-  const windowed = cheapWindowedListingSql({
-    accountSql: 'm.account_id = @accountId',
-    hideQuiet: true,
-    category: '',
-    folder: 'inbox',
-  });
-  assert.match(windowed.pageSql, /AS MATERIALIZED/);
-  assert.match(windowed.pageSql, /SELECT COUNT\(\*\) FROM latest/);
 
   const legacy = buildConversationSearch({
     accountIds: ['account-1'],

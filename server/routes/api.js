@@ -27,6 +27,7 @@ import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslo
 import { buildHealthExtras } from '../services/runtime-health.js';
 import { createEventLoopWatchdog } from '../services/event-loop-watchdog.js';
 import { createPhaseTimer, debugTimingEnabled } from '../services/debug-timing.js';
+import { emptyMessagesPhases } from '../services/messages-query-log.js';
 import {
   BARE_MESSAGES_PER_MINUTE,
   MESSAGES_PER_MINUTE,
@@ -571,12 +572,18 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       logger: request.log,
       label: 'api_messages',
     });
+    const phases = emptyMessagesPhases();
+    request.messagesPhases = phases;
+    const stampStarted = process.hrtime.bigint();
     const change = repos.changes.stamp() || {};
     const stamp = listCacheToken(change);
+    phases.stampMs = Number(process.hrtime.bigint() - stampStarted) / 1e6;
     timing.mark('stamp');
     const etag = conversationListEtag(stamp, listInput);
     response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
     if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {
+      phases.cache = 'etag';
+      phases.cacheHit = true;
       timing.mark('etag_hit');
       timing.log({ status: 304 });
       response.status(304).end();
@@ -588,9 +595,10 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       mailService,
       searchSource: 'human',
       signal: request.signal,
+      phases,
     });
     timing.mark('list');
-    timing.log({ status: 200, total: listing?.total });
+    timing.log({ status: 200, total: listing?.total, cache: phases.cache });
     response.json(listing);
   });
   router.post('/search/deep', (request, response) => {

@@ -445,12 +445,35 @@ test('page sizes clamp to a default and a maximum', () => {
 });
 
 function isInboxListingSql(sql) {
-  return /WITH\s+(latest|ranked|scoped|heads)\b/i.test(sql)
+  return /WITH\s+(latest|ranked|scoped)\b/i.test(sql)
     || /FROM threads WHERE id/i.test(sql)
     || /thread_id IN/i.test(sql)
     || /json_array_length/i.test(sql)
     || /ROW_NUMBER\(\)/i.test(sql);
 }
+
+test('listConversations records cache and SQL phases without changing the response', async (t) => {
+  const { repos, add, thread } = fixture(t);
+  add(thread('Timed'));
+  const miss = {};
+  const first = await listConversations(repos, { folder: 'inbox', pageSize: 25, phases: miss });
+  assert.equal(first.total, 1);
+  assert.equal(Object.hasOwn(first, 'phases'), false);
+  assert.equal(miss.cache, 'miss');
+  assert.equal(miss.cacheHit, false);
+  assert.ok(miss.searchMs >= 0);
+  assert.ok(miss.pageSqlMs >= 0);
+  assert.ok(miss.categorySqlMs >= 0);
+  assert.ok(miss.folderCountsMs >= 0);
+  assert.ok(miss.hydrateMs >= 0);
+  assert.equal(miss.typesenseMs || 0, 0);
+  const hit = {};
+  const second = await listConversations(repos, { folder: 'inbox', pageSize: 25, phases: hit });
+  assert.deepEqual(second.messages.map((item) => item.id), first.messages.map((item) => item.id));
+  assert.equal(hit.cache, 'list');
+  assert.equal(hit.cacheHit, true);
+  assert.equal(JSON.stringify(second).includes('phases'), false);
+});
 
 test('unchanged inbox listings reuse the change-version cache and keep a stable ETag', async (t) => {
   const { repos, executed, add, thread } = fixture(t);
@@ -518,13 +541,12 @@ test('default inbox listing SQL materializes once and hydrates without bodies or
   assert.equal(page.pageSize, 60);
   assert.equal(page.messages[0].hasAttachments, true);
   assert.equal(Object.hasOwn(page.messages[0], 'htmlBody'), false);
-  const listing = executed.filter((sql) => /WITH\s+heads/i.test(sql));
+  const listing = executed.filter((sql) => /WITH\s+latest/i.test(sql));
   assert.ok(listing.length >= 1);
   for (const sql of listing) {
-    assert.doesNotMatch(sql, /MATERIALIZED/);
+    assert.match(sql, /MATERIALIZED/);
     assert.doesNotMatch(sql, /attachments_json/);
     assert.doesNotMatch(sql, /html_body/);
-    assert.match(sql, /LIMIT @probe/);
   }
   const hydrate = executed.filter((sql) => /json_array_length\(attachments_json\)/.test(sql));
   assert.equal(hydrate.length, 1);

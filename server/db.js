@@ -986,37 +986,49 @@ export function createRepositories(db) {
     // filter so switching folders does not zero out the badges.
     folderBadgeCounts: db.prepare(`SELECT
       (
-        SELECT COUNT(DISTINCT thread_id) FROM messages INDEXED BY idx_messages_badge_inbox
-        WHERE account_id = @accountId
-          AND mailbox = 'INBOX'
-          AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
-          AND is_read = 0
-          AND (snoozed_until IS NULL OR snoozed_until <= @now)
-          AND smart_category <> 'ops_quiet'
+        SELECT COUNT(*) FROM (
+          SELECT thread_id FROM messages
+          WHERE account_id = @accountId
+            AND mailbox = 'INBOX'
+            AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
+            AND is_read = 0
+            AND (snoozed_until IS NULL OR snoozed_until <= @now)
+            AND smart_category <> 'ops_quiet'
+          GROUP BY thread_id
+        )
       ) AS inbox,
       (
-        SELECT COUNT(DISTINCT thread_id) FROM messages INDEXED BY idx_messages_badge_starred
-        WHERE account_id = @accountId
-          AND is_starred = 1 AND is_trashed = 0
+        SELECT COUNT(*) FROM (
+          SELECT thread_id FROM messages
+          WHERE account_id = @accountId
+            AND is_starred = 1 AND is_trashed = 0
+          GROUP BY thread_id
+        )
       ) AS starred,
       (
-        SELECT COUNT(DISTINCT thread_id) FROM messages INDEXED BY idx_messages_badge_snoozed
-        WHERE account_id = @accountId
-          AND snoozed_until > @now AND is_trashed = 0 AND is_spam = 0
+        SELECT COUNT(*) FROM (
+          SELECT thread_id FROM messages
+          WHERE account_id = @accountId
+            AND snoozed_until > @now AND is_trashed = 0 AND is_spam = 0
+          GROUP BY thread_id
+        )
       ) AS snoozed,
       (
         (SELECT COUNT(*) FROM drafts WHERE account_id = @accountId)
         + (SELECT COUNT(*) FROM messages WHERE account_id = @accountId AND is_draft = 1 AND is_trashed = 0 AND is_spam = 0)
       ) AS drafts,
       (
-        SELECT COUNT(DISTINCT thread_id) FROM messages INDEXED BY idx_messages_badge_inbox
-        WHERE account_id = @accountId
-          AND mailbox = 'INBOX'
-          AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
-          AND analyzed_at IS NULL
-          AND COALESCE(source_imported, 1) = 1
-          AND (snoozed_until IS NULL OR snoozed_until <= @now)
-          AND smart_category <> 'ops_quiet'
+        SELECT COUNT(*) FROM (
+          SELECT thread_id FROM messages
+          WHERE account_id = @accountId
+            AND mailbox = 'INBOX'
+            AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0
+            AND analyzed_at IS NULL
+            AND COALESCE(source_imported, 1) = 1
+            AND (snoozed_until IS NULL OR snoozed_until <= @now)
+            AND smart_category <> 'ops_quiet'
+          GROUP BY thread_id
+        )
       ) AS unanalyzed
     `),
     messageInsert: db.prepare(`INSERT INTO messages (
@@ -1364,48 +1376,56 @@ export function createRepositories(db) {
       folderCountsForAccounts(accountIds = []) {
         const ids = [...new Set((accountIds || []).filter(Boolean))];
         if (!ids.length) return { inbox: 0, starred: 0, snoozed: 0, drafts: 0, unanalyzed: 0 };
-        const params = { now: now() };
-        const placeholders = ids.map((id, index) => {
-          params[`account${index}`] = id;
-          return `@account${index}`;
-        }).join(', ');
         const row = db.prepare(`
+          WITH scoped AS (SELECT value AS account_id FROM json_each(@accountIds))
           SELECT
             (
-              SELECT COUNT(DISTINCT m.thread_id) FROM messages m INDEXED BY idx_messages_badge_inbox
-              WHERE m.account_id IN (${placeholders})
-                AND m.mailbox = 'INBOX'
-                AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
-                AND m.is_read = 0
-                AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-                AND m.smart_category <> 'ops_quiet'
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.mailbox = 'INBOX'
+                  AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
+                  AND m.is_read = 0
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+                  AND m.smart_category <> 'ops_quiet'
+                GROUP BY m.account_id, m.thread_id
+              )
             ) AS inbox,
             (
-              SELECT COUNT(DISTINCT m.thread_id) FROM messages m INDEXED BY idx_messages_badge_starred
-              WHERE m.account_id IN (${placeholders})
-                AND m.is_starred = 1 AND m.is_trashed = 0
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.is_starred = 1 AND m.is_trashed = 0
+                GROUP BY m.account_id, m.thread_id
+              )
             ) AS starred,
             (
-              SELECT COUNT(DISTINCT m.thread_id) FROM messages m INDEXED BY idx_messages_badge_snoozed
-              WHERE m.account_id IN (${placeholders})
-                AND m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.snoozed_until > @now AND m.is_trashed = 0 AND m.is_spam = 0
+                GROUP BY m.account_id, m.thread_id
+              )
             ) AS snoozed,
             (
-              (SELECT COUNT(*) FROM drafts WHERE account_id IN (${placeholders}))
-              + (SELECT COUNT(*) FROM messages
-                 WHERE account_id IN (${placeholders}) AND is_draft = 1 AND is_trashed = 0 AND is_spam = 0)
+              (SELECT COUNT(*) FROM drafts d JOIN scoped s ON s.account_id = d.account_id)
+              + (SELECT COUNT(*) FROM messages m JOIN scoped s ON s.account_id = m.account_id
+                 WHERE m.is_draft = 1 AND m.is_trashed = 0 AND m.is_spam = 0)
             ) AS drafts,
             (
-              SELECT COUNT(DISTINCT m.thread_id) FROM messages m INDEXED BY idx_messages_badge_inbox
-              WHERE m.account_id IN (${placeholders})
-                AND m.mailbox = 'INBOX'
-                AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
-                AND m.analyzed_at IS NULL
-                AND COALESCE(m.source_imported, 1) = 1
-                AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
-                AND m.smart_category <> 'ops_quiet'
+              SELECT COUNT(*) FROM (
+                SELECT m.thread_id FROM messages m
+                JOIN scoped s ON s.account_id = m.account_id
+                WHERE m.mailbox = 'INBOX'
+                  AND m.is_archived = 0 AND m.is_trashed = 0 AND m.is_spam = 0
+                  AND m.analyzed_at IS NULL
+                  AND COALESCE(m.source_imported, 1) = 1
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+                  AND m.smart_category <> 'ops_quiet'
+                GROUP BY m.account_id, m.thread_id
+              )
             ) AS unanalyzed
-        `).get(params) || {};
+        `).get({ accountIds: JSON.stringify(ids), now: now() }) || {};
         return {
           inbox: Number(row.inbox) || 0,
           starred: Number(row.starred) || 0,
@@ -1524,8 +1544,10 @@ export function createRepositories(db) {
         limit = 50,
         offset = 0,
         forceLegacy = false,
-        forceWindowed = false,
+        phases = null,
       } = {}) {
+        const tick = () => process.hrtime.bigint();
+        const elapsedMs = (started) => Number(tick() - started) / 1e6;
         const built = buildConversationSearch({
           accountIds,
           folder,
@@ -1539,28 +1561,29 @@ export function createRepositories(db) {
           limit,
           offset,
           forceLegacy,
-          forceWindowed,
           nowIso: now(),
         });
         if (built.empty) return { threadIds: [], total: 0, categoryCounts: [] };
+        const pageStarted = tick();
         const pageRows = db.prepare(built.pageSql).all(built.params);
+        if (phases) phases.pageSqlMs = elapsedMs(pageStarted);
         const threadIds = pageRows.map((row) => row.threadId);
-        const categoryCounts = db.prepare(built.categorySql).all(built.params);
-        if (built.deriveTotalFromCategories) {
-          const selected = String(built.params.category || '');
-          const total = selected
-            ? Number(categoryCounts.find((row) => row.category === selected)?.count) || 0
-            : categoryCounts.reduce((sum, row) => sum + (Number(row.count) || 0), 0);
-          return { threadIds, total, categoryCounts };
-        }
         const pageTotal = built.cheap && pageRows.length && pageRows[0].total != null
           ? Number(pageRows[0].total)
           : null;
-        const total = pageTotal != null
-          ? pageTotal
-          : (built.cheap && (Number(built.params.offset) || 0) === 0 && !pageRows.length
-            ? 0
-            : (Number(db.prepare(built.countSql).get(built.params)?.total) || 0));
+        const needsCount = pageTotal == null
+          && !(built.cheap && (Number(built.params.offset) || 0) === 0 && !pageRows.length);
+        let total = pageTotal != null ? pageTotal : 0;
+        if (needsCount) {
+          const countStarted = tick();
+          total = Number(db.prepare(built.countSql).get(built.params)?.total) || 0;
+          if (phases) phases.countSqlMs = elapsedMs(countStarted);
+        } else if (phases) {
+          phases.countSqlMs = 0;
+        }
+        const categoryStarted = tick();
+        const categoryCounts = db.prepare(built.categorySql).all(built.params);
+        if (phases) phases.categorySqlMs = elapsedMs(categoryStarted);
         return { threadIds, total, categoryCounts };
       },
       searchThreadIds({ accountId, folder = 'inbox', mailbox = 'INBOX', ftsQuery, limit = 500 }) {

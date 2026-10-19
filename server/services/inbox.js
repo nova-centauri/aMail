@@ -147,7 +147,9 @@ const emptyFolderCounts = () => ({ inbox: 0, starred: 0, snoozed: 0, drafts: 0, 
  */
 async function conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds }) {
   const engine = repos.searchEngine;
+  const phases = listArgs.phases || null;
   if (engine?.enabled && listArgs.parsed?.text) {
+    const typesenseStarted = process.hrtime.bigint();
     try {
       const eligibleExtras = extraThreadIds.length
         ? repos.messages.searchConversations({
@@ -189,12 +191,14 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
       });
       if (rankedLimit <= 0) ranked.threadIds = [];
       const seen = new Set(prefix);
+      if (phases) phases.typesenseMs = Number(process.hrtime.bigint() - typesenseStarted) / 1e6;
       return {
         threadIds: [...prefix, ...ranked.threadIds.filter((id) => !seen.has(id))],
         total: (ranked.total || 0) + extraOnly.length,
         categoryCounts: ranked.categoryCounts || [],
       };
     } catch {
+      if (phases) phases.typesenseMs = Number(process.hrtime.bigint() - typesenseStarted) / 1e6;
       // The cache listing below is the same path used when Typesense is off.
     }
   }
@@ -325,7 +329,10 @@ export async function listConversations(repos, {
   extraThreadIds: extraThreadIdsInput = null,
   forceLegacy = false,
   changedAt: changedAtInput = null,
+  phases = null,
 } = {}) {
+  const tick = () => process.hrtime.bigint();
+  const elapsedMs = (started) => Number(tick() - started) / 1e6;
   const parsedQuery = parseMailboxQuery(String(queryInput || '').trim().slice(0, 800));
   const folder = normalizeFolder(parsedQuery.folder || folderInput);
   const category = normalizeCategory(categoryInput);
@@ -350,7 +357,15 @@ export async function listConversations(repos, {
   const resultCache = cachesFor(repos).list;
   const canCache = !extraThreadIdsInput && !mailboxQueryIsActive(parsedQuery) && !category && !personFlag;
   if (canCache && resultCache.has(resultCacheKey)) {
+    if (phases) {
+      phases.cache = 'list';
+      phases.cacheHit = true;
+    }
     return resultCache.get(resultCacheKey);
+  }
+  if (phases) {
+    phases.cache = 'miss';
+    phases.cacheHit = false;
   }
   const query = parsedQuery.raw;
   const searchActive = mailboxQueryIsActive(parsedQuery);
@@ -364,6 +379,7 @@ export async function listConversations(repos, {
     && mailService?.searchAndMaterialize
     && shouldSearchProvider(parsedQuery, { source: searchSource, folder })
   ) {
+    const providerStarted = tick();
     try {
       const provider = await mailService.searchAndMaterialize({
         accounts,
@@ -375,6 +391,7 @@ export async function listConversations(repos, {
     } catch {
       // Local cache results are still returned if provider search fails.
     }
+    if (phases) phases.providerSearchMs = elapsedMs(providerStarted);
   }
 
   if (folder === 'drafts') {
@@ -387,13 +404,16 @@ export async function listConversations(repos, {
       })
       .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
     const start = (page - 1) * pageSize;
+    const folderStarted = tick();
+    const folderCounts = sumFolderCounts(accounts, repos, changedAt);
+    if (phases) phases.folderCountsMs = elapsedMs(folderStarted);
     const draftResult = {
       messages: category ? [] : drafts.slice(start, start + pageSize),
       total: category ? 0 : drafts.length,
       page,
       pageSize,
       categoryCounts: emptyCategoryCounts(),
-      folderCounts: sumFolderCounts(accounts, repos, changedAt),
+      folderCounts,
       personFlag: personFlag?.id || null,
       personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
     };
@@ -413,8 +433,12 @@ export async function listConversations(repos, {
     limit: pageSize,
     offset: (page - 1) * pageSize,
     forceLegacy,
+    phases,
   };
+  const searchStarted = tick();
   const search = await conversationSearch(repos, listArgs, { page, pageSize, extraThreadIds });
+  if (phases) phases.searchMs = elapsedMs(searchStarted);
+  const hydrateStarted = tick();
   const latestByThread = typeof repos.messages.latestForThreads === 'function'
     ? repos.messages.latestForThreads(search.threadIds, {
       folder,
@@ -467,13 +491,17 @@ export async function listConversations(repos, {
       ...(folder === 'snoozed' ? { folder: 'snoozed' } : {}),
     };
   }).filter(Boolean);
+  if (phases) phases.hydrateMs = elapsedMs(hydrateStarted);
+  const folderStarted = tick();
+  const folderCounts = sumFolderCounts(accounts, repos, changedAt);
+  if (phases) phases.folderCountsMs = elapsedMs(folderStarted);
   const result = {
     messages: pageItems,
     total: search.total,
     page,
     pageSize,
     categoryCounts,
-    folderCounts: sumFolderCounts(accounts, repos, changedAt),
+    folderCounts,
     personFlag: personFlag?.id || null,
     personFlagMeta: personFlag ? publicPersonFlag(personFlag) : null,
   };
