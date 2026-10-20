@@ -129,7 +129,7 @@ proxy_curl() {
   method=$1
   path=$2
   shift 2
-  $COMPOSE exec -T autoheal curl --silent --show-error --max-time 10 \
+  $COMPOSE exec -T autoheal curl --silent --show-error --max-time 5 \
     --output /tmp/autoheal-proxy-body \
     --write-out '%{http_code}' \
     --request "$method" \
