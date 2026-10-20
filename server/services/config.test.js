@@ -109,3 +109,11 @@ test('keyslot mode uses the hosted density profile unless explicit env overrides
   assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', SYNC_INTERVAL_MINUTES: '5' }).syncIntervalMinutes, 5);
   assert.equal(loadConfig({ AMAIL_KEY_MODE: 'keyslot', LOG_LEVEL: 'info' }).logLevel, 'info');
 });
+
+test('search reads default to a 10s worker deadline outside tests', () => {
+  assert.equal(loadConfig({}).searchReadWorker, true);
+  assert.equal(loadConfig({}).searchQueryDeadlineMs, 10_000);
+  assert.equal(loadConfig({ NODE_ENV: 'test' }).searchReadWorker, false);
+  assert.equal(loadConfig({ AMAIL_SEARCH_READ_WORKER: 'true' }).searchReadWorker, true);
+  assert.equal(loadConfig({ AMAIL_SEARCH_QUERY_DEADLINE_MS: '250' }).searchQueryDeadlineMs, 250);
+});

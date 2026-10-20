@@ -146,6 +146,10 @@ export function loadConfig(env = process.env) {
     cpuProf: boolean(readEnv(env, 'CPU_PROF'), false) || boolean(env.AMAIL_CPU_PROF, false),
     // Parse + SQLCipher writes on a worker thread. Tests turn this off.
     syncWorker: boolean(readEnv(env, 'SYNC_WORKER'), env.NODE_ENV !== 'test'),
+    // Conversation search and get_thread SQLCipher reads on a dedicated
+    // worker. A hang here used to freeze the HTTP event loop for minutes.
+    searchReadWorker: boolean(readEnv(env, 'SEARCH_READ_WORKER'), env.NODE_ENV !== 'test'),
+    searchQueryDeadlineMs: integer(readEnv(env, 'SEARCH_QUERY_DEADLINE_MS'), 10_000, { min: 50, max: 120_000 }),
     // 0 disables background polling. Otherwise this is the full-folder pass
     // (Sent, Drafts, and the rest). New inbox mail does not wait for it:
     // pooled IMAP IDLE pushes, and a 60-second UIDNEXT probe is the fallback.

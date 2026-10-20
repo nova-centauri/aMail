@@ -10,6 +10,7 @@ import { discoverAccountProvider, mailProviderCatalog } from '../utils/mail.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
 import { configuredOpsSources } from '../services/smart-filter.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
+import { logMcpToolCall } from '../services/messages-query-log.js';
 
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
@@ -130,13 +131,22 @@ const recipientSchema = z.union([
  * Build a fresh MCP server instance wired to aMail services.
  * Stateless Streamable HTTP creates one of these per request.
  */
-export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter, deepSearch = null }) {
+export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter, deepSearch = null, logger = null }) {
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const server = new McpServer({
     name: 'amail',
     version: '0.1.0',
   }, {
     instructions: 'aMail multi-account inbox tools. Never request or echo IMAP/SMTP passwords; account tools refuse to return stored credentials.',
+  });
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = (name, toolConfig, handler) => registerTool(name, toolConfig, async (args, extra) => {
+    const started = Date.now();
+    try {
+      return await handler(args, extra);
+    } finally {
+      logMcpToolCall(logger, name, args, Date.now() - started);
+    }
   });
 
   server.registerTool('list_accounts', {
@@ -375,9 +385,15 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       id: z.string().describe('Thread id'),
     },
   }, async ({ id }) => runTool(async () => {
-    const thread = repos.threads.get(id);
+    const loaded = typeof repos.searchRead?.getThread === 'function'
+      ? await repos.searchRead.getThread(id)
+      : (() => {
+        const existing = repos.threads.get(id);
+        return { thread: existing || null, messages: existing ? repos.messages.forThread(id) : [] };
+      })();
+    const thread = loaded?.thread;
     if (!thread) throw new NotFoundError('Thread not found.');
-    const stored = repos.messages.forThread(thread.id);
+    const stored = loaded.messages || [];
     const capped = stored.slice(0, MCP_MAX_THREAD_MESSAGES);
     const messages = await mapYielding(capped, async (item) => {
       let message = item;

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildConversationSearch, cheapInboxPredicate, cheapWindowedListingSql, escapeLike, listingNeedsThreadStats, listingProbe } from './conversation-search.js';
+import { bindFromAddress, buildConversationSearch, cheapInboxPredicate, cheapWindowedListingSql, escapeLike, fromAddressSql, listingNeedsThreadStats, listingProbe } from './conversation-search.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
 
 test('LIKE metacharacters are escaped for SQL contains matches', () => {
@@ -23,12 +23,33 @@ test('conversation search SQL paginates in SQLite and pushes operators into pred
   assert.doesNotMatch(built.pageSql, /\b1000\b/);
   assert.doesNotMatch(built.pageSql, /\b500\b/);
   assert.match(built.pageSql, /messages_fts MATCH @ftsQuery/);
-  assert.match(built.pageSql, /from_name/);
+  assert.match(built.pageSql, /from_hits/);
+  assert.match(built.pageSql, /INDEXED BY idx_messages_from_email/);
+  assert.match(built.pageSql, /lower\(m\.from_email\) = @from0/);
+  assert.doesNotMatch(built.pageSql, /from_name/);
   assert.match(built.pageSql, /has_attachment = 1/);
   assert.match(built.pageSql, /latest_at >= @after/);
   assert.equal(built.params.limit, 50);
   assert.equal(built.params.offset, 50);
-  assert.equal(built.params.from0, '%ada@example.com%');
+  assert.equal(built.params.from0, 'ada@example.com');
+  assert.equal(built.params.from0Kind, 'email');
+});
+
+test('from: binds to the indexed address column instead of a leading-wildcard LIKE', () => {
+  const email = {};
+  bindFromAddress(email, 'from0', 'Ada@Example.com');
+  assert.deepEqual(email, { from0: 'ada@example.com', from0Kind: 'email' });
+  assert.equal(fromAddressSql('m', 'from0', 'email'), 'lower(m.from_email) = @from0');
+
+  const local = {};
+  bindFromAddress(local, 'from0', 'ada');
+  assert.equal(local.from0Kind, 'local');
+  assert.match(fromAddressSql('m', 'from0', 'local'), /LIKE @from0 \|\| '@%'/);
+
+  const domain = {};
+  bindFromAddress(domain, 'from0', 'example.com');
+  assert.equal(domain.from0Kind, 'domain');
+  assert.match(fromAddressSql('m', 'from0', 'domain'), /LIKE '%@' \|\| @from0/);
 });
 
 test('analyzed filters require imported source and extra IMAP thread ids bypass FTS', () => {

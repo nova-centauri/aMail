@@ -45,3 +45,99 @@ export function sanitizeMessagesQuery(query = {}) {
     mailbox: mailbox ? (mailbox === 'INBOX' ? 'INBOX' : 'other') : null,
   };
 }
+
+export const MCP_TOOL_SLOW_MS = 1_000;
+
+/**
+ * MCP tool args for logs: operators, lengths, and limits only. No query
+ * text, addresses, message bodies, or ids.
+ */
+export function sanitizeMcpToolArgs(name, args = {}) {
+  const tool = String(name || '');
+  const input = args && typeof args === 'object' ? args : {};
+  switch (tool) {
+    case 'list_messages':
+    case 'start_deep_search':
+      return {
+        tool,
+        ...sanitizeMessagesQuery({
+          q: input.q,
+          folder: input.folder,
+          page: input.page,
+          pageSize: input.pageSize,
+          category: input.category,
+          flag: input.flag,
+          accountId: input.accountId,
+        }),
+      };
+    case 'get_thread':
+    case 'get_message':
+    case 'get_attachment':
+      return {
+        tool,
+        idChars: String(input.id || '').length,
+        ...(tool === 'get_attachment' ? { index: Number.isInteger(input.index) ? input.index : null } : {}),
+      };
+    case 'get_deep_search':
+    case 'cancel_deep_search':
+      return { tool, jobIdChars: String(input.jobId || '').length };
+    case 'list_providers':
+      return {
+        tool,
+        hasEmail: Boolean(input.email),
+        serverHostChars: String(input.serverHost || '').length,
+      };
+    case 'set_flags':
+      return { tool, flagCount: Array.isArray(input.flags) ? input.flags.length : 0 };
+    case 'list_unanalyzed_messages':
+      return {
+        tool,
+        hasAccountId: Boolean(input.accountId),
+        pageSize: parsePageSize(input.pageSize),
+        hasCursor: Boolean(input.cursor),
+      };
+    case 'get_analysis_status':
+    case 'mark_messages_analyzed':
+      return { tool, idCount: Array.isArray(input.ids) ? input.ids.length : 0 };
+    case 'message_action':
+      return {
+        tool,
+        action: String(input.action || '').slice(0, 32),
+        idChars: String(input.id || '').length,
+        hasUntil: Boolean(input.until),
+      };
+    case 'send_message':
+      return {
+        tool,
+        toCount: Array.isArray(input.to) ? input.to.length : 0,
+        ccCount: Array.isArray(input.cc) ? input.cc.length : 0,
+        bccCount: Array.isArray(input.bcc) ? input.bcc.length : 0,
+        subjectChars: String(input.subject || '').length,
+        textChars: String(input.textBody || '').length,
+        attachmentCount: Array.isArray(input.attachments) ? input.attachments.length : 0,
+      };
+    case 'add_account':
+    case 'update_account':
+    case 'test_account':
+      return { tool, hasEmail: Boolean(input.email || input.accountId), providerSet: Boolean(input.provider) };
+    case 'delete_account':
+      return { tool, idChars: String(input.id || input.accountId || '').length };
+    default:
+      return { tool, argKeys: Object.keys(input).sort().slice(0, 24) };
+  }
+}
+
+export function logMcpToolCall(logger, name, args, durationMs) {
+  const fields = {
+    event: 'mcp_tool',
+    tool: String(name || ''),
+    args: sanitizeMcpToolArgs(name, args),
+    durationMs: Math.round(Number(durationMs) || 0),
+  };
+  if (fields.durationMs >= MCP_TOOL_SLOW_MS) {
+    logger?.warn?.(fields, 'Slow MCP tool');
+    return fields;
+  }
+  logger?.info?.(fields, 'MCP tool');
+  return fields;
+}
