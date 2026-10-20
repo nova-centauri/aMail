@@ -32,3 +32,9 @@ export class ServiceUnavailableError extends AppError {
     super(message, { status: 503, code, expose: true });
   }
 }
+
+export class QueryDeadlineError extends AppError {
+  constructor(message = 'Search took too long. Narrow the query with a more specific from:, to:, subject:, after:, or phrase and try again.') {
+    super(message, { status: 408, code: 'QUERY_DEADLINE', expose: true });
+  }
+}

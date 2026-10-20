@@ -11,7 +11,14 @@ export function registerMcp(app, { config, repos, mailService, remoteContent, au
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const gate = accessGate(auth);
   const handleMcp = async (request, response) => {
-    const server = createAmailMcpServer({ config, repos, mailService, remoteContent, deepSearch: searchJobs });
+    const server = createAmailMcpServer({
+      config,
+      repos,
+      mailService,
+      remoteContent,
+      deepSearch: searchJobs,
+      logger: request.log,
+    });
     let transport;
     let closed = false;
     const cleanup = async () => {

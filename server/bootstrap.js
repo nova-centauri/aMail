@@ -9,6 +9,7 @@ import { createVault } from './vault.js';
 import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
 import { createSearchEngine } from './services/search-engine.js';
+import { createSearchRead } from './services/search-read.js';
 import { backgroundReceiptPlan, INBOX_PROBE_START_DELAY_MS } from './mail/receipt-path.js';
 
 /**
@@ -76,16 +77,20 @@ export function createHarness({ config, logger }) {
     const remoteContent = createRemoteContentService({ config: runtimeConfig, repos, logger });
     const mailService = createMailService({ config: runtimeConfig, repos, logger, metering });
     const searchEngine = createSearchEngine({ config: runtimeConfig, repos, logger });
+    const searchRead = createSearchRead({ config: runtimeConfig, logger });
     repos.setSearchIndexer((event) => searchEngine.noteWrite(event));
     repos.searchEngine = searchEngine;
+    repos.searchRead = searchRead;
     return {
       config: runtimeConfig,
       repos,
       remoteContent,
       mailService,
       searchEngine,
+      searchRead,
       async close() {
         searchEngine.stop();
+        await searchRead.close?.().catch(() => {});
         await mailService.close?.().catch(() => {});
         remoteContent.close().catch(() => {});
         repos.close();

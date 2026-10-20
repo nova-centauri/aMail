@@ -11,6 +11,7 @@ import {
   sanitizeMessagesQuery,
   shouldLogRequestTiming,
 } from './request-timing.js';
+import { sanitizeMcpToolArgs } from '../services/messages-query-log.js';
 import { createInFlightRegistry } from '../services/in-flight-requests.js';
 
 test('poller paths are identified without treating every API route as a poller', () => {
@@ -174,4 +175,25 @@ test('requestStartFields never copies MCP arguments', () => {
   });
   assert.equal(fields.mcpTool, 'list_messages');
   assert.equal(JSON.stringify(fields).includes('from:ada'), false);
+});
+
+test('MCP tool args keep operators and lengths and drop addresses', () => {
+  const listed = sanitizeMcpToolArgs('list_messages', {
+    q: 'from:ada@example.test quarterly',
+    folder: 'inbox',
+    page: 2,
+    pageSize: 25,
+    accountId: 'acct-secret',
+  });
+  assert.equal(listed.tool, 'list_messages');
+  assert.equal(listed.hasQuery, true);
+  assert.deepEqual(listed.operators, ['from', 'text']);
+  assert.equal(listed.queryChars, 'from:ada@example.test quarterly'.length);
+  assert.equal(listed.hasAccountId, true);
+  assert.equal(JSON.stringify(listed).includes('ada@example.test'), false);
+  assert.equal(JSON.stringify(listed).includes('quarterly'), false);
+  assert.equal(JSON.stringify(listed).includes('acct-secret'), false);
+
+  const thread = sanitizeMcpToolArgs('get_thread', { id: 'thr-secret-id' });
+  assert.deepEqual(thread, { tool: 'get_thread', idChars: 'thr-secret-id'.length });
 });

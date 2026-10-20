@@ -57,6 +57,46 @@ function likeHaystack(alias, columns, param) {
 }
 
 /**
+ * Bind a Gmail-style from: token to an indexed from_email lookup.
+ * Exact addresses seek; local-parts are a prefix; domains scan the index.
+ */
+export function bindFromAddress(params, key, value) {
+  const token = String(value || '').trim().toLowerCase().replace(/^<|>$/g, '');
+  if (token.includes('@')) {
+    params[key] = token;
+    params[`${key}Kind`] = 'email';
+    return;
+  }
+  params[key] = escapeLike(token);
+  params[`${key}Kind`] = token.includes('.') ? 'domain' : 'local';
+}
+
+export function fromAddressSql(alias, key) {
+  return `(
+    CASE @${key}Kind
+      WHEN 'email' THEN lower(${alias}.from_email) = @${key}
+      WHEN 'domain' THEN lower(${alias}.from_email) LIKE '%@' || @${key} ESCAPE '\\'
+      ELSE (lower(${alias}.from_email) = @${key} OR lower(${alias}.from_email) LIKE @${key} || '@%' ESCAPE '\\')
+    END
+  )`;
+}
+
+function fromHitsCte(accountSql, fromValues, params) {
+  const arms = fromValues.map((value, index) => {
+    const key = `from${index}`;
+    bindFromAddress(params, key, value);
+    return `SELECT DISTINCT m.thread_id AS thread_id, m.account_id AS account_id
+      FROM messages m
+      WHERE ${accountSql}
+        AND ${folderPredicate('m')}
+        AND ${fromAddressSql('m', key)}`;
+  });
+  return `from_hits AS (
+      ${arms.join('\n      INTERSECT\n      ')}
+    )`;
+}
+
+/**
  * Default inbox polling only needs latest-message category + recency.
  * Operator/FTS filters still use the full per-thread stats CTE.
  */
@@ -281,16 +321,12 @@ export function buildConversationSearch(input = {}) {
   }
 
   const query = parsed && mailboxQueryIsActive(parsed) ? parsed : null;
+  const fromValues = query?.from?.length ? query.from : [];
   if (query) {
-    query.from.forEach((value, index) => {
-      const key = `from${index}`;
-      params[key] = likeContains(value);
-      filters.push(existsInThread('from_m', likeHaystack('from_m', ['from_name', 'from_email'], `@${key}`)));
-    });
     query.notFrom.forEach((value, index) => {
       const key = `notFrom${index}`;
-      params[key] = likeContains(value);
-      filters.push(`NOT ${existsInThread('nfrom_m', likeHaystack('nfrom_m', ['from_name', 'from_email'], `@${key}`))}`);
+      bindFromAddress(params, key, value);
+      filters.push(`NOT ${existsInThread('nfrom_m', fromAddressSql('nfrom_m', key))}`);
     });
     query.to.forEach((value, index) => {
       const key = `to${index}`;
@@ -376,7 +412,11 @@ export function buildConversationSearch(input = {}) {
     category ? 'stats.latest_category = @category' : '',
   ].filter(Boolean);
   const pageWhereSql = pageWhere.length ? `WHERE ${pageWhere.join('\n      AND ')}` : '';
-  const cte = `WITH ranked AS (
+  const fromCte = fromValues.length ? `${fromHitsCte(accountSql, fromValues, params)},\n    ` : '';
+  const fromJoin = fromValues.length
+    ? 'JOIN from_hits from_h ON from_h.thread_id = m.thread_id AND from_h.account_id = m.account_id'
+    : '';
+  const cte = `WITH ${fromCte}ranked AS (
       SELECT
         m.thread_id AS thread_id,
         m.account_id AS account_id,
@@ -394,6 +434,7 @@ export function buildConversationSearch(input = {}) {
           ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.id DESC
         ) AS rk
       FROM messages m
+      ${fromJoin}
       WHERE ${accountSql}
         AND ${folderPredicate('m')}
     ),

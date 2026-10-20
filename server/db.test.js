@@ -14,6 +14,7 @@ import {
 } from './db.js';
 import { deriveSubkey } from './services/crypto.js';
 import { buildConversationSearch } from './services/conversation-search.js';
+import { parseMailboxQuery } from './mail/search-query.js';
 
 function tempConfig(t, extra = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-db-'));
@@ -492,6 +493,34 @@ test('inbox listing installs the covering poller index', (t) => {
   assert.match(plan, /idx_messages_inbox_list/);
   assert.doesNotMatch(plan, /idx_messages_folder/);
   assert.doesNotMatch(plan, /MATERIALIZE latest/);
+});
+
+test('from: search uses the from_email index instead of a table scan', (t) => {
+  const db = createDatabase(tempConfig(t));
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const index = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_from_email'`).get();
+  assert.ok(index);
+  assert.match(index.sql, /lower\(from_email\)/);
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-10-17T00:00:00.000Z',
+  });
+  repos.messages.upsert(messageFields(account.id, thread.id, { from_email: 'friend@example.test' }));
+  const built = buildConversationSearch({
+    accountIds: [account.id],
+    folder: 'inbox',
+    parsed: parseMailboxQuery('from:friend@example.test'),
+    hideQuiet: false,
+    limit: 50,
+    offset: 0,
+    nowIso: '2026-10-17T00:00:00.000Z',
+  });
+  assert.match(built.pageSql, /from_hits/);
+  const plan = db.prepare(`EXPLAIN QUERY PLAN ${built.pageSql}`).all(built.params)
+    .map((row) => row.detail)
+    .join('\n');
+  assert.match(plan, /idx_messages_from_email/);
 });
 
 test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {

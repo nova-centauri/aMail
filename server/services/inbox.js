@@ -198,6 +198,9 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
       // The cache listing below is the same path used when Typesense is off.
     }
   }
+  if (typeof repos.searchRead?.searchConversations === 'function') {
+    return repos.searchRead.searchConversations(listArgs);
+  }
   return repos.messages.searchConversations(listArgs);
 }
 
