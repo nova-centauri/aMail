@@ -61,8 +61,8 @@ services:
       typesense:
         condition: service_started
     labels:
-      # Used only with `--profile autoheal`. Default false: the sidecar needs
-      # the Docker socket (root-equivalent on the host).
+      # Used only with `--profile autoheal`. Default false: autoheal will not
+      # restart this container unless you opt in.
       autoheal: ${AMAIL_AUTOHEAL:-false}
     healthcheck:
       test:
@@ -154,25 +154,96 @@ services:
       retries: 12
 
   # Opt-in. Restarts containers whose Docker HEALTHCHECK is unhealthy.
-  # Requires /var/run/docker.sock, which is root-equivalent on the host:
-  # anyone who can talk to that socket can start, stop, or exec any container.
   # Enable with:
   #   AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d
-  # aMail IMAP/SMTP do not need this. Use it only if you accept the socket
-  # trade-off instead of an external watch.
+  # Roll back with:
+  #   docker compose --profile autoheal stop socket-proxy autoheal
+  #   docker compose --profile autoheal rm -f socket-proxy autoheal
+  # aMail IMAP/SMTP do not need this. The Docker socket is still
+  # root-equivalent: only socket-proxy mounts it, read-only, and autoheal
+  # reaches Docker over TCP on the internal autoheal-net. The mounted
+  # HAProxy config allows list/inspect/restart (plus /_ping and /version)
+  # and returns 403 for everything else. Leave the profile off unless you
+  # accept that remaining trust boundary.
+  socket-proxy:
+    profiles:
+      - autoheal
+    image: tecnativa/docker-socket-proxy:0.4.1
+    restart: unless-stopped
+    init: true
+    # The published image runs as root so it can connect to the host socket.
+    # cap_drop does not remove that socket power; the allowlist does.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${AMAIL_SOCKET_PROXY_MEMORY_LIMIT:-64m}
+    environment:
+      LOG_LEVEL: warning
+      DISABLE_IPV6: "1"
+      # Fallback if the allowlist overlay is missing. POST=1 is required for
+      # restart on this image (ALLOW_RESTARTS is evaluated after the POST
+      # block), which would also permit create/stop/exec. The mounted
+      # haproxy.cfg.template is the real gate.
+      CONTAINERS: "1"
+      POST: "1"
+      ALLOW_RESTARTS: "1"
+      PING: "1"
+      VERSION: "1"
+      ALLOW_START: "0"
+      ALLOW_STOP: "0"
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      CONFIGS: "0"
+      DISTRIBUTION: "0"
+      EVENTS: "0"
+      EXEC: "0"
+      GRPC: "0"
+      IMAGES: "0"
+      INFO: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      PLUGINS: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SESSION: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      TASKS: "0"
+      VOLUMES: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/autoheal/haproxy.cfg.template:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+    networks:
+      - autoheal-net
+
   autoheal:
     profiles:
       - autoheal
     image: willfarrell/autoheal:1.2.0
     restart: unless-stopped
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${AMAIL_AUTOHEAL_MEMORY_LIMIT:-32m}
     environment:
       AUTOHEAL_CONTAINER_LABEL: autoheal
-      AUTOHEAL_INTERVAL: 10
-      AUTOHEAL_START_PERIOD: 60
+      AUTOHEAL_INTERVAL: ${AUTOHEAL_INTERVAL:-10}
+      AUTOHEAL_START_PERIOD: ${AUTOHEAL_START_PERIOD:-60}
+      # Documented TCP setting. willfarrell/autoheal:1.2.0's bundled
+      # entrypoint rewrites tcp:// to https:// and also requires
+      # DOCKER_SOCK to exist as a file, so we overlay deploy/autoheal's
+      # entrypoint (plain HTTP, same monitor loop).
+      DOCKER_SOCK: tcp://socket-proxy:2375
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - ./deploy/autoheal/docker-entrypoint:/docker-entrypoint:ro
+    depends_on:
+      - socket-proxy
     networks:
-      - app-net
+      - autoheal-net
 
 volumes:
   # Upgrading from GigaMail? Point this at your existing volume instead:
@@ -195,3 +266,9 @@ networks:
   # Tor needs internet egress, but aMail is never attached to this network.
   tor-egress:
     driver: bridge
+  # Only socket-proxy and autoheal. No host ports, no app-net/privacy-net,
+  # no egress. Compromising autoheal still cannot reach the Docker socket
+  # except through the restart-only TCP allowlist.
+  autoheal-net:
+    driver: bridge
+    internal: true
