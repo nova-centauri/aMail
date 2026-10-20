@@ -78,7 +78,7 @@ jobs:
               const proxy = config.services?.["socket-proxy"];
               if (!autoheal || !proxy) fail("autoheal profile must define autoheal and socket-proxy");
               if (autoheal.image !== "willfarrell/autoheal:1.2.0") fail("autoheal image pin changed");
-              if (proxy.image !== "tecnativa/docker-socket-proxy:0.4.1") fail("socket-proxy image pin changed");
+              if (proxy.image !== "tecnativa/docker-socket-proxy:v0.4.1") fail("socket-proxy image pin changed");
               if (autoheal.environment?.DOCKER_SOCK !== "tcp://socket-proxy:2375") fail("autoheal must use DOCKER_SOCK=tcp://socket-proxy:2375");
               if (autoheal.environment?.AUTOHEAL_CONTAINER_LABEL !== "autoheal") fail("AUTOHEAL_CONTAINER_LABEL must stay autoheal");
               const sockMounts = (name, svc) => (svc.volumes || []).filter((mount) =>

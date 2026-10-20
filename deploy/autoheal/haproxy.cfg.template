@@ -1,4 +1,4 @@
-# Restart-only overlay for tecnativa/docker-socket-proxy:0.4.1.
+# Restart-only overlay for tecnativa/docker-socket-proxy:v0.4.1.
 # The image's env flags cannot limit POST to /restart once CONTAINERS=1 and
 # POST=1 are set; those flags also allow create, start, stop, and exec.
 # Autoheal needs GET list/inspect and POST restart (plus /_ping and /version).
@@ -6,7 +6,6 @@ global
     log stdout format raw daemon "${LOG_LEVEL}"
     pidfile /run/haproxy.pid
     maxconn 4000
-    server-state-file /var/lib/haproxy/server-state
 
 defaults
     mode http
@@ -24,7 +23,6 @@ defaults
     timeout http-keep-alive 10s
     timeout check 10s
     maxconn 3000
-    load-server-state-from-file global
     errorfile 400 /usr/local/etc/haproxy/errors/400.http
     errorfile 403 /usr/local/etc/haproxy/errors/403.http
     errorfile 408 /usr/local/etc/haproxy/errors/408.http

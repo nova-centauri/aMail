@@ -168,7 +168,7 @@ services:
   socket-proxy:
     profiles:
       - autoheal
-    image: tecnativa/docker-socket-proxy:0.4.1
+    image: tecnativa/docker-socket-proxy:v0.4.1
     restart: unless-stopped
     init: true
     # The published image runs as root so it can connect to the host socket.

@@ -437,7 +437,7 @@ again.
 Trust boundary: `/var/run/docker.sock` is still root-equivalent on the host.
 The change is who can talk to it.
 
-- Only `socket-proxy` (`tecnativa/docker-socket-proxy:0.4.1`) mounts the
+- Only `socket-proxy` (`tecnativa/docker-socket-proxy:v0.4.1`) mounts the
   socket, and it mounts it read-only. It publishes no host ports.
 - `autoheal` (`willfarrell/autoheal:1.2.0`) has no socket mount. It uses the
   documented `DOCKER_SOCK=tcp://socket-proxy:2375` setting. The 1.2.0 image
