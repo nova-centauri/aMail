@@ -51,7 +51,10 @@ jobs:
           cp .env.example .env
           sh -n deploy/launch.sh
           sh -n deploy/docker-entrypoint.sh
+          bash -n deploy/autoheal/docker-entrypoint
+          sh -n scripts/test-autoheal-proxy.sh
           docker compose --env-file .env --profile privacy config --quiet
+          docker compose --env-file .env --profile autoheal config --quiet
           docker compose --env-file .env --profile privacy config --format json | node -e '
             let input = "";
             process.stdin.setEncoding("utf8");
@@ -63,6 +66,59 @@ jobs:
               if (!service || dataMount?.type !== "volume" || dataMount.source !== "amail-data" ||
                 typeof service.environment?.AMAIL_ENCRYPTION_KEY !== "string") process.exit(1);
             });
+          '
+          docker compose --env-file .env --profile autoheal config --format json | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const config = JSON.parse(input);
+              const fail = (message) => { console.error(message); process.exit(1); };
+              const autoheal = config.services?.autoheal;
+              const proxy = config.services?.["socket-proxy"];
+              if (!autoheal || !proxy) fail("autoheal profile must define autoheal and socket-proxy");
+              if (autoheal.image !== "willfarrell/autoheal:1.2.0") fail("autoheal image pin changed");
+              if (proxy.image !== "tecnativa/docker-socket-proxy:v0.4.1") fail("socket-proxy image pin changed");
+              if (autoheal.environment?.DOCKER_SOCK !== "tcp://socket-proxy:2375") fail("autoheal must use DOCKER_SOCK=tcp://socket-proxy:2375");
+              if (autoheal.environment?.AUTOHEAL_CONTAINER_LABEL !== "autoheal") fail("AUTOHEAL_CONTAINER_LABEL must stay autoheal");
+              const sockMounts = (name, svc) => (svc.volumes || []).filter((mount) =>
+                mount.source === "/var/run/docker.sock" || mount.target === "/var/run/docker.sock");
+              if (sockMounts("autoheal", autoheal).length) fail("autoheal must not mount docker.sock");
+              const proxySock = sockMounts("socket-proxy", proxy);
+              if (proxySock.length !== 1 || proxySock[0].read_only !== true) fail("socket-proxy must be the read-only docker.sock mount");
+              for (const [name, svc] of Object.entries(config.services || {})) {
+                if (name === "socket-proxy") continue;
+                if (sockMounts(name, svc).length) fail(name + " must not mount docker.sock");
+              }
+              const netNames = (svc) => Object.keys(svc.networks || {});
+              if (netNames(autoheal).join() !== "autoheal-net") fail("autoheal must be only on autoheal-net");
+              if (netNames(proxy).join() !== "autoheal-net") fail("socket-proxy must be only on autoheal-net");
+              if (config.networks?.["autoheal-net"]?.internal !== true) fail("autoheal-net must be internal");
+              if ((autoheal.ports || []).length || (proxy.ports || []).length) fail("autoheal profile must not publish host ports");
+              const amail = config.services?.amail;
+              if (amail && netNames(amail).includes("autoheal-net")) fail("amail must not join autoheal-net");
+              if (String(amail?.labels?.autoheal ?? "") !== "false") fail("AMAIL_AUTOHEAL must default false");
+              const depends = autoheal.depends_on || {};
+              const dependsOnProxy = Array.isArray(depends)
+                ? depends.includes("socket-proxy")
+                : Object.prototype.hasOwnProperty.call(depends, "socket-proxy");
+              if (!dependsOnProxy) fail("autoheal must depend_on socket-proxy");
+            });
+          '
+          node -e '
+            const fs = require("fs");
+            const cfg = fs.readFileSync("deploy/autoheal/haproxy.cfg.template", "utf8");
+            const fail = (message) => { console.error(message); process.exit(1); };
+            if (/containers\/\[a-zA-Z0-9_.-\]\+\/json/.test(cfg)) {
+              fail("HAProxy must not allow GET /containers/{id}/json (inspect leaks Config.Env)");
+            }
+            if (!cfg.includes("/containers/json$")) {
+              fail("HAProxy must allow GET /containers/json");
+            }
+            if (!cfg.includes("containers/[a-zA-Z0-9_.-]+/restart")) {
+              fail("HAProxy must allow POST /containers/{id}/restart");
+            }
+            if (!/http-request deny/.test(cfg)) fail("HAProxy must deny unmatched paths");
           '
 
       - name: Build application and privacy images
@@ -152,12 +208,27 @@ jobs:
           docker rm --force --volumes amail-keyslot-ci >/dev/null 2>&1 || true
           docker volume rm amail-keyslot-ci >/dev/null 2>&1 || true
 
+  autoheal:
+    name: Autoheal socket-proxy allowlist
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AMAIL_AUTOHEAL_TEST_PROJECT: amail-autoheal-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Restart an unhealthy container through the restart-only proxy
+        run: sh scripts/test-autoheal-proxy.sh
+
   # Deployments watch the `release` branch, not `main`: it only ever moves to a
   # commit the job above has fully verified. The push is fast-forward only, so
   # a slower run for an older commit can never move it backwards.
   promote:
     name: Promote the tested commit to release
-    needs: verify
+    needs:
+      - verify
+      - autoheal
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5

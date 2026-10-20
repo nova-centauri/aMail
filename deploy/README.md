@@ -1,9 +1,11 @@
 # aMail Docker deployment
 
 This Compose bundle is isolated from other Docker workloads: it uses its own
-project-scoped containers, networks, and named volumes, never mounts the
-Docker socket, and never uses `down`, `prune`, or `--remove-orphans` in its
-launch helper. Its normal operations are scoped to this project.
+project-scoped containers, networks, and named volumes, and never uses `down`,
+`prune`, or `--remove-orphans` in its launch helper. The default path does not
+mount the Docker socket. The opt-in `autoheal` profile does, through a
+restart-only socket proxy (see below). Normal operations stay scoped to this
+project.
 
 ## First launch
 
@@ -394,9 +396,8 @@ Poll `get_sync_job` or `GET /api/sync/jobs/:jobId`. `/api/health` reports
 unhealthy (HTTP 503) when event-loop lag stays above
 `AMAIL_EVENT_LOOP_LAG_MS` or a single-flight sync is older than
 `AMAIL_SYNC_ACCOUNT_TIMEOUT_MS`. Docker already HEALTHCHECKs that endpoint.
-Restart-on-unhealthy is opt-in: `AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d`
-mounts `/var/run/docker.sock` into a sidecar (root-equivalent on the host).
-Leave that profile off unless you accept that trade-off.
+Restart-on-unhealthy is opt-in (see below) and stays off unless you pass
+`--profile autoheal` with `AMAIL_AUTOHEAL=true`.
 
 Agents that poll should pass `maxAgeSeconds` to `sync_mail` (or
 `POST /api/sync`) for the same reason. `SYNC_INTERVAL_MINUTES` is the
@@ -404,14 +405,77 @@ folder walk, not the inbox wait (15 minutes in keyslot mode, 5 in the
 supplied `.env.example`). Set `AMAIL_DEBUG_TIMING=1` for per-phase logs, or
 `AMAIL_CPU_PROF=1` to write Node `--cpu-prof` files under the data directory.
 
+## Optional restart-on-unhealthy (autoheal)
+
+Docker restarts a container on process exit when `restart:` says so. It does
+**not** restart a container that stays up but whose `HEALTHCHECK` is
+unhealthy. The opt-in `autoheal` profile adds that watch.
+
+Enable:
+
+```sh
+AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d
+```
+
+`autoheal` `depends_on` `socket-proxy`. A `docker compose up --no-deps`
+command skips that edge, so it must name `socket-proxy` explicitly (for
+example `docker compose --profile autoheal up -d --no-deps socket-proxy
+autoheal`). `up --no-deps autoheal` on its own starts the watcher with no
+proxy to talk to.
+
+`AMAIL_AUTOHEAL` defaults to `false`, so aMail is not labeled for restart
+until you set it. `AUTOHEAL_CONTAINER_LABEL` stays `autoheal`. IMAP/SMTP do
+not need this; use it only if you want Compose to bounce an unhealthy aMail
+instead of an external watch.
+
+Roll back (leave aMail running):
+
+```sh
+docker compose --profile autoheal stop socket-proxy autoheal
+docker compose --profile autoheal rm -f socket-proxy autoheal
+```
+
+The next `sh deploy/launch.sh` does not pass `--profile autoheal`, so the
+sidecars stay gone. Set `AMAIL_AUTOHEAL=false` (or unset it) so the aMail
+container is no longer labeled for restart if you later start the profile
+again.
+
+Trust boundary: `/var/run/docker.sock` is still root-equivalent on the host.
+The change is who can talk to it.
+
+- Only `socket-proxy` (`tecnativa/docker-socket-proxy:v0.4.1`) mounts the
+  socket, and it mounts it read-only. It publishes no host ports.
+- `autoheal` (`willfarrell/autoheal:1.2.0`) has no socket mount. It uses the
+  documented `DOCKER_SOCK=tcp://socket-proxy:2375` setting. The 1.2.0 image
+  treats `tcp://` as HTTPS and requires `DOCKER_SOCK` to exist as a file, so
+  Compose overlays `deploy/autoheal/docker-entrypoint` for plain HTTP.
+- Both services sit only on `autoheal-net` (`internal: true`). They are not
+  on `app-net` or `privacy-net`.
+- Tecnativa's env flags cannot limit `POST` to restart once `CONTAINERS=1`
+  and `POST=1` are set (create, stop, and exec would also match). Compose
+  therefore overlays `deploy/autoheal/haproxy.cfg.template`: allow `GET
+  /containers/json` (list, including autoheal's health and label filters)
+  and `POST /containers/{id}/restart`, plus `/_ping` and `/version`; 403
+  everything else. Inspect (`GET /containers/{id}/json`) is denied because
+  it returns `Config.Env` and would expose secrets from every container on
+  the host.
+
+A process that can talk to the proxy can list containers and restart them.
+It cannot inspect (no `Config.Env`), exec, create, delete, or touch images,
+volumes, networks, build, swarm, or secrets through that TCP endpoint.
+Compromising `socket-proxy` itself is still host-root equivalent, which is
+why the profile stays off by default. `scripts/test-autoheal-proxy.sh`
+checks the allow/deny set against a dummy labeled container.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` runs on pull requests and pushes to `main`: the Node
 tests, production build, dependency audit, Compose validation, both Docker
 builds, a live health check of the started image, an unauthenticated API
 check, a boot with a GigaMail-era `.env` to prove the compatibility
-fallbacks, and a boot of the same image in keyslot mode (locked, provisioned,
-unlocked by the returned token, locked again after a restart).
+fallbacks, a boot of the same image in keyslot mode (locked, provisioned,
+unlocked by the returned token, locked again after a restart), and the
+opt-in autoheal socket-proxy allowlist (`scripts/test-autoheal-proxy.sh`).
 
 When all of that passes for a push to `main`, a final job fast-forwards the
 **`release`** branch to that commit. `release` therefore only ever points at

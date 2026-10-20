@@ -1,0 +1,48 @@
+# Restart-only overlay for tecnativa/docker-socket-proxy:v0.4.1.
+# The image's env flags cannot limit POST to /restart once CONTAINERS=1 and
+# POST=1 are set; those flags also allow create, start, stop, and exec.
+# Autoheal needs GET /containers/json (list, with health/label filters) and
+# POST restart (plus /_ping and /version). Inspect is denied: GET
+# /containers/{id}/json returns Config.Env and would leak secrets.
+global
+    log stdout format raw daemon "${LOG_LEVEL}"
+    pidfile /run/haproxy.pid
+    maxconn 4000
+
+defaults
+    mode http
+    log global
+    option httplog
+    option dontlognull
+    option http-server-close
+    option redispatch
+    retries 3
+    timeout http-request 10s
+    timeout queue 1m
+    timeout connect 10s
+    timeout client 10m
+    timeout server 10m
+    timeout http-keep-alive 10s
+    timeout check 10s
+    maxconn 3000
+    errorfile 400 /usr/local/etc/haproxy/errors/400.http
+    errorfile 403 /usr/local/etc/haproxy/errors/403.http
+    errorfile 408 /usr/local/etc/haproxy/errors/408.http
+    errorfile 500 /usr/local/etc/haproxy/errors/500.http
+    errorfile 502 /usr/local/etc/haproxy/errors/502.http
+    errorfile 503 /usr/local/etc/haproxy/errors/503.http
+    errorfile 504 /usr/local/etc/haproxy/errors/504.http
+
+backend dockerbackend
+    server dockersocket $SOCKET_PATH
+
+frontend dockerfrontend
+    bind ${BIND_CONFIG}
+
+    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/_ping$ }
+    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/version$ }
+    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/json$ }
+    http-request allow if METH_POST { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/[a-zA-Z0-9_.-]+/restart$ }
+    http-request deny deny_status 403
+
+    default_backend dockerbackend
