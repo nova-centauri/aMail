@@ -522,8 +522,9 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_messages_inbox_list
       ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id, smart_category, snoozed_until)
       WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0;
+    DROP INDEX IF EXISTS idx_messages_from_email;
     CREATE INDEX IF NOT EXISTS idx_messages_from_email
-      ON messages(account_id, lower(from_email));
+      ON messages(lower(from_email), account_id);
   `);
 
   // Rules are partly operator-configured (ops-digest sources), so a changed

@@ -24,6 +24,7 @@ test('conversation search SQL paginates in SQLite and pushes operators into pred
   assert.doesNotMatch(built.pageSql, /\b500\b/);
   assert.match(built.pageSql, /messages_fts MATCH @ftsQuery/);
   assert.match(built.pageSql, /from_hits/);
+  assert.match(built.pageSql, /INDEXED BY idx_messages_from_email/);
   assert.match(built.pageSql, /lower\(m\.from_email\) = @from0/);
   assert.doesNotMatch(built.pageSql, /from_name/);
   assert.match(built.pageSql, /has_attachment = 1/);
@@ -38,17 +39,17 @@ test('from: binds to the indexed address column instead of a leading-wildcard LI
   const email = {};
   bindFromAddress(email, 'from0', 'Ada@Example.com');
   assert.deepEqual(email, { from0: 'ada@example.com', from0Kind: 'email' });
-  assert.match(fromAddressSql('m', 'from0'), /lower\(m\.from_email\) = @from0/);
+  assert.equal(fromAddressSql('m', 'from0', 'email'), 'lower(m.from_email) = @from0');
 
   const local = {};
   bindFromAddress(local, 'from0', 'ada');
   assert.equal(local.from0Kind, 'local');
-  assert.match(fromAddressSql('m', 'from0'), /LIKE @from0 \|\| '@%'/);
+  assert.match(fromAddressSql('m', 'from0', 'local'), /LIKE @from0 \|\| '@%'/);
 
   const domain = {};
   bindFromAddress(domain, 'from0', 'example.com');
   assert.equal(domain.from0Kind, 'domain');
-  assert.match(fromAddressSql('m', 'from0'), /LIKE '%@' \|\| @from0/);
+  assert.match(fromAddressSql('m', 'from0', 'domain'), /LIKE '%@' \|\| @from0/);
 });
 
 test('analyzed filters require imported source and extra IMAP thread ids bypass FTS', () => {

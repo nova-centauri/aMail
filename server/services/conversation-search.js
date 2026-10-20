@@ -71,14 +71,10 @@ export function bindFromAddress(params, key, value) {
   params[`${key}Kind`] = token.includes('.') ? 'domain' : 'local';
 }
 
-export function fromAddressSql(alias, key) {
-  return `(
-    CASE @${key}Kind
-      WHEN 'email' THEN lower(${alias}.from_email) = @${key}
-      WHEN 'domain' THEN lower(${alias}.from_email) LIKE '%@' || @${key} ESCAPE '\\'
-      ELSE (lower(${alias}.from_email) = @${key} OR lower(${alias}.from_email) LIKE @${key} || '@%' ESCAPE '\\')
-    END
-  )`;
+export function fromAddressSql(alias, key, kind) {
+  if (kind === 'email') return `lower(${alias}.from_email) = @${key}`;
+  if (kind === 'domain') return `lower(${alias}.from_email) LIKE '%@' || @${key} ESCAPE '\\'`;
+  return `(lower(${alias}.from_email) = @${key} OR lower(${alias}.from_email) LIKE @${key} || '@%' ESCAPE '\\')`;
 }
 
 function fromHitsCte(accountSql, fromValues, params) {
@@ -86,10 +82,10 @@ function fromHitsCte(accountSql, fromValues, params) {
     const key = `from${index}`;
     bindFromAddress(params, key, value);
     return `SELECT DISTINCT m.thread_id AS thread_id, m.account_id AS account_id
-      FROM messages m
-      WHERE ${accountSql}
-        AND ${folderPredicate('m')}
-        AND ${fromAddressSql('m', key)}`;
+      FROM messages m INDEXED BY idx_messages_from_email
+      WHERE ${fromAddressSql('m', key, params[`${key}Kind`])}
+        AND ${accountSql}
+        AND ${folderPredicate('m')}`;
   });
   return `from_hits AS (
       ${arms.join('\n      INTERSECT\n      ')}
@@ -326,7 +322,7 @@ export function buildConversationSearch(input = {}) {
     query.notFrom.forEach((value, index) => {
       const key = `notFrom${index}`;
       bindFromAddress(params, key, value);
-      filters.push(`NOT ${existsInThread('nfrom_m', fromAddressSql('nfrom_m', key))}`);
+      filters.push(`NOT ${existsInThread('nfrom_m', fromAddressSql('nfrom_m', key, params[`${key}Kind`]))}`);
     });
     query.to.forEach((value, index) => {
       const key = `to${index}`;

@@ -501,7 +501,7 @@ test('from: search uses the from_email index instead of a table scan', (t) => {
   t.after(() => repos.close());
   const index = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_from_email'`).get();
   assert.ok(index);
-  assert.match(index.sql, /lower\(from_email\)/);
+  assert.match(index.sql, /lower\(from_email\), account_id/);
   const account = seedAccount(repos);
   const thread = repos.threads.create({
     account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-10-17T00:00:00.000Z',
