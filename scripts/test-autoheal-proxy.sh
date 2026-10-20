@@ -1,8 +1,8 @@
 #!/bin/sh
 # Exercise the opt-in autoheal compose profile against a real Docker daemon:
 # autoheal restarts an unhealthy labeled container through socket-proxy, and
-# the proxy allowlist permits list/inspect/restart while denying stop, exec,
-# create, delete, and images.
+# the proxy allowlist permits list and restart while denying inspect, stop,
+# exec, create, delete, and images.
 set -eu
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -28,9 +28,11 @@ export AMAIL_AUTOHEAL=true
 
 PROBE_NAME="${COMPOSE_PROJECT_NAME}-probe"
 COMPOSE="docker compose --profile autoheal"
-# Operators enable the sidecar with `--profile autoheal up`; this script starts
-# only the profile services so we do not build or boot aMail.
-COMPOSE_UP="$COMPOSE up -d socket-proxy autoheal"
+# Operators enable the sidecar with `--profile autoheal up`. This script
+# starts only the profile services so we do not build or boot aMail.
+# autoheal depends_on socket-proxy; --no-deps skips that edge, so both
+# names must be listed.
+COMPOSE_UP="$COMPOSE up -d --no-deps socket-proxy autoheal"
 
 cleanup() {
   status=$?
@@ -172,7 +174,21 @@ list_code=$(proxy_curl GET /containers/json)
 report GET /containers/json 200 "$list_code"
 
 inspect_code=$(proxy_curl GET "/containers/${PROBE_ID}/json")
-report GET /containers/{id}/json 200 "$inspect_code"
+report GET /containers/{id}/json 403 "$inspect_code"
+inspect_body=$($COMPOSE exec -T autoheal cat /tmp/autoheal-proxy-body 2>/dev/null || true)
+case "$inspect_body" in
+  *'"Config"'*|*'Config.Env'*|*'"Env"'*)
+    echo "GET /containers/{id}/json was denied but the body still looks like inspect (would leak Config.Env):" >&2
+    printf '%s\n' "$inspect_body" >&2
+    fail=1
+    ;;
+esac
+if [ "$inspect_code" != "403" ]; then
+  echo "GET /containers/{id}/json must be denied (inspect exposes Config.Env)." >&2
+  fail=1
+fi
+inspect_v_code=$(proxy_curl GET "/v1.41/containers/${PROBE_ID}/json")
+report GET /v1.41/containers/{id}/json 403 "$inspect_v_code"
 
 restart_code=$(proxy_curl POST "/containers/${PROBE_ID}/restart?t=1")
 if [ "$restart_code" = "200" ] || [ "$restart_code" = "204" ]; then
@@ -246,6 +262,7 @@ $COMPOSE logs --no-color --timestamps --tail 50 socket-proxy || true
 
 if [ "$restarted" -ne 1 ]; then
   echo "autoheal did not restart the unhealthy labeled container through the proxy." >&2
+  echo "STOP: inspect stays denied. If 1.2.0 required GET /containers/{id}/json, report that rather than re-allowing it." >&2
   exit 1
 fi
 if ! $COMPOSE logs --no-color autoheal | grep -q "found to be unhealthy"; then

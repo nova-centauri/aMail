@@ -1,7 +1,9 @@
 # Restart-only overlay for tecnativa/docker-socket-proxy:v0.4.1.
 # The image's env flags cannot limit POST to /restart once CONTAINERS=1 and
 # POST=1 are set; those flags also allow create, start, stop, and exec.
-# Autoheal needs GET list/inspect and POST restart (plus /_ping and /version).
+# Autoheal needs GET /containers/json (list, with health/label filters) and
+# POST restart (plus /_ping and /version). Inspect is denied: GET
+# /containers/{id}/json returns Config.Env and would leak secrets.
 global
     log stdout format raw daemon "${LOG_LEVEL}"
     pidfile /run/haproxy.pid
@@ -40,7 +42,6 @@ frontend dockerfrontend
     http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/_ping$ }
     http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/version$ }
     http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/json$ }
-    http-request allow if METH_GET { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/[a-zA-Z0-9_.-]+/json$ }
     http-request allow if METH_POST { path,url_dec -m reg -i ^(/v[\d\.]+)?/containers/[a-zA-Z0-9_.-]+/restart$ }
     http-request deny deny_status 403
 

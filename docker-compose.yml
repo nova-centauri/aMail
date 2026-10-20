@@ -162,9 +162,11 @@ services:
   # aMail IMAP/SMTP do not need this. The Docker socket is still
   # root-equivalent: only socket-proxy mounts it, read-only, and autoheal
   # reaches Docker over TCP on the internal autoheal-net. The mounted
-  # HAProxy config allows list/inspect/restart (plus /_ping and /version)
-  # and returns 403 for everything else. Leave the profile off unless you
-  # accept that remaining trust boundary.
+  # HAProxy config allows list and restart (plus /_ping and /version) and
+  # returns 403 for everything else, including inspect (Config.Env). Leave
+  # the profile off unless you accept that remaining trust boundary.
+  # autoheal depends_on socket-proxy: a `docker compose up --no-deps`
+  # command must name socket-proxy explicitly or the TCP endpoint is gone.
   socket-proxy:
     profiles:
       - autoheal

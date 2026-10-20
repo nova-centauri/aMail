@@ -98,7 +98,27 @@ jobs:
               const amail = config.services?.amail;
               if (amail && netNames(amail).includes("autoheal-net")) fail("amail must not join autoheal-net");
               if (String(amail?.labels?.autoheal ?? "") !== "false") fail("AMAIL_AUTOHEAL must default false");
+              const depends = autoheal.depends_on || {};
+              const dependsOnProxy = Array.isArray(depends)
+                ? depends.includes("socket-proxy")
+                : Object.prototype.hasOwnProperty.call(depends, "socket-proxy");
+              if (!dependsOnProxy) fail("autoheal must depend_on socket-proxy");
             });
+          '
+          node -e '
+            const fs = require("fs");
+            const cfg = fs.readFileSync("deploy/autoheal/haproxy.cfg.template", "utf8");
+            const fail = (message) => { console.error(message); process.exit(1); };
+            if (/containers\/\[a-zA-Z0-9_.-\]\+\/json/.test(cfg)) {
+              fail("HAProxy must not allow GET /containers/{id}/json (inspect leaks Config.Env)");
+            }
+            if (!cfg.includes("/containers/json$")) {
+              fail("HAProxy must allow GET /containers/json");
+            }
+            if (!cfg.includes("containers/[a-zA-Z0-9_.-]+/restart")) {
+              fail("HAProxy must allow POST /containers/{id}/restart");
+            }
+            if (!/http-request deny/.test(cfg)) fail("HAProxy must deny unmatched paths");
           '
 
       - name: Build application and privacy images

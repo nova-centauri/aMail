@@ -417,6 +417,12 @@ Enable:
 AMAIL_AUTOHEAL=true docker compose --profile autoheal up -d
 ```
 
+`autoheal` `depends_on` `socket-proxy`. A `docker compose up --no-deps`
+command skips that edge, so it must name `socket-proxy` explicitly (for
+example `docker compose --profile autoheal up -d --no-deps socket-proxy
+autoheal`). `up --no-deps autoheal` on its own starts the watcher with no
+proxy to talk to.
+
 `AMAIL_AUTOHEAL` defaults to `false`, so aMail is not labeled for restart
 until you set it. `AUTOHEAL_CONTAINER_LABEL` stays `autoheal`. IMAP/SMTP do
 not need this; use it only if you want Compose to bounce an unhealthy aMail
@@ -448,16 +454,18 @@ The change is who can talk to it.
 - Tecnativa's env flags cannot limit `POST` to restart once `CONTAINERS=1`
   and `POST=1` are set (create, stop, and exec would also match). Compose
   therefore overlays `deploy/autoheal/haproxy.cfg.template`: allow `GET
-  /containers/json`, `GET /containers/{id}/json`, `POST
-  /containers/{id}/restart`, plus `/_ping` and `/version`; 403 everything
-  else.
+  /containers/json` (list, including autoheal's health and label filters)
+  and `POST /containers/{id}/restart`, plus `/_ping` and `/version`; 403
+  everything else. Inspect (`GET /containers/{id}/json`) is denied because
+  it returns `Config.Env` and would expose secrets from every container on
+  the host.
 
 A process that can talk to the proxy can list containers and restart them.
-It cannot exec, create, delete, or touch images, volumes, networks, build,
-swarm, or secrets through that TCP endpoint. Compromising `socket-proxy`
-itself is still host-root equivalent, which is why the profile stays off by
-default. `scripts/test-autoheal-proxy.sh` checks the allow/deny set against
-a dummy labeled container.
+It cannot inspect (no `Config.Env`), exec, create, delete, or touch images,
+volumes, networks, build, swarm, or secrets through that TCP endpoint.
+Compromising `socket-proxy` itself is still host-root equivalent, which is
+why the profile stays off by default. `scripts/test-autoheal-proxy.sh`
+checks the allow/deny set against a dummy labeled container.
 
 ## Continuous integration
 
