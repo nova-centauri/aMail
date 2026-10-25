@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import { ServiceUnavailableError, ValidationError } from '../errors.js';
 
 const VERSION = 'v1';
+const CAPABILITY_VERSION = 'v2';
+const CAPABILITY_AAD = Buffer.from('amail/capability-token/v2', 'utf8');
 const encode = (value) => Buffer.from(value).toString('base64url');
 const decode = (value) => Buffer.from(value, 'base64url');
 
@@ -81,5 +83,46 @@ export function readSignedToken(token, key) {
     return JSON.parse(decode(encodedPayload).toString('utf8'));
   } catch {
     throw new ValidationError('The remote-content token is malformed.');
+  }
+}
+
+/**
+ * Short-lived capability URLs are routinely visible to browsers and reverse
+ * proxies. Encrypt their payload as well as authenticating it so a remote
+ * image URL, message id, or attachment index is not exposed in the query
+ * string. AES-GCM's random IV also prevents two equal capabilities from being
+ * linkable by their token value.
+ */
+export function createCapabilityToken(payload, key) {
+  requireKey(key);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(CAPABILITY_AAD);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  return [CAPABILITY_VERSION, encode(iv), encode(cipher.getAuthTag()), encode(ciphertext)].join('.');
+}
+
+export function readCapabilityToken(token, key) {
+  requireKey(key);
+  const value = String(token || '');
+  if (!value.startsWith(`${CAPABILITY_VERSION}.`)) {
+    // Tokens live for at most an hour (five minutes by default). Accepting the
+    // old signed form lets images already displayed across a rolling deploy
+    // finish loading; all newly issued tokens use the opaque form above.
+    return readSignedToken(value, key);
+  }
+
+  const [version, ivValue, tagValue, ciphertextValue, extra] = value.split('.');
+  if (version !== CAPABILITY_VERSION || !ivValue || !tagValue || !ciphertextValue || extra) {
+    throw new ValidationError('The capability token is invalid.');
+  }
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, decode(ivValue));
+    decipher.setAAD(CAPABILITY_AAD);
+    decipher.setAuthTag(decode(tagValue));
+    const plaintext = Buffer.concat([decipher.update(decode(ciphertextValue)), decipher.final()]);
+    return JSON.parse(plaintext.toString('utf8'));
+  } catch {
+    throw new ValidationError('The capability token is invalid.');
   }
 }

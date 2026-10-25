@@ -6,6 +6,8 @@ import {
   discoverAccountProvider,
   mailProviderCatalog,
   normalizeMailHost,
+  recipientList,
+  recipientsToHeader,
 } from './mail.js';
 
 test('hosted providers are discovered from email domains and use safe presets', () => {
@@ -86,4 +88,20 @@ test('provider catalog exposes setup metadata but no credentials', () => {
   assert.ok(catalog.some((provider) => provider.id === 'icloud'));
   assert.ok(catalog.some((provider) => provider.id === 'mailinabox' && provider.requiresServerHost));
   assert.doesNotMatch(JSON.stringify(catalog), /password\s*[:=]/i);
+});
+
+test('recipient headers reject controls and ambiguous addresses', () => {
+  assert.throws(() => recipientList([{ name: 'Visible\r\nBcc: hidden@example.test', email: 'visible@example.test' }], 'To'), {
+    code: 'VALIDATION_ERROR',
+  });
+  assert.throws(() => recipientList(['first@example.test; second@example.test'], 'To'), {
+    code: 'VALIDATION_ERROR',
+  });
+  assert.throws(() => recipientList([`${'a'.repeat(310)}@example.test`], 'To'), {
+    code: 'VALIDATION_ERROR',
+  });
+  assert.equal(
+    recipientsToHeader([{ name: 'A "quoted" \\ name', email: 'person@example.test' }]),
+    '"A \\"quoted\\" \\\\ name" <person@example.test>',
+  );
 });

@@ -31,12 +31,18 @@ function publicPasskey(row) {
 }
 
 export function webauthnContext(request, config) {
-  const forwardedHost = String(request.get('x-forwarded-host') || '').split(',')[0].trim();
+  const trustForwarded = Boolean(config.trustProxy);
+  const forwardedHost = trustForwarded
+    ? String(request.get('x-forwarded-host') || '').split(',')[0].trim()
+    : '';
   const hostHeader = forwardedHost || String(request.get('host') || '');
   const hostname = hostHeader.split(':')[0] || 'localhost';
   const rpID = config.webauthnRpId || hostname;
-  const forwardedProto = String(request.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const forwardedProto = trustForwarded
+    ? String(request.get('x-forwarded-proto') || '').split(',')[0].trim()
+    : '';
   const proto = forwardedProto
+    || request.protocol
     || (hostname === 'localhost' || hostname === '127.0.0.1' ? 'http' : 'https');
   const derivedOrigin = `${proto}://${hostHeader || hostname}`;
   const origins = config.webauthnOrigins.length ? config.webauthnOrigins : [derivedOrigin];

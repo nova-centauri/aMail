@@ -1,6 +1,6 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
-import { readSignedToken } from '../services/crypto.js';
+import { readCapabilityToken } from '../services/crypto.js';
 import { hydrateCidImages, hydrateRemoteContent } from '../services/message-html.js';
 import {
   accountTestInput,
@@ -128,7 +128,7 @@ function attachMailboxEventStream(request, response, hub) {
   response.status(200);
   response.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
+    'Cache-Control': 'no-store, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
@@ -162,7 +162,7 @@ function attachDeepSearchStream(request, response, deepSearch, job) {
   response.status(200);
   response.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
+    'Cache-Control': 'no-store, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
@@ -198,13 +198,13 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     enable: false,
   });
 
-  app.get('/api/health', (_request, response) => {
+  app.get('/api/health', (request, response) => {
     // Container probes. Must not query SQLite, take mailbox locks, or wait
     // on IMAP. File sizes are cached; extras are process memory and
     // in-memory mailService.runtimeStatus().
     const timing = createPhaseTimer({
       enabled: debugTimingEnabled(config),
-      logger: _request.log,
+      logger: request.log,
       label: 'api_health',
     });
     const status = keyStatus();
@@ -213,12 +213,21 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     timing.mark('extras');
     timing.log();
     const healthy = extras.watchdog?.healthy !== false;
-    response.status(healthy ? 200 : 503).json({
+    const publicHealth = {
       status: healthy ? 'ok' : 'unhealthy',
       version: '0.1.0',
       releaseSha: config.releaseSha || null,
-      // Deliberately no account count or other mailbox-derived data: this
-      // endpoint answers unauthenticated for container health checks.
+    };
+    // Container and deploy probes need only liveness plus the serving commit.
+    // Runtime sizing, encryption/search choices, proxy state, and WebAuthn
+    // configuration are useful to an operator but unnecessary public
+    // fingerprinting. Unprotected local-development installs still see the
+    // full response because requestHasAccess() succeeds there.
+    if (!auth.requestHasAccess(request)) {
+      return response.status(healthy ? 200 : 503).json(publicHealth);
+    }
+    return response.status(healthy ? 200 : 503).json({
+      ...publicHealth,
       authProtected: auth.protected,
       credentialsConfigured: vault ? true : Boolean(config.credentialKey),
       databaseEncrypted: vault ? true : Boolean(config.databaseKey),
@@ -309,8 +318,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   // This endpoint is deliberately outside the Bearer gate: browser <img> tags
-  // cannot attach Authorization headers. The short-lived HMAC token, issued only
-  // for a persisted message's inert remote-image placeholder, is its authority.
+  // cannot attach Authorization headers. The short-lived encrypted capability,
+  // issued only for a persisted message's inert placeholder, is its authority.
   app.get('/api/content/remote', async (request, response) => {
     const result = await remoteContent.fetchToken(String(request.query.token || ''));
     response.set('Content-Type', result.contentType);
@@ -322,7 +331,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   });
 
   app.get('/api/content/attachment', async (request, response) => {
-    const payload = readSignedToken(String(request.query.token || ''), config.remoteTokenKey);
+    const payload = readCapabilityToken(String(request.query.token || ''), config.remoteTokenKey);
     if (payload?.v !== 1 || payload.t !== 'a' || !payload.m || !Number.isInteger(payload.i) || !Number.isInteger(payload.e)) {
       throw new ValidationError('The attachment token is invalid.');
     }
@@ -575,7 +584,10 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const stamp = listCacheToken(change);
     timing.mark('stamp');
     const etag = conversationListEtag(stamp, listInput);
-    response.set({ ETag: etag, 'Cache-Control': 'private, no-cache' });
+    // The UI keeps the ETag in memory and sends it explicitly, so no-store
+    // protects mailbox metadata from browser/proxy disk caches without losing
+    // the fast 304 path.
+    response.set({ ETag: etag, 'Cache-Control': 'private, no-store' });
     if (ifNoneMatchHits(request.headers['if-none-match'], etag)) {
       timing.mark('etag_hit');
       timing.log({ status: 304 });

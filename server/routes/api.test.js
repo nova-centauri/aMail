@@ -456,7 +456,7 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(firstList.status, 200);
   const etag = firstList.headers.get('etag');
   assert.ok(etag);
-  assert.match(firstList.headers.get('cache-control') || '', /no-cache/);
+  assert.match(firstList.headers.get('cache-control') || '', /no-store/);
   const cachedList = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
   assert.equal(cachedList.status, 304);
   const hugePage = await (await fetch(`${origin}/api/messages?folder=inbox&limit=9999`)).json();
@@ -782,7 +782,7 @@ test('GET /api/messages returns 304 for an unchanged change-version and clamps p
   assert.equal(first.status, 200);
   const etag = first.headers.get('etag');
   assert.ok(etag);
-  assert.match(first.headers.get('cache-control') || '', /no-cache/);
+  assert.match(first.headers.get('cache-control') || '', /no-store/);
   assert.equal((await first.json()).pageSize, 50);
 
   const notModified = await fetch(`${origin}/api/messages?folder=inbox`, { headers: { 'If-None-Match': etag } });
@@ -880,7 +880,7 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
     dataDir,
     dbPath: path.join(dataDir, 'mail.sqlite'),
     credentialKey: Buffer.alloc(32, 4),
-    accessToken: null,
+    accessToken: 'health-test-token',
     syncBatchSize: 50,
     remoteContentProxyUrl: null,
     allowDirectRemoteContent: false,
@@ -913,7 +913,13 @@ test('GET /api/health reports sync queue, db/WAL size, and memory without mailbo
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
-  const health = await (await fetch(`${origin}/api/health`)).json();
+  const publicHealth = await (await fetch(`${origin}/api/health`)).json();
+  assert.deepEqual(Object.keys(publicHealth).sort(), ['releaseSha', 'status', 'version']);
+  assert.equal(publicHealth.status, 'ok');
+
+  const health = await (await fetch(`${origin}/api/health`, {
+    headers: { Authorization: 'Bearer health-test-token' },
+  })).json();
   assert.equal(health.status, 'ok');
   assert.equal(health.releaseSha, config.releaseSha);
   assert.equal(Object.hasOwn(health, 'accounts'), false);

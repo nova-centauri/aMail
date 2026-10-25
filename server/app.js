@@ -11,6 +11,8 @@ import { logSerializers } from './logging.js';
 import { requestTiming } from './middleware/request-timing.js';
 import { createDeepSearchService } from './services/deep-search.js';
 import { createEventLoopWatchdog } from './services/event-loop-watchdog.js';
+import { accessGate } from './middleware/auth.js';
+import { browserOriginGuard, needsLargeJsonBody } from './middleware/request-security.js';
 
 export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, eventLoopWatchdog = null }) {
   const app = express();
@@ -44,8 +46,30 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
       },
     },
   }));
-  // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB encoded.
-  app.use(express.json({ limit: '12mb', type: ['application/json', 'application/*+json'] }));
+  app.use((request, response, next) => {
+    response.set('Permissions-Policy', 'accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()');
+    if (request.path.startsWith('/api') || request.path.startsWith('/mcp')) {
+      response.set('Cache-Control', 'private, no-store');
+    }
+    next();
+  });
+  app.use(browserOriginGuard(config));
+
+  const jsonTypes = ['application/json', 'application/*+json'];
+  const standardJson = express.json({ limit: '256kb', inflate: false, type: jsonTypes });
+  // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB
+  // encoded. Authenticate before accepting that larger allocation; every other
+  // endpoint stays on a deliberately small parser and compressed request bodies
+  // are rejected to avoid decompression-amplification work.
+  const largeJson = express.json({ limit: '12mb', inflate: false, type: jsonTypes });
+  const largeBodyGate = accessGate(auth);
+  app.use((request, response, next) => {
+    if (!needsLargeJsonBody(request)) return standardJson(request, response, next);
+    return largeBodyGate(request, response, (error) => {
+      if (error) return next(error);
+      return largeJson(request, response, next);
+    });
+  });
   // After JSON parsing so MCP tool names are on the request-start line.
   app.use(requestTiming());
 

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ARG NODE_VERSION=22
 
 FROM node:${NODE_VERSION}-bookworm-slim AS build
@@ -8,9 +9,14 @@ WORKDIR /app
 # ships prebuilt binaries for common platforms; these build dependencies make
 # the image reliable when npm has to compile the addon instead.
 COPY package.json package-lock.json ./
-RUN apt-get update \
+RUN --mount=type=secret,id=proxy_ca \
+    apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
-    && npm ci \
+    && if [ -s /run/secrets/proxy_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/proxy_ca npm ci --strict-ssl=true; \
+    else \
+      npm ci --strict-ssl=true; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . ./
