@@ -4,7 +4,46 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createDatabase, createRepositories } from '../db.js';
-import { conversationListEtag, ifNoneMatchHits, listCacheToken, listContentStamp, listConversations, MAX_PAGE_SIZE, parsePageSize } from './inbox.js';
+import {
+  conversationListEtag,
+  ifNoneMatchHits,
+  listCacheToken,
+  listContentStamp,
+  listConversations,
+  MAX_PAGE_SIZE,
+  parsePageSize,
+  searchReadWorkerNeeded,
+} from './inbox.js';
+
+test('the bounded inbox poll stays on the warm connection while searches remain isolated', () => {
+  assert.equal(searchReadWorkerNeeded({ folder: 'inbox' }), false);
+  assert.equal(searchReadWorkerNeeded({ folder: 'inbox', category: 'updates' }), false);
+  assert.equal(searchReadWorkerNeeded({ folder: 'inbox', ftsQuery: 'urgent' }), true);
+  assert.equal(searchReadWorkerNeeded({ folder: 'inbox', personEmails: ['friend@example.test'] }), true);
+  assert.equal(searchReadWorkerNeeded({ folder: 'inbox', forceWindowed: true }), true);
+  assert.equal(searchReadWorkerNeeded({ folder: 'all' }), true);
+});
+
+test('default inbox listing bypasses a cold search worker but a text search uses it', async (t) => {
+  const { repos, add, thread } = fixture(t);
+  add(thread('Warm inbox'));
+  let workerCalls = 0;
+  repos.searchRead = {
+    async searchConversations() {
+      workerCalls += 1;
+      throw new Error('worker called');
+    },
+  };
+
+  const inbox = await listConversations(repos, { folder: 'inbox', pageSize: 50 });
+  assert.equal(inbox.total, 1);
+  assert.equal(workerCalls, 0);
+  await assert.rejects(
+    () => listConversations(repos, { folder: 'inbox', pageSize: 50, query: 'warm' }),
+    /worker called/,
+  );
+  assert.equal(workerCalls, 1);
+});
 
 function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-inbox-'));

@@ -5,6 +5,7 @@ import {
 } from './smart-filter.js';
 import { getPersonFlag, loadPersonFlags, messageMatchesPersonFlag, publicPersonFlag } from './person-flags.js';
 import { toFtsMatchQuery } from './fts.js';
+import { listingNeedsThreadStats } from './conversation-search.js';
 import {
   conversationMatchesMailboxQuery,
   mailboxQueryIsActive,
@@ -198,10 +199,25 @@ async function conversationSearch(repos, listArgs, { page, pageSize, extraThread
       // The cache listing below is the same path used when Typesense is off.
     }
   }
-  if (typeof repos.searchRead?.searchConversations === 'function') {
+  if (searchReadWorkerNeeded(listArgs) && typeof repos.searchRead?.searchConversations === 'function') {
     return repos.searchRead.searchConversations(listArgs);
   }
   return repos.messages.searchConversations(listArgs);
+}
+
+/**
+ * The default inbox is already a bounded, covering-index query and the primary
+ * connection is warm from startup. A new SQLCipher reader has a cold page
+ * cache; routing this poll through it can spend the whole search deadline
+ * decrypting category-count pages on a large mailbox. Keep operator/FTS reads
+ * and less-bounded folders isolated on the worker, but serve the cheap inbox
+ * poll from the warm connection so a healthy encrypted mailbox cannot appear
+ * offline immediately after every restart.
+ */
+export function searchReadWorkerNeeded(listArgs = {}) {
+  return String(listArgs.folder || 'inbox').toLowerCase() !== 'inbox'
+    || Boolean(listArgs.forceWindowed)
+    || listingNeedsThreadStats(listArgs);
 }
 
 export const sumFolderCounts = (accounts, repos, changedAt = null) => {
