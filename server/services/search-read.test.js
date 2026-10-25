@@ -123,3 +123,36 @@ test('getThread returns the stored conversation from the worker', async (t) => {
   assert.equal(loaded.messages.length, 1);
   assert.equal(loaded.messages[0].from.email, 'friend@example.test');
 });
+
+test('search worker opens an encrypted database with a cloned key', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-search-read-encrypted-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const config = {
+    env: 'test',
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    databaseKey: Buffer.alloc(32, 9),
+    encryptDatabase: true,
+    searchReadWorker: true,
+    searchQueryDeadlineMs: 5_000,
+  };
+  const db = createDatabase(config);
+  const repos = createRepositories(db);
+  const { account, thread } = seed(repos);
+  repos.close();
+  const searchRead = createSearchRead({ config });
+  t.after(() => searchRead.close());
+
+  const listing = await searchRead.searchConversations({
+    accountIds: [account.id],
+    folder: 'inbox',
+    parsed: parseMailboxQuery(''),
+    limit: 50,
+    offset: 0,
+  });
+  const loaded = await searchRead.getThread(thread.id);
+
+  assert.deepEqual(listing.threadIds, [thread.id]);
+  assert.equal(loaded.thread.id, thread.id);
+  assert.equal(loaded.messages.length, 1);
+});

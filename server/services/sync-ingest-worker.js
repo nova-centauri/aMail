@@ -116,10 +116,14 @@ function buildPayload({ repos, account, mailbox, role, allMailMirror, message, p
   };
 }
 
+// worker_threads uses structured clone, which turns a Node Buffer into a
+// Uint8Array. Restore the Buffer before the database layer validates and
+// applies the raw 32-byte SQLCipher key.
+const databaseKey = workerData.databaseKey ? Buffer.from(workerData.databaseKey) : null;
 const db = createDatabase({
   dataDir: workerData.dataDir,
   dbPath: workerData.dbPath,
-  databaseKey: workerData.databaseKey || null,
+  databaseKey,
   encryptDatabase: Boolean(workerData.encryptDatabase),
   keyMode: workerData.keyMode || 'env',
 }, { checkpoint: false });
