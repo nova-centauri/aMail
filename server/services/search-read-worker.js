@@ -1,8 +1,12 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { openDatabase, createRepositories } from '../db.js';
 
+// worker_threads uses structured clone, which turns a Node Buffer into a
+// Uint8Array. Restore the Buffer before the database layer validates and
+// applies the raw 32-byte SQLCipher key.
+const databaseKey = workerData.databaseKey ? Buffer.from(workerData.databaseKey) : null;
 const db = openDatabase(workerData.dbPath, {
-  key: workerData.databaseKey || null,
+  key: databaseKey,
   readonly: true,
 });
 db.pragma('busy_timeout = 5000');
