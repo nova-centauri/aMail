@@ -88,3 +88,19 @@ do not make an untrusted host or Docker administrator safe.
 
 Never reuse a production mailbox or secret while testing this procedure. Use a
 synthetic account in an isolated project first.
+
+## Operator-assisted preflight
+
+When direct administrative access is unavailable, an operator can collect the
+required host facts without disclosing `.env` values. From the deployment
+repository, run:
+
+```sh
+sudo sh deploy/security-preflight.sh
+```
+
+The script is read-only. It never sources `.env`, renders Compose configuration,
+or inspects container environment variables. It reports sensitive settings only
+as missing, duplicated, too short, or present. Review the report before sharing
+it because hostnames, mount paths, container names, and listening ports are still
+operational information.

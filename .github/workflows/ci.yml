@@ -53,6 +53,7 @@ jobs:
           cp .env.example .env
           sh -n deploy/launch.sh
           sh -n deploy/docker-entrypoint.sh
+          sh -n deploy/security-preflight.sh
           docker compose --env-file .env --profile privacy config --quiet
           docker compose --env-file .env --profile privacy config --format json | node -e '
             let input = "";
