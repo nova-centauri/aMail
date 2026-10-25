@@ -4,7 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { AppError, NotFoundError, ValidationError } from '../errors.js';
-import { createSignedToken, readSignedToken } from './crypto.js';
+import { createCapabilityToken, readCapabilityToken } from './crypto.js';
 
 const MAX_REDIRECTS = 3;
 const PROXY_FAILURE_THRESHOLD = 3;
@@ -262,16 +262,16 @@ export function createRemoteContentService({ config, repos, logger }) {
 
   function issueToken(messageId, url) {
     const expiresAt = Math.floor(Date.now() / 1000) + config.remoteContentTokenTtlSeconds;
-    return createSignedToken({ v: 1, m: messageId, u: url, e: expiresAt }, config.remoteTokenKey);
+    return createCapabilityToken({ v: 1, m: messageId, u: url, e: expiresAt }, config.remoteTokenKey);
   }
 
   function issueAttachmentToken(messageId, index) {
     const expiresAt = Math.floor(Date.now() / 1000) + config.remoteContentTokenTtlSeconds;
-    return createSignedToken({ v: 1, t: 'a', m: messageId, i: index, e: expiresAt }, config.remoteTokenKey);
+    return createCapabilityToken({ v: 1, t: 'a', m: messageId, i: index, e: expiresAt }, config.remoteTokenKey);
   }
 
   async function fetchToken(token) {
-    const payload = readSignedToken(token, config.remoteTokenKey);
+    const payload = readCapabilityToken(token, config.remoteTokenKey);
     if (payload?.v !== 1 || !payload.m || !payload.u || !Number.isInteger(payload.e)) {
       throw new ValidationError('The remote-content token is invalid.');
     }

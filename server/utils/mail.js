@@ -67,12 +67,17 @@ const PROVIDER_ALIASES = {
   miab: 'mailinabox',
 };
 
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const emailPattern = /^[^\s@<>()\[\]\\,;:"]+@[^\s@<>()\[\]\\,;:"]+\.[^\s@<>()\[\]\\,;:"]+$/;
+const headerControls = /[\u0000-\u001f\u007f-\u009f]/;
 
 export const DEFAULT_ACCOUNT_COLOR = '#1a73e8';
+export const MAX_MESSAGE_RECIPIENTS = 100;
+export const MAX_RECIPIENT_NAME_LENGTH = 256;
 
 export function isEmail(value) {
-  return typeof value === 'string' && emailPattern.test(value.trim());
+  if (typeof value !== 'string') return false;
+  const email = value.trim();
+  return email.length > 0 && email.length <= 320 && !headerControls.test(email) && emailPattern.test(email);
 }
 
 function emailDomain(value) {
@@ -183,11 +188,17 @@ export function recipientList(value, fieldName = 'recipient') {
   if (recipients.some((item) => !isEmail(item.email))) {
     throw new ValidationError(`A ${fieldName} address is invalid.`);
   }
+  if (recipients.some((item) => item.name.length > MAX_RECIPIENT_NAME_LENGTH || headerControls.test(item.name))) {
+    throw new ValidationError(`A ${fieldName} display name is invalid.`);
+  }
   return recipients;
 }
 
 export function recipientsToHeader(recipients) {
-  return recipients.map(({ name, email }) => name ? `"${name.replaceAll('"', '')}" <${email}>` : email).join(', ');
+  return recipients.map(({ name, email }) => {
+    const escapedName = name.replace(/([\\"])/g, '\\$1');
+    return escapedName ? `"${escapedName}" <${email}>` : email;
+  }).join(', ');
 }
 
 export function accountConnection(input) {

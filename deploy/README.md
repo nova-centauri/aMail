@@ -202,6 +202,13 @@ last two or three and delete the rest, for example:
 docker compose exec amail sh -c 'ls -t /data/backup-*.sqlite | tail -n +3 | xargs -r rm --'
 ```
 
+A backup made before whole-database encryption is enabled remains plaintext.
+Keep that migration copy only on encrypted storage with restrictive file
+permissions, verify the encrypted service, then securely retire every
+plaintext copy according to the storage medium's guarantees. Deleting a file
+or Docker volume alone is not reliable erasure on snapshots, SSDs, or
+copy-on-write storage.
+
 The volume also holds the SQLite write-ahead log (`*.sqlite-wal`). aMail caps
 it at 64 MiB and truncates it at startup, so a large one left by an earlier
 release shrinks on the next restart.
@@ -211,9 +218,10 @@ accounts, cached mail metadata, and settings.
 
 ## Whole-database encryption
 
-Saved mail credentials are always encrypted with `AMAIL_ENCRYPTION_KEY`. The
-cached mail itself (bodies, the search index, settings) is stored in plaintext
-unless you opt in:
+Saved mail credentials are always encrypted with `AMAIL_ENCRYPTION_KEY`.
+`.env.example` enables whole-database encryption for new installs. Older `.env`
+files that still set it to false store cached bodies, the search index, and
+settings in plaintext until you enable it:
 
 ```sh
 # .env
@@ -227,8 +235,8 @@ take a backup first, expect the start to take a little longer on a large
 mailbox, and note that from then on the file is unreadable without the key.
 Setting the flag back to `false` makes the server refuse to start rather than
 create an empty database next to the encrypted one; turn it back on with the
-original key. `/api/health` reports `databaseEncrypted` so you can confirm the
-state after the restart.
+original key. Authenticated `/api/health` reports `databaseEncrypted` so you
+can confirm the state after the restart.
 
 Typesense keeps its own volume (`typesense-data`) so ranking does not have to
 scan SQLite on each keystroke. That volume is **not** covered by SQLCipher.
@@ -238,6 +246,13 @@ inside the database. Set `AMAIL_SEARCH_ENGINE=typesense` only when a plaintext
 copy of indexed mail on that volume is acceptable. `/api/health` reports
 `searchEngine` as `typesense` or `fts`. The Typesense port is not published;
 only the aMail container holds the API key.
+
+Enabling SQLCipher does not erase a Typesense index created earlier. After the
+encrypted app is verified on `fts`, stop the stack and remove only that
+installation's `typesense-data` volume (confirm its Compose project labels
+first), then restart. Treat snapshots or backups of that volume as plaintext
+mail data too. A separate `COMPOSE_PROJECT_NAME` per installation keeps this
+cleanup scoped to the intended public or private instance.
 
 ## Keyslot mode (hosted tenants)
 
@@ -443,6 +458,8 @@ Details worth knowing:
   so a five-minute cadence is fine. Overlapping runs are prevented with a lock.
 - It refuses to run over local modifications to tracked files; `.env` is
   untracked and never touched.
+- It refuses a non-fast-forward `release` movement, so a force-push or history
+  rewrite cannot silently replace the code running on the server.
 - After a rollback it records the failed revision and will not retry it. The
   next `release` movement clears that. `journalctl` has the reason.
 - `launch.sh` now stamps every deploy with the checked-out commit, so

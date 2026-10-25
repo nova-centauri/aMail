@@ -1212,6 +1212,26 @@ test('compose attachments are compiled into the SMTP raw message and stored loca
   assert.equal(stored[0].content, content);
 });
 
+test('send bounds recipient, header, and body inputs before SMTP work', async () => {
+  const recipients = Array.from({ length: 101 }, (_, index) => `person${index}@example.test`);
+  await assert.rejects(
+    () => sendHarness().service.sendMessage({ accountId: 'account-1', to: recipients, textBody: 'Hello' }),
+    /at most 100 recipients/,
+  );
+  await assert.rejects(
+    () => sendHarness().service.sendMessage({
+      accountId: 'account-1', to: ['person@example.test'], subject: 'Hello\r\nBcc: hidden@example.test', textBody: 'Hello',
+    }),
+    /Subject must be a single line/,
+  );
+  await assert.rejects(
+    () => sendHarness().service.sendMessage({
+      accountId: 'account-1', to: ['person@example.test'], textBody: 'x'.repeat(1_000_001),
+    }),
+    /1,000,000 characters/,
+  );
+});
+
 test('non-Gmail sends use identical RFC822 bytes for SMTP and Sent APPEND', async () => {
   const { service, state } = sendHarness();
   const result = await service.sendMessage({

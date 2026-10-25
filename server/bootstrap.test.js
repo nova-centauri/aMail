@@ -47,12 +47,8 @@ test('a keyslot harness boots locked, provisions once, and gates everything on a
   const { origin, harness } = await boot(t, { AMAIL_DATA_DIR: dataDir, AMAIL_KEY_MODE: 'keyslot', AMAIL_PROVISION_SECRET: 'provision-secret-value' });
 
   const health = await (await fetch(`${origin}/api/health`)).json();
-  assert.equal(health.keyMode, 'keyslot');
-  assert.equal(health.locked, true);
-  assert.equal(health.initialized, false);
-  assert.equal(health.authProtected, true);
-  assert.equal(health.databaseEncrypted, true);
-  assert.equal(Object.hasOwn(health, 'accounts'), false);
+  assert.deepEqual(Object.keys(health).sort(), ['releaseSha', 'status', 'version']);
+  assert.equal(health.status, 'ok');
 
   const session = await (await fetch(`${origin}/api/session`)).json();
   assert.equal(session.protected, true);
@@ -133,7 +129,7 @@ test('a keyslot harness boots locked, provisions once, and gates everything on a
   // A bearer token unlocks on its first call, exactly like an agent's first MCP request.
   assert.equal((await fetch(`${origin}/api/accounts`, { headers: bearer })).status, 200);
   assert.equal(harness.vault.isUnlocked(), true);
-  assert.equal((await (await fetch(`${origin}/api/health`)).json()).locked, false);
+  assert.equal((await (await fetch(`${origin}/api/health`, { headers: bearer })).json()).locked, false);
 
   // Recovery code through the session endpoint.
   await fetch(`${origin}/api/keyslots/lock`, { method: 'POST', headers: bearer });
@@ -165,7 +161,7 @@ test('escrow lets a restarted container unlock itself only when the tenant opted
   const second = await boot(t, env);
   assert.equal(second.harness.vault.isUnlocked(), false);
   assert.equal((await fetch(`${second.origin}/api/keyslots/escrow`, { method: 'POST', headers: bearer })).status, 201);
-  assert.equal((await (await fetch(`${second.origin}/api/health`)).json()).locked, false);
+  assert.equal((await (await fetch(`${second.origin}/api/health`, { headers: bearer })).json()).locked, false);
   await second.stop();
 
   // Restart with escrow enabled: unlocked at boot.
@@ -194,7 +190,9 @@ test('a new process takes the DEK from the running one over the handoff socket',
 
   const old = await boot(t, env);
   assert.equal(fs.existsSync(socketPath), false, 'nothing to serve while locked');
-  await fetch(`${old.origin}/api/keyslots/init`, { method: 'POST', headers: { authorization: `Bearer ${env.AMAIL_PROVISION_SECRET}` } });
+  const provisioned = await (await fetch(`${old.origin}/api/keyslots/init`, {
+    method: 'POST', headers: { authorization: `Bearer ${env.AMAIL_PROVISION_SECRET}` },
+  })).json();
   assert.equal(fs.existsSync(socketPath), true, 'unlocked process listens for a successor');
   assert.equal((fs.statSync(socketPath).mode & 0o777), 0o600);
 
@@ -208,7 +206,9 @@ test('a new process takes the DEK from the running one over the handoff socket',
   const fresh = await boot(t, env);
   assert.equal(fresh.harness.vault.isUnlocked(), true);
   assert.equal(fresh.harness.vault.status().unlockedVia, 'handoff');
-  assert.equal((await (await fetch(`${fresh.origin}/api/health`)).json()).locked, false);
+  assert.equal((await (await fetch(`${fresh.origin}/api/health`, {
+    headers: { authorization: `Bearer ${provisioned.token}` },
+  })).json()).locked, false);
   await old.stop();
   assert.equal(fs.existsSync(socketPath), true, 'the successor now owns the socket path');
   await fresh.stop();

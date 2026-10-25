@@ -87,6 +87,14 @@ if [ "$current" = "$target" ]; then
   exit 0
 fi
 
+# A release branch is expected to move forward from the currently deployed
+# commit. Refuse force-pushes, history rewrites, or a mistaken branch switch;
+# rollback remains an explicit local operation after human review.
+if ! git merge-base --is-ancestor "$current" "$target"; then
+  log "fetched $target is not a descendant of deployed $current; refusing non-fast-forward update"
+  exit 1
+fi
+
 if [ -f "$failed_marker" ] && [ "$(cat "$failed_marker")" = "$target" ]; then
   # Already tried this revision and rolled back. Wait for the next one rather
   # than redeploying a known-bad build every few minutes.

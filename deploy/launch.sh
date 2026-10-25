@@ -20,6 +20,13 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+# Secrets copied from the public example often inherit a world-readable mode.
+# Tighten it before either Compose or the validation below reads the file.
+if ! chmod 600 .env; then
+  echo "Could not restrict .env to mode 600; refusing to expose deployment secrets." >&2
+  exit 1
+fi
+
 # Parsing only the individual KEY=value lines avoids executing an operator's
 # configuration file as shell code.
 count_key() {

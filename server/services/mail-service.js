@@ -12,6 +12,7 @@ import {
   folderForMailbox,
   hasReplyPrefix,
   isEmail,
+  MAX_MESSAGE_RECIPIENTS,
   normalizeMessageIds,
   normalizeSubject,
   recipientList,
@@ -2348,14 +2349,25 @@ export function createMailService({
     const cc = recipientList(input.cc, 'Cc');
     const bcc = recipientList(input.bcc, 'Bcc');
     if (!to.length && !cc.length && !bcc.length) throw new ValidationError('At least one recipient is required.');
+    if (to.length + cc.length + bcc.length > MAX_MESSAGE_RECIPIENTS) {
+      throw new ValidationError(`A message can have at most ${MAX_MESSAGE_RECIPIENTS} recipients.`);
+    }
 
     const parent = input.replyToMessageId ? repos.messages.findByRfcId(account.id, input.replyToMessageId) : null;
     const subject = String(input.subject || parent?.subject || '').trim() || '(no subject)';
+    if (subject.length > 998 || /[\u0000-\u001f\u007f-\u009f]/.test(subject)) {
+      throw new ValidationError('Subject must be a single line no longer than 998 characters.');
+    }
     const references = [...new Set([...(parent?.references || []), parent?.messageId].filter(Boolean))];
-    const htmlBody = sanitizeComposeHtml(input.htmlBody);
+    const rawHtmlBody = String(input.htmlBody || '');
+    const rawTextBody = String(input.textBody || '');
+    if (rawHtmlBody.length > 1_000_000 || rawTextBody.length > 1_000_000) {
+      throw new ValidationError('Message bodies must each be no longer than 1,000,000 characters.');
+    }
+    const htmlBody = sanitizeComposeHtml(rawHtmlBody);
     const signed = appendSignature({
       html: htmlBody,
-      text: String(input.textBody || textSnippet(htmlBody || input.htmlBody || '')),
+      text: rawTextBody || textSnippet(htmlBody || rawHtmlBody),
       signature: account.signature,
       includeSignature: input.includeSignature !== false,
     });

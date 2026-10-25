@@ -340,6 +340,20 @@ export default function App() {
           if (sessionError.status === 401 || sessionError.status === 403) throw sessionError;
         }
         if (session?.keyMode) setKeyMode(session.keyMode);
+        // Environment-mode login establishes an HttpOnly cookie. Remove access
+        // tokens retained by older clients from script-readable storage once
+        // the server tells us which mode is active. Keyslot bearer tokens are
+        // intentionally retained because they can unlock the vault again.
+        if (session?.keyMode === 'env' && accessToken) {
+          if (session.authenticated) {
+            // A GET authenticated by the legacy bearer does not itself set a
+            // cookie. Exchange it once before deleting the browser-readable
+            // copy so an existing signed-in tab continues without interruption.
+            await api('/session', { method: 'POST', body: JSON.stringify({ accessToken }) });
+          }
+          persistAccessToken('');
+          setAccessToken('');
+        }
       }
       if (session?.protected && !session.authenticated) {
         setOffline(false);
@@ -1117,7 +1131,7 @@ export default function App() {
     // In keyslot mode a passphrase or recovery code also unlocks, but only a
     // real bearer token is worth keeping for the Authorization header; the
     // session cookie carries the rest.
-    const keepAsBearer = keyMode !== 'keyslot' || /^amk1_/.test(token);
+    const keepAsBearer = keyMode === 'keyslot' && /^amk1_/.test(token);
     persistAccessToken(keepAsBearer ? token : '');
     setAccessToken(keepAsBearer ? token : '');
     if (!token) {
