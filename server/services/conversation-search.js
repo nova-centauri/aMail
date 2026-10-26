@@ -71,23 +71,42 @@ export function bindFromAddress(params, key, value) {
   params[`${key}Kind`] = token.includes('.') ? 'domain' : 'local';
 }
 
+export function fromLocalPartExpression(column = 'from_email') {
+  return `lower(CASE WHEN instr(${column}, '@') > 0
+    THEN substr(${column}, 1, instr(${column}, '@') - 1)
+    ELSE ${column} END)`;
+}
+
+export function fromDomainExpression(column = 'from_email') {
+  return `lower(CASE WHEN instr(${column}, '@') > 0
+    THEN substr(${column}, instr(${column}, '@') + 1)
+    ELSE '' END)`;
+}
+
 export function fromAddressSql(alias, key, kind) {
   if (kind === 'email') return `lower(${alias}.from_email) = @${key}`;
-  if (kind === 'domain') return `lower(${alias}.from_email) LIKE '%@' || @${key} ESCAPE '\\'`;
-  return `(lower(${alias}.from_email) = @${key} OR lower(${alias}.from_email) LIKE @${key} || '@%' ESCAPE '\\')`;
+  if (kind === 'domain') return `${fromDomainExpression(`${alias}.from_email`)} = @${key}`;
+  return `${fromLocalPartExpression(`${alias}.from_email`)} = @${key}`;
+}
+
+export function fromAddressIndex(kind) {
+  if (kind === 'domain') return 'idx_messages_from_domain';
+  if (kind === 'local') return 'idx_messages_from_local';
+  return 'idx_messages_from_email';
 }
 
 function fromHitsCte(accountSql, fromValues, params) {
   const arms = fromValues.map((value, index) => {
     const key = `from${index}`;
     bindFromAddress(params, key, value);
+    const kind = params[`${key}Kind`];
     return `SELECT DISTINCT m.thread_id AS thread_id, m.account_id AS account_id
-      FROM messages m INDEXED BY idx_messages_from_email
-      WHERE ${fromAddressSql('m', key, params[`${key}Kind`])}
+      FROM messages m INDEXED BY ${fromAddressIndex(kind)}
+      WHERE ${fromAddressSql('m', key, kind)}
         AND ${accountSql}
         AND ${folderPredicate('m')}`;
   });
-  return `from_hits AS (
+  return `from_hits AS MATERIALIZED (
       ${arms.join('\n      INTERSECT\n      ')}
     )`;
 }
@@ -409,9 +428,20 @@ export function buildConversationSearch(input = {}) {
   ].filter(Boolean);
   const pageWhereSql = pageWhere.length ? `WHERE ${pageWhere.join('\n      AND ')}` : '';
   const fromCte = fromValues.length ? `${fromHitsCte(accountSql, fromValues, params)},\n    ` : '';
-  const fromJoin = fromValues.length
-    ? 'JOIN from_hits from_h ON from_h.thread_id = m.thread_id AND from_h.account_id = m.account_id'
-    : '';
+  // CROSS JOIN fixes the loop order: materialize the small indexed sender hit
+  // set first, then seek messages by thread. A normal JOIN let SQLite scan all
+  // account messages and probe from_hits, which was especially costly through
+  // SQLCipher and repeated for page/count/category queries.
+  const rankedSource = fromValues.length
+    ? `FROM from_hits from_h
+      CROSS JOIN messages m INDEXED BY idx_messages_thread
+      WHERE m.thread_id = from_h.thread_id
+        AND m.account_id = from_h.account_id
+        AND ${accountSql}
+        AND ${folderPredicate('m')}`
+    : `FROM messages m
+      WHERE ${accountSql}
+        AND ${folderPredicate('m')}`;
   const cte = `WITH ${fromCte}ranked AS (
       SELECT
         m.thread_id AS thread_id,
@@ -429,10 +459,7 @@ export function buildConversationSearch(input = {}) {
           PARTITION BY m.account_id, m.thread_id
           ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC, m.id DESC
         ) AS rk
-      FROM messages m
-      ${fromJoin}
-      WHERE ${accountSql}
-        AND ${folderPredicate('m')}
+      ${rankedSource}
     ),
     stats AS (
       SELECT

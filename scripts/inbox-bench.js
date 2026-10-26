@@ -13,6 +13,7 @@ import path from 'node:path';
 import { createDatabase, createRepositories } from '../server/db.js';
 import { buildConversationSearch, cheapWindowedListingSql } from '../server/services/conversation-search.js';
 import { conversationListEtag, listConversations, parsePageSize } from '../server/services/inbox.js';
+import { parseMailboxQuery } from '../server/mail/search-query.js';
 
 const ACCOUNT_COUNT = 20;
 const MESSAGES_PER_ACCOUNT = 10_000;
@@ -131,6 +132,22 @@ try {
   const before = timeMs(runWindowedSql);
   const after = timeMs(runCheapSql);
   const folders = timeMs(() => repos.messages.folderCountsForAccounts(accountIds));
+  const missingDomainInput = {
+    accountIds,
+    folder: 'inbox',
+    parsed: parseMailboxQuery('from:does-not-exist.invalid'),
+    limit: 50,
+    offset: 0,
+  };
+  const missingDomainSql = buildConversationSearch({
+    ...missingDomainInput,
+    nowIso: '2026-09-18T00:00:00.000Z',
+  });
+  const missingDomainPlan = db.prepare(`EXPLAIN QUERY PLAN ${missingDomainSql.pageSql}`).all(missingDomainSql.params)
+    .map((row) => row.detail)
+    .join(' | ');
+  repos.messages.searchConversations(missingDomainInput);
+  const missingDomain = timeMs(() => repos.messages.searchConversations(missingDomainInput));
   const assembled = await timeMsAsync(() => listConversations(repos, { folder: 'inbox', pageSize: 50 }));
   const assembledAfter = await timeMsAsync(() => listConversations(repos, { folder: 'inbox', pageSize: 50 }));
   const cached = assembledAfter.result;
@@ -143,6 +160,8 @@ try {
     beforeWindowedSqlMs: Number(before.durationMs.toFixed(2)),
     afterBoundedSqlMs: Number(after.durationMs.toFixed(2)),
     folderCountsMs: Number(folders.durationMs.toFixed(2)),
+    missingDomainSearchMs: Number(missingDomain.durationMs.toFixed(2)),
+    missingDomainTotal: missingDomain.result.total,
     afterListConversationsMs: Number(assembled.durationMs.toFixed(2)),
     cachedListConversationsMs: Number(assembledAfter.durationMs.toFixed(2)),
     speedupSql: before.durationMs > 0 ? Number((before.durationMs / Math.max(after.durationMs, 0.01)).toFixed(1)) : null,
@@ -151,6 +170,7 @@ try {
     etag,
     plan: planText,
     beforePlan: windowedPlan,
+    missingDomainPlan,
   };
   console.log(JSON.stringify(report, null, 2));
 } finally {

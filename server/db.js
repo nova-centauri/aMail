@@ -13,7 +13,11 @@ import {
 
 const SMART_FILTER_FINGERPRINT_SETTING = 'smartFilterFingerprint';
 import { ftsDocument } from './services/fts.js';
-import { buildConversationSearch } from './services/conversation-search.js';
+import {
+  buildConversationSearch,
+  fromDomainExpression,
+  fromLocalPartExpression,
+} from './services/conversation-search.js';
 import {
   createChangeVersionStore,
   stampFromRow,
@@ -30,6 +34,33 @@ const json = (value, fallback = []) => {
 
 const stringify = (value, fallback = []) => JSON.stringify(value ?? fallback);
 const now = () => new Date().toISOString();
+
+function canonicalSchemaSql(value) {
+  return String(value || '')
+    .replace(/\bIF\s+NOT\s+EXISTS\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([(),])\s*/g, '$1')
+    .replace(/;\s*$/, '')
+    .trim()
+    .toLowerCase();
+}
+
+function ensureSchemaObject(db, { type, name, sql }) {
+  if (!/^[a-z0-9_]+$/i.test(name)) throw new Error(`Unsafe schema object name: ${name}`);
+  const existing = db.prepare('SELECT sql FROM sqlite_master WHERE type = ? AND name = ?').get(type, name)?.sql;
+  if (canonicalSchemaSql(existing) === canonicalSchemaSql(sql)) return false;
+  db.exec(`DROP ${type.toUpperCase()} IF EXISTS ${name}`);
+  db.exec(sql);
+  return true;
+}
+
+function ensureIndex(db, name, sql) {
+  return ensureSchemaObject(db, { type: 'index', name, sql });
+}
+
+function ensureTrigger(db, name, sql) {
+  return ensureSchemaObject(db, { type: 'trigger', name, sql });
+}
 
 // List/search candidates never need full message bodies. Keep this projection
 // explicit so SQLite does not load them before the UI's conversation pagination.
@@ -511,21 +542,21 @@ function initSchema(db) {
 
   // Review pages seek directly through pending messages, both across all
   // accounts and within one account. Install after any legacy table rebuild.
-  db.exec(`
-    DROP INDEX IF EXISTS idx_messages_review_order;
-    DROP INDEX IF EXISTS idx_messages_review_account_order;
-    CREATE INDEX IF NOT EXISTS idx_messages_review_order
-      ON messages(COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
-    CREATE INDEX IF NOT EXISTS idx_messages_review_account_order
-      ON messages(account_id, COALESCE(received_at, sent_at, created_at), id) WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1;
-    DROP INDEX IF EXISTS idx_messages_inbox_list;
-    CREATE INDEX IF NOT EXISTS idx_messages_inbox_list
-      ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id, smart_category, snoozed_until)
-      WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0;
-    DROP INDEX IF EXISTS idx_messages_from_email;
-    CREATE INDEX IF NOT EXISTS idx_messages_from_email
-      ON messages(lower(from_email), account_id);
-  `);
+  ensureIndex(db, 'idx_messages_review_order', `CREATE INDEX idx_messages_review_order
+    ON messages(COALESCE(received_at, sent_at, created_at), id)
+    WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1`);
+  ensureIndex(db, 'idx_messages_review_account_order', `CREATE INDEX idx_messages_review_account_order
+    ON messages(account_id, COALESCE(received_at, sent_at, created_at), id)
+    WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1`);
+  ensureIndex(db, 'idx_messages_inbox_list', `CREATE INDEX idx_messages_inbox_list
+    ON messages(account_id, COALESCE(sent_at, received_at, created_at) DESC, thread_id, id, smart_category, snoozed_until)
+    WHERE mailbox = 'INBOX' AND is_archived = 0 AND is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0`);
+  ensureIndex(db, 'idx_messages_from_email', `CREATE INDEX idx_messages_from_email
+    ON messages(lower(from_email), account_id)`);
+  ensureIndex(db, 'idx_messages_from_local', `CREATE INDEX idx_messages_from_local
+    ON messages(${fromLocalPartExpression()}, account_id)`);
+  ensureIndex(db, 'idx_messages_from_domain', `CREATE INDEX idx_messages_from_domain
+    ON messages(${fromDomainExpression()}, account_id)`);
 
   // Rules are partly operator-configured (ops-digest sources), so a changed
   // fingerprint reclassifies everything rather than only version-stale rows.
@@ -607,6 +638,10 @@ const FTS_CREATE_SQL = `CREATE VIRTUAL TABLE messages_fts USING fts5(
       tokenize = 'unicode61 remove_diacritics 2'
     )`;
 
+const FTS_DELETE_TRIGGER_SQL = `CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
+  DELETE FROM messages_fts WHERE rowid = old.rowid;
+END`;
+
 const FTS_INSERT_SQL = `INSERT INTO messages_fts(
     rowid, subject, snippet, from_name, from_email, recipients, text_body, attachments
   ) VALUES (@rowid, @subject, @snippet, @from_name, @from_email, @recipients, @text_body, @attachments)`;
@@ -624,18 +659,13 @@ function isContentBearingMessagesFts(sql) {
 }
 
 function createMessagesFtsTable(db) {
-  const triggerSql = `
-    CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
-      DELETE FROM messages_fts WHERE rowid = old.rowid;
-    END;
-  `;
   db.exec('DROP TRIGGER IF EXISTS messages_ad_fts; DROP TABLE IF EXISTS messages_fts;');
   try {
     db.exec(FTS_CREATE_SQL);
   } catch {
     db.exec(FTS_CREATE_SQL.replace(/\s*contentless_delete=1,\s*/, '\n      '));
   }
-  db.exec(triggerSql);
+  db.exec(FTS_DELETE_TRIGGER_SQL);
 }
 
 function insertFtsDocuments(db, rows) {
@@ -681,12 +711,7 @@ function backfillMessagesFts(db, { batchSize = FTS_BACKFILL_BATCH } = {}) {
 function ensureMessagesFts(db) {
   const existingSql = messagesFtsSql(db);
   if (isDesiredMessagesFts(existingSql)) {
-    db.exec(`
-      DROP TRIGGER IF EXISTS messages_ad_fts;
-      CREATE TRIGGER messages_ad_fts AFTER DELETE ON messages BEGIN
-        DELETE FROM messages_fts WHERE rowid = old.rowid;
-      END;
-    `);
+    ensureTrigger(db, 'messages_ad_fts', FTS_DELETE_TRIGGER_SQL);
     backfillMessagesFts(db);
     return;
   }
