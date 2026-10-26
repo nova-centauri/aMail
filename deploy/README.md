@@ -160,6 +160,26 @@ signal, not a false negative: `CookieAuthentication 0` still needs
 `AUTHENTICATE ""` on the control port. An unhealthy relay does not take aMail
 down (`amail` does not `depends_on` it).
 
+Some networks allow ordinary HTTPS while blocking the published addresses of
+Tor relays. In that case, opt the privacy sidecar into the Tor Project's
+Snowflake pluggable transport in `.env`, then recreate only that sidecar:
+
+```dotenv
+AMAIL_TOR_TRANSPORT=snowflake
+```
+
+```sh
+docker compose --env-file .env --profile privacy up -d --build --no-deps --force-recreate tor-proxy
+```
+
+Snowflake uses HTTPS domain fronts, STUN, and volunteer WebRTC proxies to reach
+the Tor network, so it can work where direct relay connections do not. The
+container remains unprivileged, has no published port, and retains its separate
+egress network. This setting does not route IMAP, SMTP, mailbox synchronization,
+or search through Tor, so it does not add latency to normal mail use. Set the
+value back to `direct` on networks where public relays are reachable; that path
+has less transport overhead for remote images.
+
 Tor is a privacy aid, not a complete anonymity system. It does not anonymize
 IMAP/SMTP traffic, and remote images can still reveal message-specific data
 once explicitly loaded. Keep tracker blocking enabled and expect some image
