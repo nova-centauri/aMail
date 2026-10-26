@@ -2,6 +2,8 @@
 Description=Deploy the latest verified aMail release
 After=docker.service network-online.target
 Wants=network-online.target
+Requires=docker.service
+ConditionPathExists=/opt/amail/.env
 
 [Service]
 Type=oneshot
@@ -9,6 +11,23 @@ Type=oneshot
 # the user to the one that owns it (it needs to be in the docker group).
 WorkingDirectory=/opt/amail
 User=amail
+SupplementaryGroups=docker
+Environment=HOME=/opt/amail
+UMask=0077
 ExecStart=/bin/sh /opt/amail/deploy/autoupdate.sh privacy
 # Building the image and waiting for health can take a few minutes.
 TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

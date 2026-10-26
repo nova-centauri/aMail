@@ -240,12 +240,19 @@ can confirm the state after the restart.
 
 Typesense keeps its own volume (`typesense-data`) so ranking does not have to
 scan SQLite on each keystroke. That volume is **not** covered by SQLCipher.
-`AMAIL_SEARCH_ENGINE=auto` therefore leaves Typesense unused while the database
-is encrypted (or the process is in keyslot mode) and answers from the FTS index
-inside the database. Set `AMAIL_SEARCH_ENGINE=typesense` only when a plaintext
-copy of indexed mail on that volume is acceptable. `/api/health` reports
-`searchEngine` as `typesense` or `fts`. The Typesense port is not published;
-only the aMail container holds the API key.
+`AMAIL_SEARCH_ENGINE=auto` therefore answers from the FTS index inside an
+encrypted database (or keyslot process). `launch.sh` also omits the bundled
+Typesense profile in that case, avoiding an unused plaintext volume and its
+memory/CPU overhead. Plaintext `auto` installations still start Typesense as
+before. Set `AMAIL_SEARCH_ENGINE=typesense` only when a plaintext copy of
+indexed mail on that volume is acceptable. `/api/health` reports `searchEngine`
+as `typesense` or `fts`. The Typesense port is not published; only the aMail
+container holds the API key.
+
+Direct `docker compose up` defaults safely to FTS. Use `launch.sh`, or opt into
+the bundled service explicitly with `AMAIL_TYPESENSE_URL=http://typesense:8108`
+and `--profile typesense`. An operator-provided `AMAIL_TYPESENSE_URL` uses that
+external service without starting the bundled container.
 
 Enabling SQLCipher does not erase a Typesense index created earlier. After the
 encrypted app is verified on `fts`, stop the stack and remove only that
@@ -448,7 +455,7 @@ sudo systemctl edit amail-autoupdate.service   # set WorkingDirectory, User, Exe
 sudo systemctl daemon-reload
 sudo systemctl enable --now amail-autoupdate.timer
 
-systemctl list-timers amail-autoupdate.timer   # next run
+systemctl list-timers --all amail-autoupdate.timer # must show a real NEXT time
 journalctl -u amail-autoupdate.service         # what it did
 ```
 
@@ -456,6 +463,9 @@ Details worth knowing:
 
 - The script is idempotent and cheap when nothing changed (one `git fetch`),
   so a five-minute cadence is fine. Overlapping runs are prevented with a lock.
+- The supplied timer uses a five-minute calendar schedule rather than a
+  boot-relative monotonic deadline, so enabling it long after boot still
+  produces a real next activation.
 - It refuses to run over local modifications to tracked files; `.env` is
   untracked and never touched.
 - It refuses a non-fast-forward `release` movement, so a force-push or history
