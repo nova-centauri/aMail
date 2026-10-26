@@ -68,6 +68,19 @@ test('a plain .env keeps producing a plaintext database exactly as before', (t) 
   reopened.close();
 });
 
+test('opening a current database does not rebuild indexes or triggers', (t) => {
+  const config = tempConfig(t);
+  const first = createDatabase(config);
+  const firstVersion = first.pragma('schema_version', { simple: true });
+  first.close();
+
+  const second = createDatabase(config);
+  const secondVersion = second.pragma('schema_version', { simple: true });
+  second.close();
+
+  assert.equal(secondVersion, firstVersion);
+});
+
 test('a keyed database is unreadable without its key and rejects a wrong key', (t) => {
   const key = Buffer.alloc(32, 3);
   const config = tempConfig(t, { databaseKey: key });
@@ -495,32 +508,46 @@ test('inbox listing installs the covering poller index', (t) => {
   assert.doesNotMatch(plan, /MATERIALIZE latest/);
 });
 
-test('from: search uses the from_email index instead of a table scan', (t) => {
+test('from: searches seek indexed email, local-part, and domain hits before thread rows', (t) => {
   const db = createDatabase(tempConfig(t));
   const repos = createRepositories(db);
   t.after(() => repos.close());
-  const index = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_from_email'`).get();
-  assert.ok(index);
-  assert.match(index.sql, /lower\(from_email\), account_id/);
+  const indexes = new Map(db.prepare(`SELECT name, sql FROM sqlite_master
+    WHERE type = 'index' AND name LIKE 'idx_messages_from_%'`).all()
+    .map((row) => [row.name, row.sql]));
+  assert.match(indexes.get('idx_messages_from_email'), /lower\(from_email\), account_id/);
+  assert.match(indexes.get('idx_messages_from_local'), /THEN substr\(from_email, 1, instr\(from_email, '@'\) - 1\)/);
+  assert.match(indexes.get('idx_messages_from_domain'), /THEN substr\(from_email, instr\(from_email, '@'\) \+ 1\)/);
   const account = seedAccount(repos);
   const thread = repos.threads.create({
     account_id: account.id, subject: 'Hello', normalized_subject: 'hello', latest_at: '2026-10-17T00:00:00.000Z',
   });
   repos.messages.upsert(messageFields(account.id, thread.id, { from_email: 'friend@example.test' }));
-  const built = buildConversationSearch({
-    accountIds: [account.id],
-    folder: 'inbox',
-    parsed: parseMailboxQuery('from:friend@example.test'),
-    hideQuiet: false,
-    limit: 50,
-    offset: 0,
-    nowIso: '2026-10-17T00:00:00.000Z',
-  });
-  assert.match(built.pageSql, /from_hits/);
-  const plan = db.prepare(`EXPLAIN QUERY PLAN ${built.pageSql}`).all(built.params)
-    .map((row) => row.detail)
-    .join('\n');
-  assert.match(plan, /idx_messages_from_email/);
+  for (const [query, index] of [
+    ['from:friend@example.test', 'idx_messages_from_email'],
+    ['from:friend', 'idx_messages_from_local'],
+    ['from:example.test', 'idx_messages_from_domain'],
+  ]) {
+    const built = buildConversationSearch({
+      accountIds: [account.id],
+      folder: 'inbox',
+      parsed: parseMailboxQuery(query),
+      hideQuiet: false,
+      limit: 50,
+      offset: 0,
+      nowIso: '2026-10-17T00:00:00.000Z',
+    });
+    assert.match(built.pageSql, /from_hits AS MATERIALIZED/);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${built.pageSql}`).all(built.params)
+      .map((row) => row.detail)
+      .join('\n');
+    assert.match(plan, new RegExp(index));
+    assert.match(plan, /idx_messages_thread/);
+    assert.doesNotMatch(plan, /idx_messages_analyzed/);
+    assert.deepEqual(repos.messages.searchConversations({
+      accountIds: [account.id], folder: 'inbox', parsed: parseMailboxQuery(query), limit: 50,
+    }).threadIds, [thread.id]);
+  }
 });
 
 test('envelope-only IMAP hits stay out of the review queue until source is imported', (t) => {

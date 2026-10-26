@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { bindFromAddress, buildConversationSearch, cheapInboxPredicate, cheapWindowedListingSql, escapeLike, fromAddressSql, listingNeedsThreadStats, listingProbe } from './conversation-search.js';
+import {
+  bindFromAddress,
+  buildConversationSearch,
+  cheapInboxPredicate,
+  cheapWindowedListingSql,
+  escapeLike,
+  fromAddressIndex,
+  fromAddressSql,
+  listingNeedsThreadStats,
+  listingProbe,
+} from './conversation-search.js';
 import { parseMailboxQuery } from '../mail/search-query.js';
 
 test('LIKE metacharacters are escaped for SQL contains matches', () => {
@@ -44,12 +54,15 @@ test('from: binds to the indexed address column instead of a leading-wildcard LI
   const local = {};
   bindFromAddress(local, 'from0', 'ada');
   assert.equal(local.from0Kind, 'local');
-  assert.match(fromAddressSql('m', 'from0', 'local'), /LIKE @from0 \|\| '@%'/);
+  assert.match(fromAddressSql('m', 'from0', 'local'), /substr\(m\.from_email, 1,/);
+  assert.equal(fromAddressIndex('local'), 'idx_messages_from_local');
 
   const domain = {};
   bindFromAddress(domain, 'from0', 'example.com');
   assert.equal(domain.from0Kind, 'domain');
-  assert.match(fromAddressSql('m', 'from0', 'domain'), /LIKE '%@' \|\| @from0/);
+  assert.match(fromAddressSql('m', 'from0', 'domain'), /substr\(m\.from_email, instr\(m\.from_email, '@'\) \+ 1\)/);
+  assert.equal(fromAddressIndex('domain'), 'idx_messages_from_domain');
+  assert.equal(fromAddressIndex('email'), 'idx_messages_from_email');
 });
 
 test('analyzed filters require imported source and extra IMAP thread ids bypass FTS', () => {
