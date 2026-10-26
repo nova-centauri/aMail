@@ -134,6 +134,10 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    environment:
+      # Direct is fastest where public relays are reachable. Snowflake is an
+      # explicit circumvention mode for networks that block known Tor relays.
+      AMAIL_TOR_TRANSPORT: ${AMAIL_TOR_TRANSPORT:-${GIGAMAIL_TOR_TRANSPORT:-direct}}
     volumes:
       - tor-state:/var/lib/tor
     tmpfs:

@@ -3,7 +3,7 @@ FROM alpine:3.24
 ARG PROXY_UID=10002
 ARG PROXY_GID=10002
 
-RUN apk add --no-cache privoxy tor netcat-openbsd \
+RUN apk add --no-cache privoxy tor snowflake-client netcat-openbsd \
     && addgroup -g "${PROXY_GID}" -S torproxy \
     && adduser -u "${PROXY_UID}" -S -D -H -h /var/lib/tor -s /sbin/nologin -G torproxy torproxy \
     && mkdir -p /var/lib/tor \
@@ -13,6 +13,7 @@ RUN apk add --no-cache privoxy tor netcat-openbsd \
 
 COPY torrc /etc/tor/torrc
 COPY privoxy.config /etc/privoxy/config
+COPY render-torrc.sh /usr/local/bin/render-torrc
 COPY entrypoint.sh /usr/local/bin/tor-proxy
 
 # Alpine keeps Privoxy's stock files as *.new until an administrator accepts
@@ -23,7 +24,7 @@ RUN for file in default.action default.filter match-all.action user.action; do \
     done \
     && chgrp -R torproxy /etc/privoxy \
     && chmod -R g+rX,g-w /etc/privoxy \
-    && chmod 0555 /usr/local/bin/tor-proxy
+    && chmod 0555 /usr/local/bin/render-torrc /usr/local/bin/tor-proxy
 
 USER torproxy
 

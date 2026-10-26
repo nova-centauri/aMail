@@ -1,7 +1,12 @@
 #!/bin/sh
 set -eu
 
-tor -f /etc/tor/torrc &
+umask 077
+
+tor_config=$(mktemp /tmp/amail-torrc.XXXXXX)
+/usr/local/bin/render-torrc /etc/tor/torrc "$tor_config"
+
+tor -f "$tor_config" &
 tor_pid=$!
 privoxy_pid=''
 
@@ -12,6 +17,7 @@ cleanup() {
   fi
   kill -TERM "$tor_pid" 2>/dev/null || true
   wait "$tor_pid" 2>/dev/null || true
+  rm -f "$tor_config"
 }
 
 on_signal() {

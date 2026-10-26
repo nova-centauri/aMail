@@ -55,6 +55,19 @@ jobs:
           sh -n deploy/typesense-mode.sh
           sh -n deploy/docker-entrypoint.sh
           sh -n deploy/security-preflight.sh
+          sh -n deploy/tor/render-torrc.sh
+          torrc_test=$(mktemp)
+          AMAIL_TOR_TRANSPORT=direct sh deploy/tor/render-torrc.sh deploy/tor/torrc "$torrc_test"
+          cmp deploy/tor/torrc "$torrc_test"
+          AMAIL_TOR_TRANSPORT=snowflake sh deploy/tor/render-torrc.sh deploy/tor/torrc "$torrc_test"
+          grep -q '^UseBridges 1$' "$torrc_test"
+          grep -q '^ClientTransportPlugin snowflake exec /usr/bin/snowflake-client$' "$torrc_test"
+          test "$(grep -c '^Bridge snowflake ' "$torrc_test")" = 2
+          if AMAIL_TOR_TRANSPORT=invalid sh deploy/tor/render-torrc.sh deploy/tor/torrc "$torrc_test"; then
+            echo 'invalid Tor transport was accepted' >&2
+            exit 1
+          fi
+          rm -f "$torrc_test"
           docker compose --env-file .env --profile privacy config --quiet
           docker compose --env-file .env --profile privacy config --format json | node -e '
             let input = "";
@@ -66,7 +79,18 @@ jobs:
               const dataMount = service?.volumes?.find((mount) => mount.target === "/data");
               if (!service || dataMount?.type !== "volume" || dataMount.source !== "amail-data" ||
                 typeof service.environment?.AMAIL_ENCRYPTION_KEY !== "string" ||
-                service.environment?.AMAIL_TYPESENSE_URL !== "" || config.services?.typesense) process.exit(1);
+                service.environment?.AMAIL_TYPESENSE_URL !== "" || config.services?.typesense ||
+                config.services?.["tor-proxy"]?.environment?.AMAIL_TOR_TRANSPORT !== "direct") process.exit(1);
+            });
+          '
+          AMAIL_TOR_TRANSPORT=snowflake \
+            docker compose --env-file .env --profile privacy config --format json | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const config = JSON.parse(input);
+              if (config.services?.["tor-proxy"]?.environment?.AMAIL_TOR_TRANSPORT !== "snowflake") process.exit(1);
             });
           '
           AMAIL_TYPESENSE_URL=http://typesense:8108 \
@@ -82,7 +106,10 @@ jobs:
           '
 
       - name: Build application and privacy images
-        run: docker compose --env-file .env --profile privacy build
+        run: |
+          docker compose --env-file .env --profile privacy build
+          docker run --rm --entrypoint /usr/bin/snowflake-client \
+            "${COMPOSE_PROJECT_NAME}-tor-proxy:local" -version
 
       - name: Start the application image
         run: |
