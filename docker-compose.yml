@@ -23,9 +23,11 @@ services:
       AMAIL_RELEASE_SHA: ${AMAIL_RELEASE_SHA:-}
       # Typesense is the relevance index. It is not published on the host.
       # Encrypted databases stay on SQLite FTS unless AMAIL_SEARCH_ENGINE=typesense.
-      AMAIL_SEARCH_ENGINE: ${AMAIL_SEARCH_ENGINE:-auto}
-      AMAIL_TYPESENSE_URL: http://typesense:8108
-      AMAIL_TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-amail-dev-typesense-key}
+      AMAIL_SEARCH_ENGINE: ${AMAIL_SEARCH_ENGINE:-${GIGAMAIL_SEARCH_ENGINE:-auto}}
+      # launch.sh fills the internal URL only when this installation actually
+      # selects Typesense. Direct Compose starts safely on SQLite FTS.
+      AMAIL_TYPESENSE_URL: ${AMAIL_TYPESENSE_URL:-${GIGAMAIL_TYPESENSE_URL:-}}
+      AMAIL_TYPESENSE_API_KEY: ${AMAIL_TYPESENSE_API_KEY:-${GIGAMAIL_TYPESENSE_API_KEY:-${TYPESENSE_API_KEY:-}}}
       # The privacy launcher provides this only for its own Compose invocation.
       # An empty value keeps remote-content requests on their normal path.
       REMOTE_CONTENT_PROXY_URL: ${REMOTE_CONTENT_PROXY_URL:-}
@@ -60,6 +62,8 @@ services:
     depends_on:
       typesense:
         condition: service_started
+        # Encrypted/FTS deployments intentionally omit the Typesense profile.
+        required: false
     labels:
       # Used only with `--profile autoheal`. Default false: the sidecar needs
       # the Docker socket (root-equivalent on the host).
@@ -79,6 +83,8 @@ services:
   # The volume is plaintext. With AMAIL_ENCRYPT_DATABASE or keyslot mode, aMail
   # leaves this service unused unless AMAIL_SEARCH_ENGINE=typesense.
   typesense:
+    profiles:
+      - typesense
     image: typesense/typesense:29.0
     restart: unless-stopped
     init: true

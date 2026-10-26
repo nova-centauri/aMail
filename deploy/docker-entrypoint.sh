@@ -5,6 +5,7 @@
 # already set these. Self-hosted env-mode installs are unchanged. Explicit
 # environment always wins.
 set -eu
+umask 077
 
 if [ "${AMAIL_CPU_PROF:-}" = "1" ] || [ "${AMAIL_CPU_PROF:-}" = "true" ]; then
   PROF_DIR="${AMAIL_DATA_DIR:-/data}/cpu-profiles"

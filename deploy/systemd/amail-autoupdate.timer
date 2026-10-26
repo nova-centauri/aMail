@@ -2,10 +2,11 @@
 Description=Check for a new verified aMail release every five minutes
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnCalendar=*:0/5
 RandomizedDelaySec=30s
+AccuracySec=15s
 Persistent=true
+Unit=amail-autoupdate.service
 
 [Install]
 WantedBy=timers.target

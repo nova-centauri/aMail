@@ -77,36 +77,54 @@ if [ -z "${AMAIL_RELEASE_SHA:-}" ]; then
 fi
 export AMAIL_RELEASE_SHA
 
-# `config --quiet` renders the exact project first. It does not create,
-# remove, or restart containers, volumes, networks, or images.
-docker compose --env-file .env config --quiet
+typesense_mode=$(sh deploy/typesense-mode.sh .env)
+
+compose_direct() {
+  if [ "$typesense_mode" = local ]; then
+    AMAIL_TYPESENSE_URL=http://typesense:8108 REMOTE_CONTENT_PROXY_URL= \
+      docker compose --env-file .env --profile typesense "$@"
+  else
+    REMOTE_CONTENT_PROXY_URL= \
+      docker compose --env-file .env "$@"
+  fi
+}
 
 compose_privacy() {
   # Shell-scoped so a normal direct launch cannot accidentally retain a proxy
   # setting for a stopped Tor container.
-  REMOTE_CONTENT_PROXY_URL=http://tor-proxy:8118 \
-    docker compose --env-file .env --profile privacy "$@"
+  if [ "$typesense_mode" = local ]; then
+    AMAIL_TYPESENSE_URL=http://typesense:8108 \
+      REMOTE_CONTENT_PROXY_URL=http://tor-proxy:8118 \
+      docker compose --env-file .env --profile privacy --profile typesense "$@"
+  else
+    REMOTE_CONTENT_PROXY_URL=http://tor-proxy:8118 \
+      docker compose --env-file .env --profile privacy "$@"
+  fi
 }
 
 force_recreate=${AMAIL_FORCE_RECREATE:-${GIGAMAIL_FORCE_RECREATE:-0}}
 
 if [ "$mode" = privacy ]; then
+  # Render the exact service/profile selection before changing runtime state.
+  compose_privacy config --quiet
   if [ "$force_recreate" = "1" ]; then
     # Never force-recreate Tor for an app release: a cold Tor bootstrap can
     # take minutes, and taking down a working relay is how deploys get stuck.
     compose_privacy up --detach --build tor-proxy
+    if [ "$typesense_mode" = local ]; then
+      compose_privacy up --detach typesense
+    fi
     compose_privacy up --detach --build --force-recreate --no-deps amail
   else
     compose_privacy up --detach --build
   fi
 else
+  compose_direct config --quiet
   # This intentionally runs no proxy. In production aMail keeps remote
   # content blocked rather than bypassing privacy controls with direct egress.
   if [ "$force_recreate" = "1" ]; then
-    REMOTE_CONTENT_PROXY_URL= \
-      docker compose --env-file .env up --detach --build --force-recreate
+    compose_direct up --detach --build --force-recreate
   else
-    REMOTE_CONTENT_PROXY_URL= \
-      docker compose --env-file .env up --detach --build
+    compose_direct up --detach --build
   fi
 fi

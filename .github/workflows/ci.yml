@@ -52,6 +52,7 @@ jobs:
         run: |
           cp .env.example .env
           sh -n deploy/launch.sh
+          sh -n deploy/typesense-mode.sh
           sh -n deploy/docker-entrypoint.sh
           sh -n deploy/security-preflight.sh
           docker compose --env-file .env --profile privacy config --quiet
@@ -64,7 +65,19 @@ jobs:
               const service = config.services?.amail;
               const dataMount = service?.volumes?.find((mount) => mount.target === "/data");
               if (!service || dataMount?.type !== "volume" || dataMount.source !== "amail-data" ||
-                typeof service.environment?.AMAIL_ENCRYPTION_KEY !== "string") process.exit(1);
+                typeof service.environment?.AMAIL_ENCRYPTION_KEY !== "string" ||
+                service.environment?.AMAIL_TYPESENSE_URL !== "" || config.services?.typesense) process.exit(1);
+            });
+          '
+          AMAIL_TYPESENSE_URL=http://typesense:8108 \
+            docker compose --env-file .env --profile privacy --profile typesense config --format json | node -e '
+            let input = "";
+            process.stdin.setEncoding("utf8");
+            process.stdin.on("data", (chunk) => { input += chunk; });
+            process.stdin.on("end", () => {
+              const config = JSON.parse(input);
+              if (!config.services?.typesense ||
+                config.services?.amail?.environment?.AMAIL_TYPESENSE_URL !== "http://typesense:8108") process.exit(1);
             });
           '
 

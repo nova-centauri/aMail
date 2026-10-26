@@ -18,6 +18,18 @@ async function runEntrypoint(env) {
   return stdout;
 }
 
+async function entrypointUmask() {
+  const { stdout } = await execFileAsync('sh', [script, 'sh', '-c', 'umask'], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME || '/', AMAIL_KEY_MODE: 'env' },
+    encoding: 'utf8',
+  });
+  return stdout.trim();
+}
+
+test('entrypoint makes newly-created runtime files private by default', async () => {
+  assert.equal(await entrypointUmask(), '0077');
+});
+
 test('keyslot entrypoint applies the hosted heap and threadpool caps', async () => {
   assert.equal(await runEntrypoint({ AMAIL_KEY_MODE: 'keyslot' }), '--max-old-space-size=384|2');
   assert.equal(
