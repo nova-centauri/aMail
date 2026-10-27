@@ -12,6 +12,7 @@ the tokens in `tokens.css`; nothing else hard-codes colors.
 | `reader.css` | Reader pane: heading, message cards, email body, privacy notice, attachments |
 | `compose.css` | Compose window, recipient chips, and the shared rich-text editor |
 | `panels.css` | Quick settings drawer, profile menu, search options, and the modals (add account, unlock, shortcuts) |
+| `print.css` | Open conversation only, with paper layout, full-length messages, and no inbox or controls |
 | `index.css` | Import order |
 
 ## Layout rules
@@ -20,6 +21,7 @@ the tokens in `tokens.css`; nothing else hard-codes colors.
 - `.mail-split` is one column by default. `.mail-app.reader-mounted` reserves a second column and `.mail-app.thread-open` eases it open to `var(--list-w) minmax(0, 1fr)`. Below 1000px the reader overlays the list. `prefers-reduced-motion` collapses those transitions.
 - The 840px breakpoint turns the sidebar into a drawer. `App.jsx` uses the same number to decide whether the menu button toggles compact mode or the drawer, so change both together.
 - `.mail-list-panel` is a container (`container-type: inline-size`); row layout switches at 640px and 400px of panel width via `grid-template-areas`, with no DOM changes.
+- `print.css` is imported last. Browser printing keeps the open conversation's subject, message headers, visible bodies, and attachment names, and removes the viewport height and scroll limits so long messages can span pages.
 
 ## Light surfaces
 

@@ -1,0 +1,91 @@
+/* Print the open conversation in normal document flow so every page of a long
+   email is included. Imported last to override the responsive screen layout. */
+@media print {
+  @page { margin: 15mm; }
+
+  /* Keep only the path to the reader; this also excludes overlays and portals. */
+  body > :not(#root),
+  #root > :not(.mail-app),
+  .mail-app > :not(.mail-workspace),
+  .mail-workspace > :not(.mail-split),
+  .mail-split > :not(.thread-panel),
+  .mail-app:not(.thread-open) .thread-panel,
+  .thread-toolbar,
+  .heading-labels,
+  .category-reason,
+  .message-summary > .avatar,
+  .message-summary > .icon,
+  .message-utilities > div,
+  .message-reply-actions,
+  .privacy-notice,
+  .quoted-toggle,
+  .attachment-progress {
+    display: none;
+  }
+
+  html, body, #root,
+  .mail-app, .mail-workspace, .mail-split,
+  .thread-panel, .thread-scroll, .conversation-stack {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    min-height: 0;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    color: var(--ink);
+    background: var(--bg-1);
+    box-shadow: none;
+  }
+
+  /* The narrow-screen reader normally sits absolutely over the inbox. */
+  .mail-app.thread-open .thread-panel {
+    position: static;
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+
+  .conversation-stack { animation: none; }
+  .thread-heading { padding: 0 0 var(--sp-4); break-after: avoid; }
+  .thread-title-line h1 { font-size: var(--fs-2xl); }
+
+  .conversation-stack .message-card {
+    margin-bottom: var(--sp-6);
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  .message-summary {
+    min-height: 0;
+    padding: 0;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    break-inside: avoid;
+    break-after: avoid;
+  }
+
+  .message-sender strong,
+  .message-sender small,
+  .message-summary time,
+  .message-utilities > span,
+  .attachment-chip > span:not(.attachment-progress) {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .message-content { padding: 0; }
+  .message-body { orphans: 3; widows: 3; }
+  .html-email-body pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .html-email-body table { width: 100%; table-layout: fixed; }
+  .attachments { padding-bottom: 0; }
+  .attachment-chip { height: auto; max-width: 100%; break-inside: avoid; }
+}
