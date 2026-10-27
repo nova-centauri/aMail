@@ -71,6 +71,10 @@ export function loadConfig(env = process.env) {
   const keyModeConflicts = keyslotMode
     ? ['ENCRYPTION_KEY', 'ACCESS_TOKEN', 'REMOTE_TOKEN_KEY', 'ENCRYPT_DATABASE'].filter((name) => readEnv(env, name) !== undefined)
     : [];
+  const webauthnOrigins = String(readEnv(env, 'ORIGIN') || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
   const mib = 1024 * 1024;
 
   return Object.freeze({
@@ -196,10 +200,18 @@ export function loadConfig(env = process.env) {
     // container usually sees an internal Host, so operators pin these explicitly;
     // when unset, the RP ID and origin are derived from each request.
     webauthnRpId: String(readEnv(env, 'RP_ID') || '').trim(),
-    webauthnOrigins: String(readEnv(env, 'ORIGIN') || '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean),
+    webauthnOrigins,
+    // OAuth discovery must publish one stable issuer. Reuse the first public
+    // WebAuthn origin so existing reverse-proxy deployments need no new secret
+    // or setting; local development derives it from the request Host instead.
+    publicOrigin: webauthnOrigins.map((value) => {
+      try {
+        const url = new URL(value);
+        return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.origin : null;
+      } catch {
+        return null;
+      }
+    }).find(Boolean) || null,
     // Keywords that identify routine infrastructure digests (Proxmox, Watchtower,
     // a backup job, ...). Matching mail is hidden from the default inbox unless it
     // reports a failure, which surfaces under "Ops errors".

@@ -4,7 +4,6 @@ import { createRemoteContentService } from './services/remote-content.js';
 import { createPasskeyService } from './services/passkeys.js';
 import { createMeteringService } from './services/metering.js';
 import { createKeyslotStore, passkeyStoreFromKeyslots } from './services/keyslots.js';
-import { createAuthenticator } from './middleware/auth.js';
 import { createVault } from './vault.js';
 import { createHandoffServer, requestHandoff } from './handoff.js';
 import { createApp } from './app.js';
@@ -101,8 +100,7 @@ export function createHarness({ config, logger }) {
   if (config.keyMode !== 'keyslot') {
     const runtime = buildRuntime(config);
     const passkeys = createPasskeyService({ config, repos: runtime.repos });
-    const auth = createAuthenticator({ config });
-    const app = createApp({ ...runtime, config, logger, passkeys, auth });
+    const app = createApp({ ...runtime, config, logger, passkeys });
     harnessApp = app;
     return {
       mode: 'env',
@@ -154,8 +152,7 @@ export function createHarness({ config, logger }) {
   }
 
   const passkeys = createPasskeyService({ config, store: passkeyStoreFromKeyslots(keyslots), requestPrf: true });
-  const auth = createAuthenticator({ config, vault });
-  const app = createApp({ ...vault.runtime, logger, passkeys, auth, vault });
+  const app = createApp({ ...vault.runtime, logger, passkeys, vault });
   harnessApp = app;
 
   return {

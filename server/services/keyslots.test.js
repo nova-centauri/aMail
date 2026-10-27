@@ -73,6 +73,12 @@ test('the store writes atomically, re-reads external changes, and protects the l
 
   assert.equal(store.remove(token.id), true);
   assert.throws(() => store.remove(recovery.id), /last credential/);
+  const hiddenOauth = wrapDek(dek, {
+    type: 'token', secret: generateToken(), label: 'OAuth access', extra: { hidden: true, oauth: { kind: 'access' } },
+  });
+  store.add(hiddenOauth);
+  assert.throws(() => store.remove(recovery.id), /last credential/, 'hidden OAuth wrappers do not replace an owner credential');
+  assert.equal(store.remove(hiddenOauth.id), true);
   const escrow = wrapDek(dek, { type: 'escrow', secret: 'operator-kek' });
   store.add(escrow);
   assert.throws(() => store.remove(recovery.id), /last credential/, 'escrow does not count as a tenant credential');

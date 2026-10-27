@@ -231,7 +231,10 @@ export function createKeyslotStore({ dataDir, filePath = path.join(dataDir, KEYS
     filePath,
     initialized: () => read().slots.length > 0,
     slots: () => read().slots.map((slot) => ({ ...slot })),
-    list: () => read().slots.map(publicKeyslot),
+    // OAuth access/refresh wrappers are implementation details rather than
+    // credentials a person can manage from Settings. They are revoked and
+    // rotated by the OAuth provider, so keep them out of the keyslot UI.
+    list: () => read().slots.filter((slot) => !slot.hidden).map(publicKeyslot),
     get: (id) => read().slots.find((slot) => slot.id === id) || null,
     ofType: (type) => read().slots.filter((slot) => slot.type === type),
     add(slot) {
@@ -261,7 +264,9 @@ export function createKeyslotStore({ dataDir, filePath = path.join(dataDir, KEYS
       return mutate((data) => {
         const index = data.slots.findIndex((slot) => slot.id === id);
         if (index < 0) return false;
-        const remaining = data.slots.filter((slot, position) => position !== index && slot.type !== 'escrow' && slot.wrapped);
+        const remaining = data.slots.filter((slot, position) => (
+          position !== index && slot.type !== 'escrow' && !slot.hidden && slot.wrapped
+        ));
         if (!remaining.length) {
           throw new ConflictError('Refusing to delete the last credential that can unlock this harness. Add another keyslot first.');
         }

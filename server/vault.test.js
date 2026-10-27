@@ -97,6 +97,11 @@ test('bearer tokens authenticate by unwrapping, are cached, and stop working onc
   const second = vault.addTokenSlot({ label: 'second agent' });
   assert.equal(second.slot.type, 'token');
   assert.equal(vault.authenticateToken(second.token), second.slot.id);
+  const oauth = vault.addTokenSlot({ label: 'Claude OAuth refresh', hidden: true, oauth: { kind: 'refresh' } });
+  assert.equal(vault.listSlots().some((slot) => slot.id === oauth.slot.id), false, 'protocol wrappers stay out of Settings');
+  assert.equal(vault.authenticateToken(oauth.token), null, 'a refresh token is not a general bearer credential');
+  assert.equal(vault.authenticateToken(oauth.token, { oauthKind: 'refresh' }), oauth.slot.id);
+  assert.throws(() => vault.unlockWithSecret(oauth.token), /does not unlock/, 'OAuth tokens cannot authorize an owner session');
   assert.equal(vault.removeSlot(slotId), true);
   assert.equal(vault.authenticateToken(token), null, 'revoked token is rejected even though it was cached');
   assert.equal(vault.authenticateToken(second.token), second.slot.id);

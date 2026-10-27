@@ -20,6 +20,10 @@ function bearerToken(request) {
   return authorization.match(/^Bearer\s+(.+)$/i)?.[1] || null;
 }
 
+function acceptsOAuthToken(request) {
+  return request.path === '/mcp' || request.path === '/mcp/';
+}
+
 export function sessionCookieOptions(config) {
   return {
     httpOnly: true,
@@ -44,10 +48,12 @@ export function sessionCookieClearOptions(config) {
  * Environment mode: the classic single access token. The browser session
  * cookie carries the token itself, as it always has.
  */
-function createEnvAuthenticator({ config }) {
+function createEnvAuthenticator({ config, oauth = null }) {
   const requestHasAccess = (request) => {
     if (!config.accessToken) return true;
-    return timingSafeMatch(bearerToken(request), config.accessToken)
+    const bearer = bearerToken(request);
+    return timingSafeMatch(bearer, config.accessToken)
+      || Boolean(bearer && acceptsOAuthToken(request) && oauth?.verifyAccessToken?.(bearer, request))
       || timingSafeMatch(readCookie(request, SESSION_COOKIE), config.accessToken)
       || timingSafeMatch(readCookie(request, LEGACY_SESSION_COOKIE), config.accessToken);
   };
@@ -77,7 +83,7 @@ function createEnvAuthenticator({ config }) {
  * memory; they vanish with the process, which is also when the harness
  * re-locks, so a restart always requires a fresh keyslot credential.
  */
-function createKeyslotAuthenticator({ config, vault }) {
+function createKeyslotAuthenticator({ config, vault, oauth = null }) {
   const sessions = new Map();
 
   function pruneSessions() {
@@ -100,6 +106,7 @@ function createKeyslotAuthenticator({ config, vault }) {
 
   const requestHasAccess = (request) => {
     const bearer = bearerToken(request);
+    if (bearer && acceptsOAuthToken(request) && oauth?.verifyAccessToken?.(bearer, request)) return true;
     if (bearer && vault.authenticateToken(bearer)) return true;
     return sessionValid(readCookie(request, SESSION_COOKIE));
   };
@@ -129,8 +136,8 @@ function createKeyslotAuthenticator({ config, vault }) {
   };
 }
 
-export function createAuthenticator({ config, vault = null }) {
-  return vault ? createKeyslotAuthenticator({ config, vault }) : createEnvAuthenticator({ config });
+export function createAuthenticator({ config, vault = null, oauth = null }) {
+  return vault ? createKeyslotAuthenticator({ config, vault, oauth }) : createEnvAuthenticator({ config, oauth });
 }
 
 /** Back-compat helper for callers that only have a config. */
@@ -138,7 +145,7 @@ export function requestHasAccess(request, config) {
   return createEnvAuthenticator({ config }).requestHasAccess(request);
 }
 
-export function accessGate(auth) {
+export function accessGate(auth, { challenge = null } = {}) {
   const authenticator = typeof auth?.requestHasAccess === 'function' ? auth : createEnvAuthenticator({ config: auth });
   return (request, response, next) => {
     let allowed;
@@ -148,6 +155,14 @@ export function accessGate(auth) {
       return next(error);
     }
     if (allowed) return next();
+    const bearerChallenge = typeof challenge === 'function' ? challenge(request) : challenge;
+    if (bearerChallenge) {
+      response.set('WWW-Authenticate', bearerChallenge);
+      return response.status(401).json({
+        error: 'invalid_token',
+        error_description: 'aMail authorization is required.',
+      });
+    }
     response.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'aMail access token required.' } });
   };
 }

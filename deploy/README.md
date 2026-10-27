@@ -120,14 +120,21 @@ to `192.168.1.20:3080`. Do not make a public HTTP-only route. Keep
 `AMAIL_ACCESS_TOKEN` set: it is the application-level gate for every mailbox
 API request. A proxy-level access list or SSO is a useful additional layer.
 
-Passkeys need to know the public origin, because the container only sees the
-proxy's internal `Host`. Pin it:
+Passkeys and Claude Custom Connector OAuth discovery need to know the public
+origin, because the container only sees the proxy's internal `Host`. Pin it:
 
 ```sh
 # .env
 AMAIL_RP_ID=mail.example.com
 AMAIL_ORIGIN=https://mail.example.com
 ```
+
+Proxy the whole origin to aMail rather than only `/api`: Claude needs `/mcp`,
+`/.well-known/oauth-protected-resource/mcp`,
+`/.well-known/oauth-authorization-server`, and `/oauth/*`. In Claude, add
+`https://mail.example.com/mcp`, choose **Sign in now**, and choose **Register
+automatically**. aMail's consent page accepts the normal owner credential; it
+does not disclose that credential to Claude.
 
 `AMAIL_TRUST_PROXY` can remain `false` for this configuration because aMail
 uses Bearer-token authentication and does not need forwarded client addresses.
@@ -229,9 +236,11 @@ plaintext copy according to the storage medium's guarantees. Deleting a file
 or Docker volume alone is not reliable erasure on snapshots, SSDs, or
 copy-on-write storage.
 
-The volume also holds the SQLite write-ahead log (`*.sqlite-wal`). aMail caps
-it at 64 MiB and truncates it at startup, so a large one left by an earlier
-release shrinks on the next restart.
+The volume also holds the SQLite write-ahead log (`*.sqlite-wal`) and
+`oauth.json`, which contains public connector registrations plus hashes of
+OAuth codes/tokens (never their raw values). aMail caps the WAL at 64 MiB and
+truncates it at startup, so a large one left by an earlier release shrinks on
+the next restart.
 
 Do not delete the `amail-data` volume unless intentionally discarding all
 accounts, cached mail metadata, and settings.
@@ -379,8 +388,9 @@ with `canUnlock: false` and cannot unlock.
 3. **A credential.** Otherwise the harness waits; the next agent call with a
    valid token unlocks it.
 
-**Backups, moves, deletion.** The volume is ciphertext plus `keyslots.json`;
-snapshot it as-is. `server/tools/backup.js` refuses to run in keyslot mode
+**Backups, moves, deletion.** The volume is ciphertext plus `keyslots.json`
+and hashed connector state in `oauth.json`; snapshot it as-is.
+`server/tools/backup.js` refuses to run in keyslot mode
 because no tooling can obtain the key. Moving a tenant is stop, copy the
 volume, start elsewhere. Deleting a tenant is deleting the volume: without the
 keyslots the cache is unrecoverable, and the tenant's mail still lives on

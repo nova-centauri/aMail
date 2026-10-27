@@ -11,7 +11,7 @@ aMail is the open-source continuation of GigaMail and upgrades existing GigaMail
 ## What it does
 
 - **Unified inbox** for any number of IMAP/SMTP accounts: Gmail, iCloud, Outlook, Mail-in-a-Box, or any custom server. Threading from `Message-ID`/`References` with a safe subject fallback.
-- **One endpoint for agents.** A Streamable HTTP [MCP](https://modelcontextprotocol.io) server at `/mcp` plus a REST API at `/api`, both gated by the same access token. Cursor, Claude, or anything that speaks HTTP can list, search, read, reply, triage, and manage accounts.
+- **One endpoint for agents.** A Streamable HTTP [MCP](https://modelcontextprotocol.io) server at `/mcp` plus a REST API at `/api`. Claude Custom Connectors use OAuth; Cursor and other header-based clients can use the existing access token. Agents can list, search, read, reply, triage, and manage accounts.
 - **Analyzed flags.** `analyzedAt`/`analyzedBy` per message, `unanalyzedCount` per conversation, `is:analyzed`/`is:unanalyzed` search operators, a "Not yet analyzed" queue in the sidebar, and `message_action: analyzed` for agents. Local-only; never written back to IMAP.
 - **Explainable smart views.** Deterministic, on-device classification into Primary, GitHub CI, Logs, Status updates, and Ops errors, each with a human-readable reason. Routine infrastructure digests from sources you configure stay out of the default inbox unless they report a failure.
 - **Flagged people.** Turn any set of addresses into a sidebar folder. Edit in Settings, or let an agent manage the list with `list_flags`/`set_flags`.
@@ -42,7 +42,20 @@ npm run dev             # Vite on :5173, API on :3000
 
 ## Connecting an agent
 
-Every connected inbox is reachable through one MCP endpoint. Authenticate with `Authorization: Bearer <AMAIL_ACCESS_TOKEN>` (or the browser session cookie).
+Every connected inbox is reachable through one MCP endpoint. aMail supports the OAuth authorization-code flow used by Claude Custom Connectors as well as `Authorization: Bearer <AMAIL_ACCESS_TOKEN>` for header-based clients.
+
+### Claude Custom Connector
+
+The hosted Claude apps connect from Anthropic's network, so the aMail deployment must have a public HTTPS URL. Set `AMAIL_ORIGIN` to that exact origin (for example, `https://mail.example.com`) and proxy all paths on the origin to aMail, including `/.well-known/*`, `/oauth/*`, and `/mcp`.
+
+1. In Claude, open **Customize → Connectors → Add custom connector**.
+2. Enter `https://mail.example.com/mcp` as the server URL.
+3. Choose **Sign in now** and **Register automatically** for the OAuth client. Leave client ID and secret blank.
+4. On aMail's authorization page, review the access request and enter the same owner credential used to unlock aMail. The credential is checked only by aMail and is never sent to Claude.
+
+aMail publishes RFC 9728/RFC 8414 discovery metadata, requires authorization-code + S256 PKCE, rotates public-client refresh tokens, and continues to accept existing bearer-token integrations. OAuth codes and tokens are stored only as SHA-256 hashes in `oauth.json`; keyslot deployments also use hidden, revocable wrappers so a valid Claude token can unlock the encrypted harness after a restart.
+
+### Header-based clients
 
 ```json
 {
@@ -92,7 +105,7 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_ACCESS_TOKEN` | **Required.** Gates the UI, REST API, and MCP endpoint |
 | `AMAIL_BIND_ADDRESS`, `AMAIL_PORT` | Where Compose publishes the app (default `127.0.0.1:3080`) |
 | `AMAIL_MEMORY_LIMIT`, `AMAIL_TOR_MEMORY_LIMIT` | Container memory caps (default `1536m` and `256m`) |
-| `AMAIL_RP_ID`, `AMAIL_ORIGIN` | Public hostname/origin for passkeys behind a reverse proxy |
+| `AMAIL_RP_ID`, `AMAIL_ORIGIN` | Public hostname/origin for passkeys and Claude OAuth discovery behind a reverse proxy; put the public HTTPS origin first when several are listed |
 | `AMAIL_OPS_SOURCES` | Comma-separated keywords for your infrastructure digests (default `proxmox,watchtower`; empty disables) |
 | `AMAIL_TRUST_PROXY`, `AMAIL_COOKIE_SECURE` | Reverse-proxy and cookie hardening |
 | `AMAIL_SYNC_*`, `SYNC_INTERVAL_MINUTES` | Initial window, timeouts, size caps, 60s minimum interval, IMAP pool idle, background polling |

@@ -4,12 +4,13 @@ import { createAmailMcpServer } from '../mcp/server.js';
 import { createDeepSearchService } from '../services/deep-search.js';
 
 /**
- * Mount a Cursor-compatible Streamable HTTP MCP endpoint at /mcp.
- * Auth reuses the same Bearer token / session cookie gate as /api.
+ * Mount a stateless Streamable HTTP MCP endpoint at /mcp.
+ * Auth accepts the existing aMail credential and OAuth access tokens minted by
+ * the Claude custom-connector flow.
  */
-export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, deepSearch = null }) {
+export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, oauth = null, deepSearch = null }) {
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
-  const gate = accessGate(auth);
+  const gate = accessGate(auth, { challenge: (request) => oauth?.challenge?.(request) });
   const handleMcp = async (request, response) => {
     const server = createAmailMcpServer({
       config,
