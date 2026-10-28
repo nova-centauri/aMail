@@ -106,6 +106,7 @@ export function sanitizeMcpToolArgs(name, args = {}) {
         idChars: String(input.id || '').length,
         hasUntil: Boolean(input.until),
       };
+    case 'save_draft':
     case 'send_message':
       return {
         tool,

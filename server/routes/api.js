@@ -19,8 +19,7 @@ import {
   discoverAccountProvider,
   mailProviderCatalog,
 } from '../utils/mail.js';
-import { mergeDraftAttachments, normalizeComposeAttachments } from '../services/compose-attachments.js';
-import { sanitizeComposeHtml } from '../utils/signature.js';
+import { providerDraft, saveDraft } from '../services/drafts.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
@@ -712,91 +711,29 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       .map(({ draft }) => draft)
       .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
   };
-  const providerDraft = (id) => {
-    const message = repos.messages.get(id);
-    if (!message?.isDraft || message.isTrashed || message.isSpam) return null;
-    return {
-      id: message.id,
-      accountId: message.accountId,
-      threadId: message.threadId,
-      to: message.to || [],
-      cc: message.cc || [],
-      bcc: message.bcc || [],
-      subject: message.subject === '(no subject)' ? '' : (message.subject || ''),
-      htmlBody: message.htmlBody || '',
-      textBody: message.textBody || '',
-      attachments: message.attachments || [],
-      updatedAt: message.receivedAt || message.sentAt || message.updatedAt,
-      createdAt: message.createdAt || message.receivedAt || message.sentAt,
-    };
-  };
   router.get('/drafts', (request, response) => {
     const accountId = String(request.query.accountId || '');
     response.json({ drafts: storedDrafts(accountId) });
   });
   router.post('/drafts', (request, response) => {
-    const body = request.body || {};
-    if (!repos.accounts.get(body.accountId)) throw new NotFoundError('Mail account not found.');
-    const draft = repos.drafts.create({
-      account_id: body.accountId,
-      thread_id: body.threadId || null,
-      to_json: JSON.stringify(body.to || []),
-      cc_json: JSON.stringify(body.cc || []),
-      bcc_json: JSON.stringify(body.bcc || []),
-      subject: String(body.subject || '').slice(0, 998),
-      html_body: sanitizeComposeHtml(body.htmlBody).slice(0, 1_000_000),
-      text_body: String(body.textBody || '').slice(0, 1_000_000),
-      attachments_json: JSON.stringify(normalizeComposeAttachments(body.attachments || [])),
-    });
+    const { draft } = saveDraft(repos, request.body || {});
     response.status(201).json({ draft });
   });
   router.get('/drafts/:id', (request, response) => {
-    const draft = repos.drafts.get(request.params.id) || providerDraft(request.params.id);
+    const draft = repos.drafts.get(request.params.id) || providerDraft(repos, request.params.id);
     if (!draft) throw new NotFoundError('Draft not found.');
     response.json({ draft });
   });
   router.patch('/drafts/:id', (request, response) => {
-    const existing = repos.drafts.get(request.params.id);
-    if (!existing) {
-      const synced = providerDraft(request.params.id);
-      if (!synced) throw new NotFoundError('Draft not found.');
-      const body = request.body || {};
-      const accountId = body.accountId || synced.accountId;
-      if (!repos.accounts.get(accountId)) throw new NotFoundError('Mail account not found.');
-      const threadId = [body.threadId, synced.threadId].find((id) => id && repos.threads.get(id)) || null;
-      const draft = repos.drafts.create({
-        account_id: accountId,
-        thread_id: threadId,
-        to_json: JSON.stringify(body.to || synced.to || []),
-        cc_json: JSON.stringify(body.cc || synced.cc || []),
-        bcc_json: JSON.stringify(body.bcc || synced.bcc || []),
-        subject: String(body.subject ?? synced.subject ?? '').slice(0, 998),
-        html_body: sanitizeComposeHtml(body.htmlBody ?? synced.htmlBody).slice(0, 1_000_000),
-        text_body: String(body.textBody ?? synced.textBody ?? '').slice(0, 1_000_000),
-        attachments_json: JSON.stringify(mergeDraftAttachments(body.attachments ?? synced.attachments ?? [], synced.attachments || [])),
-      });
-      response.status(201).json({ draft });
-      return;
-    }
-    const body = request.body || {};
-    const draft = repos.drafts.update(existing.id, {
-      thread_id: body.threadId ?? existing.threadId,
-      to_json: JSON.stringify(body.to ?? existing.to),
-      cc_json: JSON.stringify(body.cc ?? existing.cc),
-      bcc_json: JSON.stringify(body.bcc ?? existing.bcc),
-      subject: String(body.subject ?? existing.subject).slice(0, 998),
-      html_body: sanitizeComposeHtml(body.htmlBody ?? existing.htmlBody).slice(0, 1_000_000),
-      text_body: String(body.textBody ?? existing.textBody).slice(0, 1_000_000),
-      ...(body.attachments !== undefined ? { attachments_json: JSON.stringify(mergeDraftAttachments(body.attachments, existing.attachments || [])) } : {}),
-    });
-    response.json({ draft });
+    const { draft, created } = saveDraft(repos, request.body || {}, request.params.id);
+    response.status(created ? 201 : 200).json({ draft });
   });
   router.delete('/drafts/:id', async (request, response) => {
     if (repos.drafts.remove(request.params.id)) {
       response.status(204).end();
       return;
     }
-    const synced = providerDraft(request.params.id);
+    const synced = providerDraft(repos, request.params.id);
     if (!synced) throw new NotFoundError('Draft not found.');
     if (mailService?.updateMessageState) await mailService.updateMessageState(synced.id, { isTrashed: true });
     else repos.messages.setState(synced.id, { isTrashed: true });

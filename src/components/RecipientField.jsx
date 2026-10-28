@@ -157,10 +157,8 @@ export function RecipientField({
           }}
           onFocus={() => setOpen(true)}
           onBlur={() => {
-            window.setTimeout(() => {
-              commitQuery({ requireValid: true });
-              setOpen(false);
-            }, 80);
+            commitQuery({ requireValid: true });
+            setOpen(false);
           }}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}

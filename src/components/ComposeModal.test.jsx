@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { api } from '../api.js';
@@ -218,5 +218,75 @@ describe('ComposeModal', () => {
     expect(onClose).toHaveBeenCalled();
     expect(onDraftRemoved).not.toHaveBeenCalled();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('saves without closing or sending and updates the same draft on the next save', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const onSent = vi.fn();
+    const onDraftSaved = vi.fn();
+    api.mockImplementation(async (_path, options) => ({ draft: { id: 'saved-1', ...JSON.parse(options.body) } }));
+    render(<ComposeModal account={account} accounts={[account]} contacts={contacts} onClose={onClose} onSent={onSent} onDraftSaved={onDraftSaved} onDraftRemoved={vi.fn()} />);
+
+    const body = screen.getByRole('textbox', { name: 'Message body' });
+    await user.type(body, 'Work in progress');
+    // Saving must include a typed address even before Enter turns it into a chip.
+    await user.type(screen.getByLabelText('Recipients'), 'reviewer@example.test');
+    await user.click(screen.getByRole('button', { name: 'Save draft' }));
+    await waitFor(() => expect(onDraftSaved).toHaveBeenCalledTimes(1));
+    expect(api).toHaveBeenLastCalledWith('/drafts', expect.objectContaining({ method: 'POST' }));
+    const payload = JSON.parse(api.mock.calls.at(-1)[1].body);
+    expect(payload.textBody).toContain('Work in progress');
+    expect(payload.to).toEqual([{ name: '', email: 'reviewer@example.test' }]);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onSent).not.toHaveBeenCalled();
+    expect(body).toHaveTextContent('Work in progress');
+
+    await user.type(screen.getByLabelText('Subject'), 'Updated subject');
+    await user.click(screen.getByRole('button', { name: 'Save draft' }));
+    await waitFor(() => expect(onDraftSaved).toHaveBeenCalledTimes(2));
+    expect(api).toHaveBeenLastCalledWith('/drafts/saved-1', expect.objectContaining({ method: 'PATCH' }));
+    expect(JSON.parse(api.mock.calls.at(-1)[1].body).subject).toBe('Updated subject');
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onSent).not.toHaveBeenCalled();
+  });
+
+  it('keeps the writer contents and allows retry when saving fails', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const onDraftSaved = vi.fn();
+    api.mockRejectedValueOnce(new Error('Connection unavailable'));
+    render(<ComposeModal account={account} accounts={[account]} onClose={onClose} onSent={vi.fn()} onDraftSaved={onDraftSaved} onDraftRemoved={vi.fn()} />);
+    await user.type(screen.getByLabelText('Subject'), 'Do not lose this');
+    await user.click(screen.getByRole('button', { name: 'Save draft' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Draft could not be saved. Connection unavailable');
+    expect(screen.getByLabelText('Subject')).toHaveValue('Do not lose this');
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onDraftSaved).not.toHaveBeenCalled();
+    api.mockResolvedValueOnce({ draft: { id: 'retry-1', subject: 'Do not lose this' } });
+    await user.click(screen.getByRole('button', { name: 'Save draft' }));
+    await waitFor(() => expect(onDraftSaved).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('can save an empty draft and prevents switching accounts while the first save is pending', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const onDraftSaved = vi.fn();
+    let finishSave;
+    api.mockImplementationOnce(() => new Promise((resolve) => { finishSave = resolve; }));
+    const otherAccount = { id: 'acc-2', name: 'Other', email: 'other@example.test' };
+    render(<ComposeModal account={account} accounts={[account, otherAccount]} onClose={onClose} onSent={vi.fn()} onDraftSaved={onDraftSaved} onDraftRemoved={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: 'Save draft' }));
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(screen.getByLabelText('Send from account')).toBeDisabled();
+    expect(JSON.parse(api.mock.calls.at(-1)[1].body)).toMatchObject({ accountId: account.id, to: [], subject: '', textBody: '' });
+    await act(async () => finishSave({ draft: { id: 'blank-1', accountId: account.id } }));
+    expect(onDraftSaved).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Send from account')).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Save draft' })).toBeEnabled();
   });
 });

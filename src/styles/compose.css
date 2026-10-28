@@ -61,6 +61,9 @@
 .send-button { height: 36px; padding: 0 20px; border-radius: var(--r-pill); color: var(--accent-ink); background: var(--accent-strong); font-size: var(--fs-sm); font-weight: 700; margin-right: 6px; }
 .send-button:hover:not(:disabled) { filter: brightness(1.08); }
 .send-button:disabled { opacity: .6; }
+.save-draft-button { height: 36px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: var(--r-pill); color: var(--ink); background: var(--bg-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; }
+.save-draft-button:hover:not(:disabled) { background: var(--bg-3); }
+.save-draft-button:disabled { opacity: .6; }
 .compose-spacer { flex: 1; }
 
 /* ---- Rich text editor ---- */
