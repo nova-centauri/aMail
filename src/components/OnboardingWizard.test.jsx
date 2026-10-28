@@ -12,6 +12,8 @@ describe('agentConfigSnippets', () => {
     const snippets = agentConfigSnippets('https://mail.example.com/mcp');
     expect(JSON.parse(snippets.cursor.code).mcpServers.amail.url).toBe('https://mail.example.com/mcp');
     expect(JSON.parse(snippets.claude.code).mcpServers.amail.headers.Authorization).toBe('Bearer <AMAIL_ACCESS_TOKEN>');
+    expect(snippets.claudeConnector.code).toContain('Authentication: Sign in now');
+    expect(snippets.claudeConnector.code).toContain('OAuth client: Register automatically');
     expect(snippets.curl.code).toContain('https://mail.example.com/api/messages?folder=inbox&q=is%3Aunanalyzed');
     expect(Object.values(snippets).some((snippet) => /[0-9a-f]{32}/i.test(snippet.code))).toBe(false);
   });
@@ -37,7 +39,7 @@ describe('OnboardingWizard', () => {
 
     expect(screen.getByRole('heading', { name: /connect an agent/i })).toBeInTheDocument();
     expect(screen.getByText(`${window.location.origin}/mcp`)).toBeInTheDocument();
-    await user.click(screen.getByRole('tab', { name: /claude/i }));
+    await user.click(screen.getByRole('tab', { name: /claude code/i }));
     expect(screen.getByRole('tabpanel')).toHaveTextContent('"type": "http"');
     await user.click(screen.getByRole('button', { name: /copy config/i }));
     expect(await window.navigator.clipboard.readText()).toContain('/mcp');

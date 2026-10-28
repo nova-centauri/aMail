@@ -55,6 +55,17 @@ test('a keyslot harness boots locked, provisions once, and gates everything on a
   assert.equal(session.authenticated, false);
   assert.equal(session.locked, true);
 
+  const oauthChallenge = await fetch(`${origin}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }),
+  });
+  assert.equal(oauthChallenge.status, 401);
+  assert.match(oauthChallenge.headers.get('www-authenticate'), /resource_metadata="http:\/\/127\.0\.0\.1:\d+\/\.well-known\/oauth-protected-resource\/mcp"/);
+  const oauthMetadata = await (await fetch(`${origin}/.well-known/oauth-protected-resource/mcp`)).json();
+  assert.equal(oauthMetadata.resource, `${origin}/mcp`);
+  assert.deepEqual(oauthMetadata.authorization_servers, [origin]);
+
   // Public routes that need the database answer with a clear locked code.
   const avatar = await fetch(`${origin}/api/accounts/some-id/avatar`);
   assert.equal(avatar.status, 503);

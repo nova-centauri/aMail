@@ -22,8 +22,18 @@ export function agentConfigSnippets(url, tokenPlaceholder = '<AMAIL_ACCESS_TOKEN
       hint: 'Add to ~/.cursor/mcp.json or the project .cursor/mcp.json.',
       code: JSON.stringify({ mcpServers: { amail: { url, headers } } }, null, 2),
     },
+    claudeConnector: {
+      label: 'Claude Custom',
+      hint: 'In Claude, open Customize → Connectors → Add custom connector. OAuth keeps the aMail credential out of Claude.',
+      code: [
+        `Server URL: ${url}`,
+        'Authentication: Sign in now',
+        'OAuth client: Register automatically',
+        'Client ID / secret: leave blank',
+      ].join('\n'),
+    },
     claude: {
-      label: 'Claude Desktop / Code',
+      label: 'Claude Code',
       hint: 'claude mcp add --transport http amail <url> --header "Authorization: Bearer …" also works.',
       code: JSON.stringify({ mcpServers: { amail: { type: 'http', url, headers } } }, null, 2),
     },
@@ -89,7 +99,7 @@ function WelcomeStep({ onNext, onSkip }) {
       </div>
       <ul className="wizard-feature-list">
         <li><span className="wizard-feature-icon"><Icon name="inbox" size={18} /></span><span><strong>All of your inboxes, one workspace</strong><small>Gmail, iCloud, Outlook, Mail-in-a-Box, or any IMAP provider. Credentials are encrypted on your server and never stored in the browser.</small></span></li>
-        <li><span className="wizard-feature-icon"><Icon name="branch" size={18} /></span><span><strong>One endpoint for your agents</strong><small>Cursor, Claude, or anything that speaks MCP or HTTP connects at <code>/mcp</code> with the same access token you use.</small></span></li>
+        <li><span className="wizard-feature-icon"><Icon name="branch" size={18} /></span><span><strong>One endpoint for your agents</strong><small>Claude connects with OAuth; Cursor and other MCP or HTTP clients can use a Bearer token at <code>/mcp</code>.</small></span></li>
         <li><span className="wizard-feature-icon"><Icon name="sparkles" size={18} /></span><span><strong>Analyzed, not just read</strong><small>Every message carries an agent-side flag alongside read/unread. Agents ask for <code>is:unanalyzed</code> mail, do their work, and mark it analyzed so nothing is processed twice.</small></span></li>
         <li><span className="wizard-feature-icon"><Icon name="shield" size={18} /></span><span><strong>Private by default</strong><small>Trackers are blocked, remote images load through an optional Tor relay, and the app binds to localhost unless you say otherwise.</small></span></li>
       </ul>
@@ -175,7 +185,7 @@ function AgentStep({ serverInfo, onNext, onBack }) {
         <CopyButton text={url} label="Copy URL" />
       </div>
       {authProtected ? (
-        <p className="wizard-note"><Icon name="lock" size={14} /> Send your server's <code>AMAIL_ACCESS_TOKEN</code> as a Bearer token. It is the same value you used to unlock this browser; it is never shown here.</p>
+        <p className="wizard-note"><Icon name="lock" size={14} /> Claude Custom uses a secure sign-in page. Header-based clients can still send <code>AMAIL_ACCESS_TOKEN</code> as a Bearer token; the value is never shown here.</p>
       ) : (
         <p className="wizard-note is-warning"><Icon name="alert" size={14} /> This server has no access token configured. Set <code>AMAIL_ACCESS_TOKEN</code> before exposing it to agents or a network.</p>
       )}

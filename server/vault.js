@@ -185,9 +185,9 @@ export function createVault({ config, keyslots, buildRuntime, logger, onUnlock =
   }
 
   /** Try a credential against slots of the given types; returns the slot or null. */
-  function trySlots(secret, types) {
+  function trySlots(secret, types, accept = () => true) {
     for (const slot of keyslots.slots()) {
-      if (!types.includes(slot.type) || !slot.wrapped) continue;
+      if (!types.includes(slot.type) || !slot.wrapped || !accept(slot)) continue;
       const candidate = unwrapDek(slot, secret);
       if (candidate) return { slot, dek: candidate };
     }
@@ -202,7 +202,10 @@ export function createVault({ config, keyslots, buildRuntime, logger, onUnlock =
     const candidates = types || (looksLikeToken(text)
       ? ['token']
       : looksLikeRecoveryCode(text) ? ['recovery', 'passphrase'] : ['passphrase', 'recovery']);
-    const match = trySlots(text, candidates);
+    // OAuth access and refresh wrappers are purpose-bound protocol tokens, not
+    // owner credentials. They must not unlock a browser session or authorize a
+    // second connector grant.
+    const match = trySlots(text, candidates, (slot) => !slot.oauth);
     if (!match) throw new KeyslotError('That credential does not unlock this harness.', 'KEYSLOT_INVALID', 401);
     unlockWithDek(match.dek, { via: `${via}:${match.slot.type}`, slotId: match.slot.id });
     match.dek.fill(0);
@@ -211,18 +214,21 @@ export function createVault({ config, keyslots, buildRuntime, logger, onUnlock =
   }
 
   /** Bearer-token check used by the access gate on every request. */
-  function authenticateToken(token) {
+  function authenticateToken(token, { oauthKind = null } = {}) {
     if (!looksLikeToken(token)) return null;
     const digest = hashToken(token);
+    const accepts = (slot) => (oauthKind ? slot.oauth?.kind === oauthKind : !slot.oauth);
     if (isUnlocked()) {
       const cached = tokenCache.get(digest);
       if (cached) {
         // Revocation deletes the slot; the cache must not outlive it.
-        if (keyslots.get(cached)) return cached;
+        const slot = keyslots.get(cached);
+        if (slot && accepts(slot)) return cached;
+        if (slot) return null;
         tokenCache.delete(digest);
       }
     }
-    const match = trySlots(token, ['token']);
+    const match = trySlots(token, ['token'], accepts);
     if (!match) return null;
     if (!isUnlocked()) unlockWithDek(match.dek, { via: 'bearer:token', slotId: match.slot.id });
     match.dek.fill(0);
@@ -264,9 +270,17 @@ export function createVault({ config, keyslots, buildRuntime, logger, onUnlock =
     return { token, recoveryCode, keyslots: keyslots.list() };
   }
 
-  function addTokenSlot({ label = '' } = {}) {
+  function addTokenSlot({ label = '', hidden = false, oauth = null } = {}) {
     const token = generateToken();
-    const slot = addSlot({ type: 'token', secret: token, label });
+    const slot = addSlot({
+      type: 'token',
+      secret: token,
+      label,
+      extra: {
+        ...(hidden ? { hidden: true } : {}),
+        ...(oauth ? { oauth } : {}),
+      },
+    });
     return { token, slot };
   }
 

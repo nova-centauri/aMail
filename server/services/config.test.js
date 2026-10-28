@@ -57,6 +57,11 @@ test('WebAuthn origin and RP ID come only from explicit configuration', () => {
     loadConfig({ AMAIL_ORIGIN: 'https://mail.example.test,http://localhost:5173' }).webauthnOrigins,
     ['https://mail.example.test', 'http://localhost:5173'],
   );
+  assert.equal(
+    loadConfig({ AMAIL_ORIGIN: 'https://mail.example.test,http://localhost:5173' }).publicOrigin,
+    'https://mail.example.test',
+  );
+  assert.equal(loadConfig({}).publicOrigin, null);
   assert.equal(loadConfig({}).webauthnRpName, 'aMail');
 });
 

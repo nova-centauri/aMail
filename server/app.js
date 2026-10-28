@@ -6,15 +6,18 @@ import pinoHttp from 'pino-http';
 import { registerApi } from './routes/api.js';
 import { registerMcp } from './routes/mcp.js';
 import { errorHandler, notFound } from './middleware/errors.js';
-import { createAuthenticator } from './middleware/auth.js';
+import { accessGate, createAuthenticator } from './middleware/auth.js';
 import { logSerializers } from './logging.js';
 import { requestTiming } from './middleware/request-timing.js';
 import { createDeepSearchService } from './services/deep-search.js';
 import { createEventLoopWatchdog } from './services/event-loop-watchdog.js';
-import { accessGate } from './middleware/auth.js';
 import { browserOriginGuard, needsLargeJsonBody } from './middleware/request-security.js';
+import { createOAuthProvider } from './services/oauth-provider.js';
+import { registerOAuth } from './routes/oauth.js';
 
-export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, eventLoopWatchdog = null }) {
+export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = null, oauth = null, vault = null, deepSearch = null, eventLoopWatchdog = null }) {
+  const oauthProvider = oauth || createOAuthProvider({ config, vault });
+  const authenticator = auth || createAuthenticator({ config, vault, oauth: oauthProvider });
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy);
@@ -62,7 +65,12 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   // endpoint stays on a deliberately small parser and compressed request bodies
   // are rejected to avoid decompression-amplification work.
   const largeJson = express.json({ limit: '12mb', inflate: false, type: jsonTypes });
-  const largeBodyGate = accessGate(auth);
+  const largeBodyGate = accessGate(authenticator, {
+    // This gate runs before the route-specific MCP gate so large unauthenticated
+    // payloads are rejected before allocation. It must carry the same OAuth
+    // challenge or Claude cannot discover the authorization server.
+    challenge: (request) => (request.path === '/mcp' ? oauthProvider.challenge(request) : null),
+  });
   app.use((request, response, next) => {
     if (!needsLargeJsonBody(request)) return standardJson(request, response, next);
     return largeBodyGate(request, response, (error) => {
@@ -82,13 +90,14 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
     enable: config.env !== 'test',
   });
   app.locals.eventLoopWatchdog = watchdog;
-  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog });
-  registerMcp(app, { config, repos, mailService, remoteContent, auth, deepSearch: searchJobs });
+  registerOAuth(app, { auth: authenticator, oauth: oauthProvider });
+  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth: authenticator, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog });
+  registerMcp(app, { config, repos, mailService, remoteContent, auth: authenticator, oauth: oauthProvider, deepSearch: searchJobs });
   app.use('/api', notFound);
 
   if (fs.existsSync(config.staticDir)) {
     app.use(express.static(config.staticDir, { index: false, maxAge: config.env === 'production' ? '1h' : 0 }));
-    app.get(/^(?!\/(?:api|mcp)(?:\/|$)).*/, (request, response, next) => {
+    app.get(/^(?!\/(?:api|mcp|oauth|\.well-known)(?:\/|$)).*/, (request, response, next) => {
       if (!request.accepts('html')) return next();
       response.sendFile(path.join(config.staticDir, 'index.html'));
     });

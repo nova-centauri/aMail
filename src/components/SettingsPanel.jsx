@@ -106,7 +106,7 @@ export function SettingsPanel({
           </section>
           <section className="settings-section agent-settings-section">
             <div className="settings-section-title"><h3>Agents</h3><Icon name="sparkles" size={20} /></div>
-            <p className="settings-description">MCP endpoint: <code>{`${window.location.origin}/mcp`}</code>. Authenticate with the server access token as a Bearer header.</p>
+            <p className="settings-description">MCP endpoint: <code>{`${window.location.origin}/mcp`}</code>. Claude Custom can sign in with OAuth; header-based clients can use the server access token as a Bearer credential.</p>
             {opsSources.length > 0 && (
               <>
                 <p className="settings-description">Ops digest sources (set <code>AMAIL_OPS_SOURCES</code> on the server to change):</p>
