@@ -9,6 +9,8 @@ import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js
 import { discoverAccountProvider, mailProviderCatalog } from '../utils/mail.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
 import { configuredOpsSources } from '../services/smart-filter.js';
+import { saveDraft } from '../services/drafts.js';
+import { publicAttachmentMeta } from '../services/compose-attachments.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { logMcpToolCall } from '../services/messages-query-log.js';
 
@@ -410,11 +412,40 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     };
   }));
 
+  server.registerTool('save_draft', {
+    title: 'Save draft',
+    description: 'Save an unsent draft in aMail for review or editing in the UI. Never sends mail or writes to the provider. Supply accountId for a new draft, or draftId to update a saved draft; omitted fields are preserved on update. Returns draft.id for subsequent saves. Provider drafts are copied locally; use the returned id thereafter.',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: {
+      accountId: z.string().optional().describe('Required for a new draft; saved drafts keep their original account'),
+      draftId: z.string().min(1).optional().describe('Existing draft id to update; omit to create'),
+      threadId: z.string().nullable().optional().describe('Related thread id, or null to unlink'),
+      to: z.array(recipientSchema).optional(),
+      cc: z.array(recipientSchema).optional(),
+      bcc: z.array(recipientSchema).optional(),
+      subject: z.string().optional(),
+      textBody: z.string().optional(),
+      htmlBody: z.string().optional(),
+      attachments: z.array(z.object({
+        filename: z.string(),
+        contentType: z.string().optional(),
+        content: z.string().optional().describe('Base64 bytes required for new attachments'),
+        index: z.number().int().nonnegative().optional(),
+        size: z.number().nonnegative().optional(),
+        contentId: z.string().optional(),
+      })).optional().describe('Up to 8 files, 8 MiB combined; omit to preserve existing attachments, [] to remove'),
+    },
+  }, async ({ draftId, ...input }) => runTool(async () => {
+    const { draft } = saveDraft(repos, input, draftId);
+    return { draft: clipMcpMessage({ ...draft, attachments: draft.attachments.map(publicAttachmentMeta) }) };
+  }));
+
   server.registerTool('send_message', {
     title: 'Send message',
     description: 'Compose and send mail through an existing account via SMTP.',
     inputSchema: {
       accountId: z.string().describe('Sending account id'),
+      draftId: z.string().optional().describe('Saved local draft to remove after successful sending'),
       to: z.array(recipientSchema).optional().describe('To recipients'),
       cc: z.array(recipientSchema).optional().describe('Cc recipients'),
       bcc: z.array(recipientSchema).optional().describe('Bcc recipients'),

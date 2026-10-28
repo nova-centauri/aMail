@@ -1015,7 +1015,8 @@ export default function App() {
 
   const draftSaved = (draft, senderAccount, localOnly) => {
     const id = String(draft?.id || `preview-${Date.now()}`);
-    const replacesExisting = threads.some((item) => item.draftId === id || item.id === `draft:${id}`);
+    const replacesExisting = savedDrafts.some((item) => item.id === id || item.draftId === id)
+      || threads.some((item) => item.draftId === id || item.id === `draft:${id}`);
     const accountId = String(draft?.accountId || senderAccount?.id || '');
     const timestamp = draft?.updatedAt || new Date().toISOString();
     const draftThread = normalizeThread({
@@ -1047,7 +1048,9 @@ export default function App() {
       }],
     });
     if (localOnly) demoDraftsRef.current = [draftThread, ...demoDraftsRef.current.filter((item) => item.draftId !== id)];
-    setThreads((current) => [draftThread, ...current.filter((item) => item.draftId !== id && item.id !== `draft:${id}`)]);
+    if (activeFolder === 'drafts') {
+      setThreads((current) => [draftThread, ...current.filter((item) => item.draftId !== id && item.id !== `draft:${id}`)]);
+    }
     setSavedDrafts((current) => [normalizeFreshDraft({ ...draft, id, accountId, updatedAt: timestamp }), ...current.filter((item) => item.id !== id && item.draftId !== id)]);
     if (!replacesExisting) {
       setFolderCounts((current) => ({ ...current, drafts: current.drafts + 1 }));

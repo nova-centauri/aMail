@@ -132,8 +132,8 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
   });
   const saveDraft = async ({ closeAfter = true } = {}) => {
     if (isSending || isSavingDraft) return false;
-    if (!hasUnsavedContent()) {
-      if (closeAfter) onClose();
+    if (!hasUnsavedContent() && closeAfter) {
+      onClose();
       return true;
     }
     if (!senderAccount?.id) {
@@ -142,6 +142,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
     }
     setError('');
     setIsSavingDraft(true);
+    pristineRef.current = false;
     const payload = draftPayload();
     try {
       if (isDemo) {
@@ -307,7 +308,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
           {accounts.length > 1 && (
             <div className="recipient-line from-line">
               <span>From</span>
-              <select value={senderId} onChange={(event) => setSenderId(event.target.value)} aria-label="Send from account" disabled={Boolean(draftId)} title={draftId ? 'A saved draft stays with its original account' : undefined}>
+              <select value={senderId} onChange={(event) => setSenderId(event.target.value)} aria-label="Send from account" disabled={Boolean(draftId) || isSending || isSavingDraft} title={draftId ? 'A saved draft stays with its original account' : undefined}>
                 {accounts.map((item) => <option key={item.id} value={item.id}>{item.name} &lt;{item.email}&gt;</option>)}
               </select>
             </div>
@@ -352,6 +353,7 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
           {error && <p className="compose-error" role="alert">{error}</p>}
           <div className="compose-footer">
             <button type="submit" className="send-button" disabled={isSending || isSavingDraft}>{isSending ? 'Sending…' : 'Send'}</button>
+            <button type="button" className="save-draft-button" onClick={() => void saveDraft({ closeAfter: false })} disabled={isSending || isSavingDraft}>{isSavingDraft ? 'Saving…' : 'Save draft'}</button>
             <input
               ref={fileRef}
               type="file"

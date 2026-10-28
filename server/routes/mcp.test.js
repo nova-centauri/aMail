@@ -11,6 +11,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createDatabase, createRepositories } from '../db.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerMcp } from './mcp.js';
+import { registerApi } from './api.js';
 import { ServiceUnavailableError } from '../errors.js';
 
 function messageInput({ accountId, threadId, uid, subject, fromEmail, timestamp }) {
@@ -312,6 +313,7 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
     'get_attachment',
     'get_thread',
     'send_message',
+    'save_draft',
     'message_action',
     'sync_mail',
     'get_sync_job',
@@ -486,6 +488,122 @@ test('MCP endpoint requires access token and exposes inbox tools', async (t) => 
   assert.equal(repos.messages.get(firstMessage.id).isRead, false);
   const repeatedMark = JSON.parse((await mark([firstMessage.id])).body.result.content[0].text);
   assert.equal(repeatedMark.messages[0].isAnalyzed, true);
+});
+
+test('drafts saved through MCP and REST share one unsent working copy', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-drafts-'));
+  const token = 'test-draft-access-token';
+  const config = { dataDir, dbPath: path.join(dataDir, 'mail.sqlite'), credentialKey: Buffer.alloc(32, 7), accessToken: token };
+  const repos = createRepositories(createDatabase(config));
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', color: '#1a73e8', provider: 'custom',
+    avatar_blob: null, avatar_mime: null,
+    imap_host: 'imap.example.test', imap_port: 993, imap_secure: 1,
+    smtp_host: 'smtp.example.test', smtp_port: 465, smtp_secure: 1,
+    credential_ciphertext: 'unused-test-credential', signature: '', sync_enabled: 1,
+  });
+  const mailService = {
+    sendMessage() { assert.fail('Saving a draft must never send mail'); },
+    updateMessageState() { assert.fail('Saving a draft must never change provider state'); },
+  };
+  const app = express();
+  app.use(express.json());
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  registerMcp(app, { config, repos, mailService });
+  app.use(errorHandler({ error() {} }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const call = async (args, accessToken = token) => mcpRpc(origin, {
+    token: accessToken, method: 'tools/call', params: { name: 'save_draft', arguments: args },
+  });
+  const rest = (route, options = {}) => fetch(`${origin}/api${route}`, {
+    ...options, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+  });
+  const content = Buffer.from('working notes').toString('base64');
+  assert.equal((await call({ accountId: account.id }, 'wrong-token')).response.status, 401);
+  assert.equal(repos.drafts.listAll().length, 0);
+  const saved = await call({
+    accountId: account.id,
+    to: [{ name: 'Reviewer', email: 'reviewer@example.test' }],
+    cc: ['copy@example.test'], bcc: ['private@example.test'],
+    subject: 'Review before sending', textBody: 'First version',
+    htmlBody: '<p>First <strong>version</strong></p><script>alert(1)</script>',
+    attachments: [{ filename: 'notes.txt', contentType: 'text/plain', content }],
+  });
+  assert.notEqual(saved.body.result.isError, true);
+  const { draft } = JSON.parse(saved.body.result.content[0].text);
+  assert.ok(draft.id);
+  assert.equal(draft.attachments[0].content, undefined, 'MCP save results omit file bytes');
+  const detail = (await (await rest(`/drafts/${draft.id}`)).json()).draft;
+  assert.equal(detail.subject, 'Review before sending');
+  assert.equal(detail.attachments[0].content, content);
+  assert.match(detail.htmlBody, /<strong>version<\/strong>/);
+  assert.doesNotMatch(detail.htmlBody, /script|alert/);
+  const listed = await (await rest('/messages?folder=drafts')).json();
+  assert.equal(listed.total, 1);
+  assert.equal(listed.messages[0].draftId, draft.id);
+  assert.equal(listed.folderCounts.drafts, 1);
+
+  const updated = await call({ draftId: draft.id, textBody: 'Second version' });
+  const next = JSON.parse(updated.body.result.content[0].text).draft;
+  assert.equal(next.id, draft.id);
+  assert.equal(next.textBody, 'Second version');
+  assert.deepEqual(next.to, draft.to);
+  assert.deepEqual(next.bcc, draft.bcc);
+  assert.equal(repos.drafts.get(draft.id).attachments[0].content, content);
+  assert.equal(repos.drafts.listAll().length, 1);
+  const patched = await rest(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ subject: 'Edited in the UI' }) });
+  assert.equal(patched.status, 200);
+  assert.equal((await patched.json()).draft.textBody, 'Second version');
+  const cleared = await call({ draftId: draft.id, to: [], bcc: [], attachments: [], textBody: '', htmlBody: '' });
+  const clearedDraft = JSON.parse(cleared.body.result.content[0].text).draft;
+  assert.equal(clearedDraft.subject, 'Edited in the UI');
+  assert.deepEqual(clearedDraft.to, []);
+  assert.deepEqual(clearedDraft.attachments, []);
+  assert.equal(clearedDraft.textBody, '');
+
+  for (const [args, code] of [
+    [{}, 'VALIDATION_ERROR'],
+    [{ accountId: 'missing' }, 'NOT_FOUND'],
+    [{ draftId: 'missing' }, 'NOT_FOUND'],
+    [{ draftId: draft.id, accountId: 'different' }, 'VALIDATION_ERROR'],
+    [{ accountId: account.id, threadId: 'missing' }, 'NOT_FOUND'],
+    [{ accountId: account.id, attachments: [{ filename: 'no-bytes.txt' }] }, 'VALIDATION_ERROR'],
+  ]) {
+    const failed = await call(args);
+    assert.equal(failed.body.result.isError, true);
+    assert.equal(JSON.parse(failed.body.result.content[0].text).error.code, code);
+  }
+  const invalid = await rest('/drafts', { method: 'POST', body: JSON.stringify({ accountId: account.id, to: 'not-an-array' }) });
+  assert.equal(invalid.status, 400);
+  assert.equal(repos.drafts.listAll().length, 1);
+
+  const blank = await call({ accountId: account.id });
+  const blankDraft = JSON.parse(blank.body.result.content[0].text).draft;
+  assert.deepEqual(blankDraft.to, []);
+  assert.equal(blankDraft.subject, '');
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Provider draft', normalized_subject: 'provider draft', latest_at: '2026-03-01T00:00:00.000Z' });
+  const provider = repos.messages.upsert({
+    ...messageInput({ accountId: account.id, threadId: thread.id, uid: 1, subject: 'Provider draft', fromEmail: account.email, timestamp: '2026-03-01T00:00:00.000Z' }),
+    mailbox: 'Drafts', is_draft: 1,
+    attachments_json: JSON.stringify([{ filename: 'provider.pdf', contentType: 'application/pdf', size: 2048 }]),
+  });
+  const localCopy = await call({ draftId: provider.id, textBody: 'Local edits' });
+  const localDraft = JSON.parse(localCopy.body.result.content[0].text).draft;
+  assert.notEqual(localDraft.id, provider.id);
+  assert.equal(localDraft.threadId, thread.id);
+  assert.equal(localDraft.attachments[0].filename, 'provider.pdf');
+  assert.equal(repos.messages.get(provider.id).textBody, 'Provider draft');
+  assert.equal(repos.messages.get(provider.id).isTrashed, false);
+  await call({ draftId: localDraft.id, subject: 'More local edits' });
+  assert.equal(repos.drafts.listAll().length, 3);
 });
 
 test('get_attachment authenticates and returns bounded exact bytes for one verified attachment', async (t) => {
