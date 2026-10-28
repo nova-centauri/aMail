@@ -79,6 +79,44 @@ function consentPage(transaction, { authenticated = false, authMode = 'env', err
 </html>`;
 }
 
+function redirectOrigin(transaction) {
+  try {
+    const url = new URL(transaction.redirectUri);
+    // CSP host-source syntax has no IPv6 literal form; such callbacks keep the
+    // site-wide policy and rely on browsers that do not check redirects.
+    return url.hostname.startsWith('[') ? null : url.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send the consent page with headers that let a browser complete the flow.
+ *
+ * Helmet's site-wide `Referrer-Policy: no-referrer` makes browsers send
+ * `Origin: null` on form-submission navigations (Fetch standard, "append a
+ * request Origin header"), which the browser origin guard rejects with 403.
+ * `same-origin` keeps the real Origin on the approval POST while still hiding
+ * the consent URL (client_id, PKCE challenge, state) from the callback host.
+ *
+ * Chrome also enforces `form-action` against the redirect that follows a form
+ * submission, so the callback origin must be allowed on this page. Everything
+ * else is tightened to `'none'`: the page is static HTML with one inline style.
+ */
+function sendConsentPage(response, status, transaction, options) {
+  const callback = redirectOrigin(transaction);
+  response.set('Cache-Control', 'no-store');
+  response.set('Referrer-Policy', 'same-origin');
+  response.set('Content-Security-Policy', [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    `form-action 'self'${callback ? ` ${callback}` : ''}`,
+  ].join('; '));
+  return response.status(status).type('html').send(consentPage(transaction, options));
+}
+
 function oauthError(response, error) {
   const protocol = error instanceof OAuthProtocolError
     ? error
@@ -136,7 +174,7 @@ export function registerOAuth(app, { auth, oauth }) {
     try {
       const transaction = oauth.beginAuthorization(request.query, request);
       const authenticated = auth.requestHasAccess(request);
-      return response.type('html').send(consentPage(transaction, { authenticated, authMode: auth.mode }));
+      return sendConsentPage(response, 200, transaction, { authenticated, authMode: auth.mode });
     } catch (error) {
       const status = error instanceof OAuthProtocolError ? error.status : 500;
       const message = error instanceof OAuthProtocolError ? error.message : 'The authorization request could not be started.';
@@ -165,11 +203,11 @@ export function registerOAuth(app, { auth, oauth }) {
       return response.redirect(303, oauth.finishAuthorization(transaction.id, { approved: true }));
     } catch (error) {
       if (error instanceof OAuthProtocolError) return oauthError(response, error);
-      return response.status(401).type('html').send(consentPage(transaction, {
+      return sendConsentPage(response, 401, transaction, {
         authenticated: false,
         authMode: auth.mode,
         error: 'That aMail owner credential was not accepted.',
-      }));
+      });
     }
   });
 

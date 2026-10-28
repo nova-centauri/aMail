@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import test from 'node:test';
 import express from 'express';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
+import { browserOriginGuard } from '../middleware/request-security.js';
 import { createOAuthProvider } from '../services/oauth-provider.js';
 import { registerOAuth } from './oauth.js';
 
@@ -24,6 +25,10 @@ test('Claude custom-connector OAuth flow reaches an authenticated MCP request', 
   const auth = createAuthenticator({ config, oauth });
   const app = express();
   app.use(express.json());
+  // Production mounts this guard in front of every route. The consent form is
+  // the only browser-submitted POST that carries no bearer token, so the flow
+  // below sends the headers a browser sends for a same-origin form submission.
+  app.use(browserOriginGuard(config));
   registerOAuth(app, { auth, oauth });
   app.post('/mcp', accessGate(auth, { challenge: (request) => oauth.challenge(request) }), (_request, response) => {
     response.json({ jsonrpc: '2.0', id: 1, result: { tools: [{ name: 'list_messages' }] } });
@@ -74,16 +79,36 @@ test('Claude custom-connector OAuth flow reaches an authenticated MCP request', 
   });
   const consent = await fetch(authorizationUrl);
   assert.equal(consent.status, 200);
+  assert.equal(consent.headers.get('referrer-policy'), 'same-origin', 'no-referrer would make browsers send Origin: null on the approval POST');
+  assert.match(consent.headers.get('content-security-policy'), /form-action 'self' https:\/\/claude\.ai(;|$)/, 'Chrome checks form-action against the post-submit redirect to the callback');
   const consentHtml = await consent.text();
   const transaction = consentHtml.match(/name="transaction" value="([^"]+)"/)?.[1];
   assert.ok(transaction);
   assert.equal(consentHtml.includes('owner-access-token'), false);
 
+  const browserForm = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Origin: origin,
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'navigate',
+  };
+  const rejected = await fetch(`${origin}/oauth/authorize`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: browserForm,
+    body: new URLSearchParams({ transaction, decision: 'allow', credential: 'not-the-owner-token' }),
+  });
+  assert.equal(rejected.status, 401);
+  assert.equal(rejected.headers.get('referrer-policy'), 'same-origin', 'the re-rendered consent page keeps the browser headers');
+  const retry = await fetch(authorizationUrl);
+  const retryTransaction = (await retry.text()).match(/name="transaction" value="([^"]+)"/)?.[1];
+  assert.ok(retryTransaction);
+
   const approval = await fetch(`${origin}/oauth/authorize`, {
     method: 'POST',
     redirect: 'manual',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ transaction, decision: 'allow', credential: 'owner-access-token' }),
+    headers: browserForm,
+    body: new URLSearchParams({ transaction: retryTransaction, decision: 'allow', credential: 'owner-access-token' }),
   });
   assert.equal(approval.status, 303);
   const callback = new URL(approval.headers.get('location'));
