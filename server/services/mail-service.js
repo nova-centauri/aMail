@@ -1645,6 +1645,12 @@ export function createMailService({
       assertAccountGeneration(accountId, generation);
       noteSyncSuccess(accountId);
       accountLastSync.set(key, { finishedAt: Date.now(), result });
+      // lastSyncedAt is what agents read. The 'recent' skip uses this
+      // in-memory finishedAt. Both must move on a successful pass even when
+      // IMAP found 0 new messages (plan.kind unchanged/flags).
+      if (result?.status === 'ok' || result?.status === 'partial') {
+        repos.accounts.markSynced?.(accountId);
+      }
       logger.info({
         accountId,
         durationMs: Date.now() - entry.startedAt,
