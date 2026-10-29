@@ -13,6 +13,9 @@ import { createEventLoopWatchdog } from '../services/event-loop-watchdog.js';
 import { createMailboxEventHub } from '../services/mailbox-events.js';
 import { decryptJson } from '../services/crypto.js';
 import { serializeAccountInput } from '../services/account-input.js';
+import { encryptJson } from '../services/crypto.js';
+import { createMailService } from '../services/mail-service.js';
+import { createFakeImapServer } from '../services/fake-imap.test-support.js';
 
 function messageInput({ accountId, threadId, uid, subject, fromEmail, timestamp }) {
   return {
@@ -62,7 +65,22 @@ test('message API filters unified mail by smart category and account creation is
   const database = createDatabase(config);
   const repos = createRepositories(database);
   let rejectConnection = false;
+  const imap = createFakeImapServer({
+    folders: [
+      { path: 'INBOX', name: 'INBOX', specialUse: '\\Inbox' },
+      { path: '[Gmail]/Drafts', name: 'Drafts', specialUse: '\\Drafts' },
+    ],
+  });
+  const drafts = createMailService({
+    config: { ...config, syncTimeoutMs: 5_000 },
+    repos,
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    ImapClient: imap.FakeImapClient,
+  });
+  t.after(() => drafts.close());
   const mailService = {
+    saveDraft: drafts.saveDraft,
+    migrateLocalDrafts: drafts.migrateLocalDrafts,
     async testSettings() {
       if (rejectConnection) throw new ServiceUnavailableError('Sanitized connection failure.', 'IMAP_AUTH_FAILED');
       return { imap: true, smtp: true };
@@ -119,7 +137,7 @@ test('message API filters unified mail by smart category and account creation is
     smtp_host: 'smtp.example.test',
     smtp_port: 465,
     smtp_secure: 1,
-    credential_ciphertext: 'test-only',
+    credential_ciphertext: encryptJson({ username: 'owner@example.test', password: 'test-only' }, config.credentialKey),
     signature: '',
     sync_enabled: 1,
   });
@@ -308,20 +326,43 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(all.folderCounts.drafts, 2);
   assert.equal(all.messages.some((message) => message.subject === 'Q3 budget notes'), false);
 
+  const quoteBytes = Buffer.from('%PDF quote').toString('base64');
+  // Metadata as sync records it, so the strict server fetch can verify the part.
+  const quoteSize = Buffer.from('%PDF quote').length;
+  const quoteUid = imap.state.seed('[Gmail]/Drafts', [
+    'Message-ID: <quote-follow-up@example.test>',
+    'Subject: Quote follow-up',
+    'Content-Type: multipart/mixed; boundary="q"',
+    '',
+    '--q',
+    'Content-Type: text/plain',
+    '',
+    'See the attached quote.',
+    '--q',
+    'Content-Type: application/pdf; name="quote.pdf"',
+    'Content-Disposition: attachment; filename="quote.pdf"',
+    'Content-ID: <part-1>',
+    'Content-Transfer-Encoding: base64',
+    '',
+    quoteBytes,
+    '--q--',
+    '',
+  ].join('\r\n'), ['\\Draft']);
   const providerWithFile = repos.messages.upsert({
     ...messageInput({
       accountId: account.id,
       threadId: threadIds[0],
-      uid: 91,
+      uid: quoteUid,
       subject: 'Quote follow-up',
       fromEmail: 'owner@example.test',
       timestamp: '2026-02-02T00:00:00.000Z',
     }),
     mailbox: '[Gmail]/Drafts',
+    rfc_message_id: '<quote-follow-up@example.test>',
     is_draft: 1,
     is_read: 1,
     text_body: 'See the attached quote.',
-    attachments_json: JSON.stringify([{ index: 0, filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }]),
+    attachments_json: JSON.stringify([{ index: 0, filename: 'quote.pdf', contentType: 'application/pdf', size: quoteSize, contentId: 'part-1' }]),
   });
   const closedProvider = await fetch(`${origin}/api/drafts/${providerWithFile.id}`, {
     method: 'PATCH',
@@ -329,13 +370,18 @@ test('message API filters unified mail by smart category and account creation is
     body: JSON.stringify({
       subject: 'Quote follow-up',
       textBody: 'See the attached quote.',
-      attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }],
+      attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', size: quoteSize, contentId: 'part-1' }],
     }),
   });
-  assert.equal(closedProvider.status, 201);
+  // A provider draft is edited in place on the server: same id, the old
+  // server copy is replaced, and its attachment comes along from the server.
+  assert.equal(closedProvider.status, 200);
   const closedProviderBody = await closedProvider.json();
+  assert.equal(closedProviderBody.draft.id, providerWithFile.id);
   assert.equal(closedProviderBody.draft.attachments[0].filename, 'quote.pdf');
-  assert.equal(closedProviderBody.draft.attachments[0].content, undefined);
+  assert.equal(closedProviderBody.draft.attachments[0].content, quoteBytes);
+  assert.equal(closedProviderBody.server.replaced, 'deleted');
+  assert.equal(imap.state.messages('[Gmail]/Drafts').some((message) => message.uid === quoteUid), false);
   assert.equal(repos.messages.get(providerWithFile.id).isTrashed, false);
   assert.equal((await (await fetch(`${origin}/api/drafts/${createdDraftBody.draft.id}`)).json()).draft.attachments[0].content, draftContent);
 

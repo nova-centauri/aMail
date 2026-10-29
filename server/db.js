@@ -360,6 +360,14 @@ function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_drafts_account ON drafts(account_id, updated_at DESC);
 
+    -- Editable HTML of drafts aMail saved to the server. messages.html_body is
+    -- the display copy (no styles, inert remote images); feeding that back to
+    -- the composer would strip a draft's formatting on every save.
+    CREATE TABLE IF NOT EXISTS draft_compose_html (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      html TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
@@ -1077,6 +1085,14 @@ export function createRepositories(db) {
       source_imported = COALESCE(@source_imported, source_imported), updated_at = @updated_at
       WHERE id = @id`),
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
+    messageDelete: db.prepare('DELETE FROM messages WHERE id = ?'),
+    threadDelete: db.prepare('DELETE FROM threads WHERE id = ?'),
+    draftComposeHtmlGet: db.prepare('SELECT html FROM draft_compose_html WHERE message_id = ?'),
+    draftComposeHtmlPut: db.prepare(`INSERT INTO draft_compose_html (message_id, html) VALUES (?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET html = excluded.html`),
+    draftComposeHtmlDelete: db.prepare('DELETE FROM draft_compose_html WHERE message_id = ?'),
+    draftUidsInMailbox: db.prepare(`SELECT id, uid FROM messages
+      WHERE account_id = ? AND mailbox = ? AND is_draft = 1 AND uid IS NOT NULL`),
     messageState: db.prepare(`UPDATE messages SET
       is_read = COALESCE(@is_read, is_read),
       is_starred = COALESCE(@is_starred, is_starred),
@@ -1530,6 +1546,62 @@ export function createRepositories(db) {
         changes.bump('message', timestamp);
         return publicMessage(queries.messageById.get(id));
       },
+      /**
+       * Rewrite one stored message in place, keeping its id. Server drafts use
+       * this: each save APPENDs a new copy and expunges the old one, but the
+       * draft id the UI and agents hold stays the same. A row the sync already
+       * imported for the new (mailbox, uid) is our own copy and gives way.
+       */
+      replace: db.transaction((id, input) => {
+        const existing = queries.messageById.get(id);
+        if (!existing) return null;
+        const uid = input.uid === null || input.uid === undefined ? null : Number(input.uid);
+        if (uid !== null) {
+          const occupant = queries.messageByUid.get(existing.account_id, input.mailbox, uid);
+          if (occupant && occupant.id !== id) {
+            queries.messageDelete.run(occupant.id);
+            if (occupant.thread_id !== existing.thread_id && occupant.thread_id !== input.thread_id) {
+              if (!recomputeThread(occupant.thread_id)) queries.threadDelete.run(occupant.thread_id);
+            }
+          }
+        }
+        const classification = classifyMessage(input);
+        const row = {
+          ...existing,
+          ...input,
+          id,
+          uid,
+          account_id: existing.account_id,
+          is_draft: input.is_draft ? 1 : 0,
+          smart_category: classification.category,
+          smart_category_reason: classification.categoryReason,
+          smart_category_rule: classification.rule,
+          smart_category_version: classification.version,
+          source_imported: input.source_imported === 0 ? 0 : 1,
+          created_at: existing.created_at,
+          updated_at: now(),
+        };
+        return updateMessageRow(existing, row);
+      }),
+      /** Drop one cached message (a sent or superseded draft). Empty threads go too. */
+      remove: db.transaction((id) => {
+        const existing = queries.messageById.get(id);
+        if (!existing) return false;
+        queries.messageDelete.run(id);
+        const thread = recomputeThread(existing.thread_id);
+        if (!thread) queries.threadDelete.run(existing.thread_id);
+        else queueSearch({ messageIds: queries.messagesByThread.all(existing.thread_id).map((row) => row.id) });
+        changes.bump('message');
+        return true;
+      }),
+      /** Editable HTML of a draft aMail saved, or null for drafts other clients wrote. */
+      composeHtml: (id) => queries.draftComposeHtmlGet.get(id)?.html ?? null,
+      setComposeHtml(id, html) {
+        if (html) queries.draftComposeHtmlPut.run(id, html);
+        else queries.draftComposeHtmlDelete.run(id);
+      },
+      draftUids: (accountId, mailbox) => queries.draftUidsInMailbox.all(accountId, mailbox)
+        .map((row) => ({ id: row.id, uid: Number(row.uid) })),
       relocate(id, { mailbox, uid }) {
         const row = queries.messageById.get(id);
         if (!row) return null;

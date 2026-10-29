@@ -19,7 +19,7 @@ import {
   discoverAccountProvider,
   mailProviderCatalog,
 } from '../utils/mail.js';
-import { providerDraft, saveDraft } from '../services/drafts.js';
+import { providerDraft } from '../services/drafts.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { accessGate, createAuthenticator } from '../middleware/auth.js';
 import { registerKeyslotManagement, registerKeyslotProvisioning } from './keyslots.js';
@@ -715,18 +715,32 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const accountId = String(request.query.accountId || '');
     response.json({ drafts: storedDrafts(accountId) });
   });
-  router.post('/drafts', (request, response) => {
-    const { draft } = saveDraft(repos, request.body || {});
-    response.status(201).json({ draft });
+  const requireDraftService = () => {
+    if (!mailService?.saveDraft) throw new ServiceUnavailableError('Drafts need the mail service.', 'DRAFTS_UNAVAILABLE');
+    return mailService;
+  };
+  router.post('/drafts', async (request, response) => {
+    const { draft, server } = await requireDraftService().saveDraft(request.body || {});
+    response.status(201).json({ draft, server });
+  });
+  // Moves drafts that older aMail versions kept only in aMail to each
+  // account's server Drafts. Lists only unless { "dryRun": false }.
+  router.post('/drafts/migrate-local', async (request, response) => {
+    const body = request.body || {};
+    const result = await requireDraftService().migrateLocalDrafts({
+      dryRun: body.dryRun !== false,
+      accountId: body.accountId ? String(body.accountId) : null,
+    });
+    response.json(result);
   });
   router.get('/drafts/:id', (request, response) => {
     const draft = repos.drafts.get(request.params.id) || providerDraft(repos, request.params.id);
     if (!draft) throw new NotFoundError('Draft not found.');
     response.json({ draft });
   });
-  router.patch('/drafts/:id', (request, response) => {
-    const { draft, created } = saveDraft(repos, request.body || {}, request.params.id);
-    response.status(created ? 201 : 200).json({ draft });
+  router.patch('/drafts/:id', async (request, response) => {
+    const { draft, created, server } = await requireDraftService().saveDraft(request.body || {}, request.params.id);
+    response.status(created ? 201 : 200).json({ draft, server });
   });
   router.delete('/drafts/:id', async (request, response) => {
     if (repos.drafts.remove(request.params.id)) {
