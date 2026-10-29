@@ -93,11 +93,10 @@ Nothing writes to it any more.
 
 1. Review and merge the PR.
 2. Deploy to the private install. On first sync, the Drafts reconciliation
-   removes local rows for drafts that are no longer on the server. On the one
-   install checked (Oct 29) the Drafts view held 489 rows, most of them stale
-   autosave versions from Gmail accounts.
+   removes local rows for drafts that are no longer on the server. Expect the
+   Drafts view to shrink a lot on accounts with Gmail autosave history.
 3. Run `migrate_local_drafts` with the default dry run and review the list
-   (6 local-only drafts on that install).
+   of local-only drafts.
 4. Run it with `dryRun: false`, then confirm the drafts show in each account's
    own Drafts folder.
 
