@@ -21,10 +21,12 @@ import {
 import { NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { stringify } from '../db.js';
+import { legacyDraftSummary, prepareDraft, providerDraft } from './drafts.js';
 import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
   mailerAttachments,
+  mergeDraftAttachments,
   normalizeComposeAttachments,
   publicAttachmentMeta,
   storedAttachmentRecords,
@@ -1197,11 +1199,12 @@ export function createMailService({
       if (statusPreview) return statusPreview;
       if (typeof client.status !== 'function') return null;
       try {
-        const status = await client.status(mailbox, { uidNext: true, uidValidity: true, highestModseq: true });
+        const status = await client.status(mailbox, { uidNext: true, uidValidity: true, highestModseq: true, messages: true });
         return {
           uidNext: Number(status?.uidNext) || 0,
           uidValidity: Number(status?.uidValidity) || null,
           highestModseq: status?.highestModseq != null ? String(status.highestModseq) : null,
+          messages: Number.isSafeInteger(Number(status?.messages)) ? Number(status.messages) : null,
         };
       } catch {
         return null;
@@ -1226,9 +1229,44 @@ export function createMailService({
       }
     }
 
+    // Drafts are edited, sent and discarded in other clients too, and each
+    // change expunges a UID. The incremental UIDNEXT pass never sees that, so
+    // without this the Drafts folder fills with every superseded version.
+    async function reconcileDrafts(preview, previousUidValidity) {
+      const known = repos.messages.draftUids?.(account.id, mailbox) || [];
+      if (!known.length) return 0;
+      if (preview?.uidValidity && previousUidValidity && preview.uidValidity !== previousUidValidity) return 0;
+      if (preview && preview.messages === known.length && preview.uidNext && preview.uidNext - 1 <= lastUid) return 0;
+      let draftLock;
+      let present;
+      try {
+        draftLock = await client.getMailboxLock(mailbox, { readOnly: true });
+        if (previousUidValidity && Number(client.mailbox?.uidValidity) && Number(client.mailbox.uidValidity) !== previousUidValidity) return 0;
+        present = await client.search({ all: true }, { uid: true });
+      } finally {
+        draftLock?.release();
+      }
+      if (!Array.isArray(present)) return 0;
+      const live = new Set(present.map(Number));
+      let removed = 0;
+      for (const row of known) {
+        if (live.has(row.uid)) continue;
+        if (repos.messages.remove(row.id)) removed += 1;
+      }
+      if (removed) logger.info({ accountId: account.id, mailbox, removed }, 'Removed drafts that are no longer on the server');
+      return removed;
+    }
+
     try {
       const previousUidValidity = Number(previousSync?.uid_validity) || null;
       const preview = await readStatus();
+      if (role === 'drafts') {
+        try {
+          await reconcileDrafts(preview, previousUidValidity);
+        } catch (error) {
+          logger.warn({ accountId: account.id, mailbox, err: cleanupError(error) }, 'Drafts reconciliation failed');
+        }
+      }
       const planPreview = planMailboxSync({
         lastUid,
         uidValidity: preview?.uidValidity ?? previousUidValidity,
@@ -1476,11 +1514,12 @@ export function createMailService({
           return;
         }
         try {
-          const status = await client.status(descriptor.mailbox, { uidNext: true, uidValidity: true, highestModseq: true });
+          const status = await client.status(descriptor.mailbox, { uidNext: true, uidValidity: true, highestModseq: true, messages: true });
           statusByMailbox.set(descriptor.mailbox, {
             uidNext: Number(status?.uidNext) || 0,
             uidValidity: Number(status?.uidValidity) || null,
             highestModseq: status?.highestModseq != null ? String(status.highestModseq) : null,
+            messages: Number.isSafeInteger(Number(status?.messages)) ? Number(status.messages) : null,
           });
         } catch {
           statusByMailbox.set(descriptor.mailbox, null);
@@ -2342,6 +2381,289 @@ export function createMailService({
     }
   }
 
+  // ---- Server drafts --------------------------------------------------------
+  // A draft is a message in the account's own Drafts mailbox, flagged \Draft.
+  // Saving APPENDs the new version and then expunges the version it replaces,
+  // which is what Thunderbird, Apple Mail and Gmail's own IMAP clients do. The
+  // local row keeps one id across versions so callers can keep saving to it.
+
+  const FALLBACK_DRAFTS_MAILBOX = 'Drafts';
+
+  async function locateDraftsMailbox(client) {
+    const drafts = discoverSyncMailboxes(await client.list()).find((descriptor) => descriptor.role === 'drafts');
+    if (drafts) return { mailbox: drafts.mailbox, created: false };
+    // Every mainstream provider has one; a bare Dovecot/Mail-in-a-Box account
+    // may not until a client creates it. Create it where other clients would.
+    await client.mailboxCreate(FALLBACK_DRAFTS_MAILBOX);
+    return { mailbox: FALLBACK_DRAFTS_MAILBOX, created: true };
+  }
+
+  async function appendedDraftUid(client, mailbox, appended, messageId) {
+    const uid = Number(appended?.uid);
+    if (Number.isSafeInteger(uid) && uid > 0) return uid;
+    // No UIDPLUS: find the copy by its unique Message-ID. If even that fails
+    // the row stays uid-less and the next Drafts sync fills the UID in.
+    let lock;
+    try {
+      lock = await client.getMailboxLock(mailbox);
+      const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+      const found = Array.isArray(uids) ? uids.map(Number).filter((value) => Number.isSafeInteger(value) && value > 0) : [];
+      return found.length ? Math.max(...found) : null;
+    } catch {
+      return null;
+    } finally {
+      lock?.release();
+    }
+  }
+
+  /**
+   * Expunge the server copy a save replaced. Only deletes when the UID still
+   * holds the same Message-ID, so a stale UID (UIDVALIDITY reset, another
+   * client's edit) can never take an unrelated message with it.
+   */
+  async function deleteServerDraftCopy(client, { mailbox, uid, messageId }) {
+    if (!mailbox) return { status: 'skipped', reason: 'no-imap-mailbox' };
+    if (!messageId) return { status: 'kept', reason: 'no-message-id' };
+    let lock;
+    try {
+      lock = await client.getMailboxLock(mailbox);
+      if (!Number.isInteger(uid) || uid < 1) {
+        // Saved without UIDPLUS and not synced yet: the Message-ID is unique
+        // to this one version, so a single match is that copy.
+        const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+        if (!Array.isArray(uids) || uids.length === 0) return { status: 'skipped', reason: 'already-gone' };
+        if (uids.length > 1) return { status: 'kept', reason: 'ambiguous-message-id' };
+        uid = Number(uids[0]);
+      }
+      const found = await client.fetchOne(uid, { uid: true, envelope: true }, { uid: true });
+      if (!found) return { status: 'skipped', reason: 'already-gone' };
+      const serverId = normalizeMessageIds(found.envelope?.messageId)[0] || null;
+      if (serverId !== normalizeMessageIds(messageId)[0]) return { status: 'kept', reason: 'message-id-mismatch' };
+      const deleted = await client.messageDelete(uid, { uid: true });
+      return deleted ? { status: 'deleted' } : { status: 'failed', reason: 'imap-delete-rejected' };
+    } catch (error) {
+      logger.warn({ mailbox, code: classifyMailConnectionError(error, { protocol: 'imap' }).code }, 'Previous server draft could not be removed');
+      return { status: 'failed', reason: 'imap-delete-failed' };
+    } finally {
+      lock?.release();
+    }
+  }
+
+  async function withDraftClient(account, credentials, fn) {
+    const client = newImapClient(account, credentials);
+    try {
+      await client.connect();
+      return await fn(client);
+    } catch (error) {
+      if (error instanceof ValidationError || error instanceof NotFoundError || error instanceof ServiceUnavailableError) throw error;
+      const classified = classifyMailConnectionError(error, { protocol: 'imap', provider: account.provider });
+      logger.warn({ accountId: account.id, code: classified.code }, 'Server draft could not be saved');
+      const failure = new ServiceUnavailableError(
+        'The draft could not be saved to the mail server\'s Drafts folder. Check the account\'s IMAP settings and try again.',
+        'DRAFT_SAVE_FAILED',
+      );
+      failure.details = { reason: classified.code };
+      throw failure;
+    } finally {
+      await client.logout().catch(() => {});
+    }
+  }
+
+  /** Bytes for attachments a server draft carries but aMail never stored. */
+  async function draftAttachmentsWithBytes(plan) {
+    if (!plan.server || plan.attachments.every((attachment) => attachment.content)) return plan.attachments;
+    const existing = [];
+    for (const meta of plan.server.attachments) {
+      if (meta.content) {
+        existing.push(meta);
+        continue;
+      }
+      const fetched = await fetchAttachment(plan.server.id, meta.index);
+      existing.push({ ...meta, content: Buffer.from(fetched.body).toString('base64'), size: fetched.body.length });
+    }
+    const merged = mergeDraftAttachments(plan.incomingAttachments, existing);
+    const missing = merged.find((attachment) => !attachment.content);
+    if (missing) {
+      throw new ValidationError(`${missing.filename} is not in this draft any more. Attach the file again or remove it.`);
+    }
+    return merged;
+  }
+
+  /**
+   * Save a draft to the account's server Drafts mailbox. Never sends mail.
+   * `draftId` may name a server draft (a messages row) or an old local-only
+   * draft; the latter is moved to the server and its local copy removed.
+   */
+  async function saveDraft(input = {}, draftId = null) {
+    const plan = prepareDraft(repos, input, draftId);
+    assertImapWritesAllowed(plan.accountId);
+    const { account, credentials } = accountAndCredentials(plan.accountId);
+    const attachments = await draftAttachmentsWithBytes(plan);
+    const messageId = createMessageId(account);
+    const savedAt = new Date();
+    const raw = await compileMessage({
+      messageId,
+      date: savedAt,
+      from: { name: account.display_name, address: account.email },
+      to: recipientsToHeader(plan.to) || undefined,
+      cc: recipientsToHeader(plan.cc) || undefined,
+      // Unlike a sent message, a draft keeps its Bcc header: it is only on
+      // the owner's server, and the client that sends it needs the list.
+      bcc: recipientsToHeader(plan.bcc) || undefined,
+      subject: plan.subject,
+      text: plan.textBody || textSnippet(plan.htmlBody),
+      html: plan.htmlBody || undefined,
+      inReplyTo: plan.inReplyTo || undefined,
+      references: plan.references.length ? plan.references.join(' ') : undefined,
+      headers: { 'X-Mailer': 'aMail' },
+      attachments: attachments.length ? mailerAttachments(attachments) : undefined,
+    });
+    const rawMessage = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw || ''));
+    if (!rawMessage.length) throw new Error('RFC822 compilation produced an empty draft.');
+
+    const server = await withDraftClient(account, credentials, async (client) => {
+      const target = await locateDraftsMailbox(client);
+      const appended = await client.append(target.mailbox, rawMessage, ['\\Draft', '\\Seen'], savedAt);
+      if (!appended) {
+        throw new ServiceUnavailableError('The mail server refused to store the draft.', 'DRAFT_APPEND_REJECTED');
+      }
+      const uid = await appendedDraftUid(client, target.mailbox, appended, messageId);
+      const previous = plan.server
+        ? await deleteServerDraftCopy(client, plan.server)
+        : { status: 'none' };
+      return { mailbox: target.mailbox, uid, createdMailbox: target.created, previous };
+    });
+
+    const row = {
+      account_id: account.id,
+      mailbox: server.mailbox,
+      uid: server.uid,
+      rfc_message_id: messageId,
+      in_reply_to: plan.inReplyTo,
+      references_json: stringify(plan.references),
+      subject: plan.subject || '(no subject)',
+      from_name: account.display_name || '',
+      from_email: account.email,
+      to_json: stringify(plan.to),
+      cc_json: stringify(plan.cc),
+      bcc_json: stringify(plan.bcc),
+      reply_to_json: null,
+      sent_at: savedAt.toISOString(),
+      received_at: savedAt.toISOString(),
+      html_body: sanitizeEmailHtml(plan.htmlBody || toSafeHtmlFromText(plan.textBody)).html,
+      text_body: plan.textBody,
+      snippet: textSnippet(plan.textBody || plan.htmlBody),
+      attachments_json: stringify(storedAttachmentRecords(attachments)),
+      labels_json: '[]',
+      is_read: 1,
+      is_starred: 0,
+      is_archived: 0,
+      is_trashed: 0,
+      is_spam: 0,
+      snoozed_until: null,
+      is_sent: 0,
+      is_draft: 1,
+      source_imported: 1,
+    };
+    let saved;
+    if (plan.server) {
+      const thread = plan.threadId ? repos.threads.get(plan.threadId) : null;
+      saved = repos.messages.replace(plan.server.id, { ...row, thread_id: thread?.id || plan.server.threadId });
+    } else {
+      const thread = resolveThread({
+        accountId: account.id,
+        subject: plan.subject,
+        inReplyTo: plan.inReplyTo,
+        references: plan.references,
+        threadId: plan.threadId,
+      });
+      saved = repos.messages.upsert({ ...row, thread_id: thread.id });
+      if (plan.legacy) repos.drafts.remove(plan.legacy.id);
+    }
+    logger.info({
+      accountId: account.id,
+      draft: { mailbox: server.mailbox, hasUid: Boolean(server.uid), previous: server.previous.status, migrated: Boolean(plan.legacy) },
+    }, 'Draft saved to the server Drafts mailbox');
+    return {
+      draft: providerDraft(repos, saved.id),
+      created: !plan.server,
+      server: {
+        mailbox: server.mailbox,
+        uid: server.uid,
+        createdMailbox: server.createdMailbox,
+        replaced: server.previous.status,
+        ...(server.previous.reason ? { replacedReason: server.previous.reason } : {}),
+        ...(plan.legacy ? { migratedFrom: plan.legacy.id } : {}),
+      },
+    };
+  }
+
+  /** Remove a server draft after it was sent. Best-effort; never fails the send. */
+  async function retireSentDraft(draftId, { account, credentials }) {
+    if (!draftId) return null;
+    if (repos.drafts.get?.(draftId)) {
+      repos.drafts.remove(draftId);
+      return { status: 'deleted', location: 'local' };
+    }
+    const draft = providerDraft(repos, draftId);
+    if (!draft || draft.accountId !== account.id) return { status: 'skipped', reason: 'draft-not-found' };
+    let result;
+    try {
+      const client = newImapClient(account, credentials);
+      try {
+        await client.connect();
+        result = await deleteServerDraftCopy(client, draft);
+      } finally {
+        await client.logout().catch(() => {});
+      }
+    } catch (error) {
+      logger.warn({ accountId: account.id, code: classifyMailConnectionError(error, { protocol: 'imap', provider: account.provider }).code }, 'Sent draft could not be removed from the server');
+      result = { status: 'failed', reason: 'imap-connection-failed' };
+    }
+    // Keep the row when the server still holds it, so the person can see the
+    // leftover draft instead of it reappearing on a later full sync.
+    if (['deleted', 'skipped'].includes(result.status)) repos.messages.remove(draft.id);
+    return { ...result, location: 'server' };
+  }
+
+  /**
+   * Move drafts saved by older aMail versions (local `drafts` table only) to
+   * each account's server Drafts. Dry run by default: lists, connects to nothing.
+   */
+  async function migrateLocalDrafts({ dryRun = true, accountId = null } = {}) {
+    const drafts = repos.drafts.listAll().filter((draft) => !accountId || draft.accountId === accountId);
+    const protectedEmails = new Set(config.imapWriteProtectedAccounts || []);
+    const items = drafts.map((draft) => {
+      const summary = legacyDraftSummary(repos, draft);
+      const blocked = protectedEmails.has(String(summary.accountEmail || '').trim().toLowerCase())
+        ? 'imap-write-protected'
+        : null;
+      return { ...summary, ...(blocked ? { blocked } : {}) };
+    });
+    if (dryRun) return { dryRun: true, total: items.length, drafts: items };
+    const results = [];
+    for (const item of items) {
+      if (item.blocked) {
+        results.push({ ...item, status: 'skipped' });
+        continue;
+      }
+      try {
+        const saved = await saveDraft({}, item.id);
+        results.push({ ...item, status: 'moved', draftId: saved.draft.id, mailbox: saved.server.mailbox });
+      } catch (error) {
+        results.push({ ...item, status: 'failed', error: error?.code || 'DRAFT_SAVE_FAILED' });
+      }
+    }
+    return {
+      dryRun: false,
+      total: items.length,
+      moved: results.filter((item) => item.status === 'moved').length,
+      failed: results.filter((item) => item.status === 'failed').length,
+      skipped: results.filter((item) => item.status === 'skipped').length,
+      drafts: results,
+    };
+  }
+
   async function sendMessage(input) {
     assertImapWritesAllowed(input.accountId);
     const { account, credentials } = accountAndCredentials(input.accountId);
@@ -2467,9 +2789,9 @@ export function createMailService({
       snoozed_until: null,
       is_sent: 1,
     });
-    if (input.draftId) repos.drafts.remove(input.draftId);
     const sentCopy = await appendProviderSentCopy({ account, credentials, rawMessage, sentAt });
-    return { ...saved, delivery, sentCopy };
+    const draftCleanup = input.draftId ? await retireSentDraft(input.draftId, { account, credentials }) : null;
+    return { ...saved, delivery, sentCopy, ...(draftCleanup ? { draftCleanup } : {}) };
   }
 
   async function syncMessageStateToImap(message, state) {
@@ -2856,6 +3178,8 @@ export function createMailService({
     testSettings,
     testAccount,
     sendMessage,
+    saveDraft,
+    migrateLocalDrafts,
     updateMessageState,
     fetchAttachment,
     hydrateMessageSource,

@@ -9,7 +9,6 @@ import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js
 import { discoverAccountProvider, mailProviderCatalog } from '../utils/mail.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
 import { configuredOpsSources } from '../services/smart-filter.js';
-import { saveDraft } from '../services/drafts.js';
 import { publicAttachmentMeta } from '../services/compose-attachments.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { logMcpToolCall } from '../services/messages-query-log.js';
@@ -414,12 +413,13 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
 
   server.registerTool('save_draft', {
     title: 'Save draft',
-    description: 'Save an unsent draft in aMail for review or editing in the UI. Never sends mail or writes to the provider. Supply accountId for a new draft, or draftId to update a saved draft; omitted fields are preserved on update. Returns draft.id for subsequent saves. Provider drafts are copied locally; use the returned id thereafter.',
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    description: 'Save an unsent draft to the account\'s own Drafts folder on its mail server (IMAP APPEND, flagged \\Draft), so it appears in Gmail, Apple Mail and every other client of that account. Never sends mail. Supply accountId for a new draft, or draftId to update one; omitted fields are preserved on update and draft.id stays the same across saves. For a reply, pass replyToMessageId (RFC Message-ID) or threadId so the draft carries In-Reply-To/References and threads with the conversation. Each update replaces the previous server copy.',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     inputSchema: {
       accountId: z.string().optional().describe('Required for a new draft; saved drafts keep their original account'),
       draftId: z.string().min(1).optional().describe('Existing draft id to update; omit to create'),
       threadId: z.string().nullable().optional().describe('Related thread id, or null to unlink'),
+      replyToMessageId: z.string().optional().describe('RFC Message-ID of the message this draft replies to'),
       to: z.array(recipientSchema).optional(),
       cc: z.array(recipientSchema).optional(),
       bcc: z.array(recipientSchema).optional(),
@@ -436,8 +436,25 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       })).optional().describe('Up to 8 files, 8 MiB combined; omit to preserve existing attachments, [] to remove'),
     },
   }, async ({ draftId, ...input }) => runTool(async () => {
-    const { draft } = saveDraft(repos, input, draftId);
-    return { draft: clipMcpMessage({ ...draft, attachments: draft.attachments.map(publicAttachmentMeta) }) };
+    if (!mailService?.saveDraft) throw new ServiceUnavailableError('Drafts need the mail service.', 'DRAFTS_UNAVAILABLE');
+    const { draft, server: stored } = await mailService.saveDraft(input, draftId);
+    return {
+      draft: clipMcpMessage({ ...draft, attachments: draft.attachments.map(publicAttachmentMeta) }),
+      server: stored,
+    };
+  }));
+
+  server.registerTool('migrate_local_drafts', {
+    title: 'Migrate local drafts',
+    description: 'Drafts saved by older aMail versions lived only inside aMail. This lists them (dryRun, the default) or, with dryRun:false, saves each to its account\'s server Drafts folder and removes the local copy. Never sends mail.',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    inputSchema: {
+      dryRun: z.boolean().optional().describe('Default true: list only, no mail server writes'),
+      accountId: z.string().optional().describe('Limit to one account'),
+    },
+  }, async ({ dryRun, accountId }) => runTool(async () => {
+    if (!mailService?.migrateLocalDrafts) throw new ServiceUnavailableError('Drafts need the mail service.', 'DRAFTS_UNAVAILABLE');
+    return mailService.migrateLocalDrafts({ dryRun: dryRun !== false, accountId: accountId || null });
   }));
 
   server.registerTool('send_message', {
@@ -445,7 +462,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     description: 'Compose and send mail through an existing account via SMTP.',
     inputSchema: {
       accountId: z.string().describe('Sending account id'),
-      draftId: z.string().optional().describe('Saved local draft to remove after successful sending'),
+      draftId: z.string().optional().describe('Saved draft to remove from the server Drafts folder after successful sending'),
       to: z.array(recipientSchema).optional().describe('To recipients'),
       cc: z.array(recipientSchema).optional().describe('Cc recipients'),
       bcc: z.array(recipientSchema).optional().describe('Bcc recipients'),
