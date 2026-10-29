@@ -77,6 +77,27 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
    new UIDs exist, skips on a UIDVALIDITY change, and only deletes aMail's
    cache rows, never server mail. Before this, every Gmail autosave version
    stayed in aMail's Drafts folder forever.
+   - A local draft whose UID is gone is first matched by Message-ID against
+     live UIDs aMail does not know (newest 500). On a match the row moves to
+     the new UID and keeps its id. It is downloaded again in the same pass;
+     its editable HTML is kept only if the server copy's HTML (or text, for
+     a text-only draft) is unchanged, since another client may have edited
+     it under the same Message-ID. Only unmatched rows are dropped.
+   - With CONDSTORE, a changed HIGHESTMODSEQ runs the reconciliation even
+     when the message count and UIDNEXT look unchanged, which is what a
+     draft renumbered below the cursor looks like.
+   - Live UIDs at or below the sync cursor that aMail has no row for are
+     imported in the same pass, newest first and within the account's
+     per-pass message budget; the rest wait for the next pass. One that
+     still cannot be imported is recorded in `sync_skips` so it is not
+     downloaded on every sync.
+   - Why: Gmail renumbers drafts. On the first live save (Oct 29) a draft
+     APPENDed at one UID left it within seconds; the reconcile dropped the
+     row, and the UIDNEXT pass had already moved its cursor past the UID the
+     draft came back at, so aMail never saw it again although Gmail still
+     had it. Which of the two (renumbered and visible, or visible only
+     later) happened there is inferred from the sync results, not from
+     server logs; the fix covers both.
 5. **Migration of local-only drafts.** `mailService.migrateLocalDrafts`, exposed
    as MCP `migrate_local_drafts` and `POST /api/drafts/migrate-local`. Dry run
    is the default and touches no mail server: it lists id, account, subject,
@@ -95,6 +116,8 @@ Nothing writes to it any more.
   `[Gmail]/Drafts` follows the account's "When a message is marked as deleted
   and expunged" IMAP setting, so Gmail may archive or trash the superseded
   version instead of deleting it. Check this on the first live save.
+  Gmail also moves drafts to new UIDs on its own, sometimes seconds after an
+  APPEND; the Drafts reconciliation follows them by Message-ID.
 - **iCloud**: `Drafts` with `\Drafts`; UIDPLUS supported.
 - **Mail-in-a-Box / Dovecot**: `Drafts` with `\Drafts`; UIDPLUS supported.
 

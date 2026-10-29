@@ -1,6 +1,6 @@
 // In-memory IMAP server for draft tests. Implements only the ImapFlow calls
 // the draft paths use: list, mailboxCreate, append, getMailboxLock, search,
-// fetchOne, messageDelete and status. Not loaded by production code.
+// fetch, fetchOne, messageDelete and status. Not loaded by production code.
 
 function headerValue(raw, name) {
   const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
@@ -16,6 +16,7 @@ export function createFakeImapServer({
     { path: 'Drafts', name: 'Drafts', specialUse: '\\Drafts' },
   ],
   uidplus = true,
+  condstore = false,
   uidValidity = 7,
   failConnect = null,
   failAppend = null,
@@ -26,7 +27,9 @@ export function createFakeImapServer({
     created: [],
     appends: [],
     deletes: [],
+    fetches: [],
     connects: 0,
+    modseq: 1,
     uidplus,
     uidValidity,
   };
@@ -41,6 +44,15 @@ export function createFakeImapServer({
     const uid = mailbox.nextUid;
     mailbox.nextUid += 1;
     mailbox.messages.set(uid, { raw: Buffer.from(raw), flags: new Set(flags), messageId: headerValue(raw, 'Message-ID') });
+    state.modseq += 1;
+    return uid;
+  };
+  // Put a message at a chosen UID, as Gmail does when it renumbers a draft.
+  state.seedAt = (path, uid, raw, flags = []) => {
+    const mailbox = box(path);
+    mailbox.messages.set(uid, { raw: Buffer.from(raw), flags: new Set(flags), messageId: headerValue(raw, 'Message-ID') });
+    mailbox.nextUid = Math.max(mailbox.nextUid, uid + 1);
+    state.modseq += 1;
     return uid;
   };
   state.messages = (path) => [...box(path).messages.entries()].map(([uid, message]) => ({
@@ -93,7 +105,13 @@ export function createFakeImapServer({
     async getMailboxLock(path) {
       box(path);
       const mailbox = state.mailboxes.get(path);
-      this.mailbox = { path, uidValidity: BigInt(state.uidValidity), uidNext: mailbox.nextUid, exists: mailbox.messages.size };
+      this.mailbox = {
+        path,
+        uidValidity: BigInt(state.uidValidity),
+        uidNext: mailbox.nextUid,
+        exists: mailbox.messages.size,
+        ...(condstore ? { highestModseq: BigInt(state.modseq) } : {}),
+      };
       return { path, release: () => {} };
     }
 
@@ -105,6 +123,32 @@ export function createFakeImapServer({
         .map(([uid]) => uid);
     }
 
+    async* fetch(range, query = {}) {
+      const mailbox = box(this.mailbox.path);
+      state.fetches.push({ path: this.mailbox.path, range: String(range), source: Boolean(query.source) });
+      const max = mailbox.nextUid - 1;
+      const wanted = new Set();
+      for (const part of String(range).split(',')) {
+        const [from, to = from] = part.split(':');
+        const low = Number(from);
+        const high = to === '*' ? max : Number(to);
+        for (let uid = low; uid <= high; uid += 1) wanted.add(uid);
+      }
+      for (const uid of [...wanted].sort((a, b) => a - b)) {
+        const message = mailbox.messages.get(uid);
+        if (!message) continue;
+        yield {
+          uid,
+          size: message.raw.length,
+          flags: message.flags,
+          labels: new Set(),
+          internalDate: new Date('2026-10-29T15:27:13.000Z'),
+          envelope: { messageId: message.messageId, subject: headerValue(message.raw, 'Subject') },
+          ...(query.source ? { source: message.raw } : {}),
+        };
+      }
+    }
+
     async fetchOne(uid) {
       const message = box(this.mailbox.path).messages.get(Number(uid));
       if (!message) return false;
@@ -114,13 +158,22 @@ export function createFakeImapServer({
     async messageDelete(uid) {
       const mailbox = box(this.mailbox.path);
       const existed = mailbox.messages.delete(Number(uid));
-      if (existed) state.deletes.push({ path: this.mailbox.path, uid: Number(uid) });
+      if (existed) {
+        state.deletes.push({ path: this.mailbox.path, uid: Number(uid) });
+        state.modseq += 1;
+      }
       return existed;
     }
 
     async status(path) {
       const mailbox = box(path);
-      return { path, uidNext: mailbox.nextUid, uidValidity: BigInt(state.uidValidity), messages: mailbox.messages.size };
+      return {
+        path,
+        uidNext: mailbox.nextUid,
+        uidValidity: BigInt(state.uidValidity),
+        messages: mailbox.messages.size,
+        ...(condstore ? { highestModseq: BigInt(state.modseq) } : {}),
+      };
     }
   }
 
