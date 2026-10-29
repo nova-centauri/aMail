@@ -1091,7 +1091,7 @@ export function createRepositories(db) {
     draftComposeHtmlPut: db.prepare(`INSERT INTO draft_compose_html (message_id, html) VALUES (?, ?)
       ON CONFLICT(message_id) DO UPDATE SET html = excluded.html`),
     draftComposeHtmlDelete: db.prepare('DELETE FROM draft_compose_html WHERE message_id = ?'),
-    draftUidsInMailbox: db.prepare(`SELECT id, uid FROM messages
+    draftUidsInMailbox: db.prepare(`SELECT id, uid, rfc_message_id FROM messages
       WHERE account_id = ? AND mailbox = ? AND is_draft = 1 AND uid IS NOT NULL`),
     messageState: db.prepare(`UPDATE messages SET
       is_read = COALESCE(@is_read, is_read),
@@ -1116,6 +1116,7 @@ export function createRepositories(db) {
       ON CONFLICT(account_id, mailbox, uid) DO UPDATE SET
         reason = excluded.reason, seen_at = excluded.seen_at`),
     syncSkipClear: db.prepare('DELETE FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
+    syncSkipUids: db.prepare('SELECT uid FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
     maxMessageUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM messages'),
     maxSyncSynced: db.prepare('SELECT MAX(synced_at) AS t FROM sync_state'),
     maxAccountUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM accounts'),
@@ -1601,7 +1602,7 @@ export function createRepositories(db) {
         else queries.draftComposeHtmlDelete.run(id);
       },
       draftUids: (accountId, mailbox) => queries.draftUidsInMailbox.all(accountId, mailbox)
-        .map((row) => ({ id: row.id, uid: Number(row.uid) })),
+        .map((row) => ({ id: row.id, uid: Number(row.uid), messageId: row.rfc_message_id || null })),
       relocate(id, { mailbox, uid }) {
         const row = queries.messageById.get(id);
         if (!row) return null;
@@ -1804,6 +1805,7 @@ export function createRepositories(db) {
         });
       },
       clearSkips: (accountId, mailbox) => queries.syncSkipClear.run(accountId, mailbox),
+      skippedUids: (accountId, mailbox) => queries.syncSkipUids.all(accountId, mailbox).map((row) => Number(row.uid)),
     },
     changes,
     retention: {

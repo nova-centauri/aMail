@@ -78,6 +78,8 @@ export const SYNC_SCAN_YIELD_EVERY = 32;
 // Sources per UID FETCH. Bounds the bytes in flight to this many capped
 // messages while replacing one round trip per message with one per chunk.
 const SYNC_SOURCE_CHUNK = 25;
+// Unknown live UIDs a Drafts reconcile looks at; Drafts folders are small.
+const DRAFT_RECONCILE_MAX_UNKNOWN = 500;
 
 export function yieldEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -1232,37 +1234,85 @@ export function createMailService({
     // Drafts are edited, sent and discarded in other clients too, and each
     // change expunges a UID. The incremental UIDNEXT pass never sees that, so
     // without this the Drafts folder fills with every superseded version.
+    //
+    // Gmail also renumbers drafts on its own: shortly after an APPEND the
+    // draft can leave its UID and come back at a higher one, sometimes after
+    // the UIDNEXT pass has already moved lastUid past it. So a missing UID is
+    // first matched by Message-ID against live UIDs aMail does not know
+    // (the row follows the draft), and live UIDs at or below lastUid that
+    // nothing claims are returned for import instead of being skipped forever.
     async function reconcileDrafts(preview, previousUidValidity) {
+      const none = { removed: 0, relocated: 0, late: [] };
       const known = repos.messages.draftUids?.(account.id, mailbox) || [];
-      if (!known.length) return 0;
-      if (preview?.uidValidity && previousUidValidity && preview.uidValidity !== previousUidValidity) return 0;
-      if (preview && preview.messages === known.length && preview.uidNext && preview.uidNext - 1 <= lastUid) return 0;
+      if (!known.length && !preview?.messages) return none;
+      if (preview?.uidValidity && previousUidValidity && preview.uidValidity !== previousUidValidity) return none;
+      if (preview && preview.messages === known.length && preview.uidNext && preview.uidNext - 1 <= lastUid) return none;
       let draftLock;
       let present;
+      const unclaimed = new Map();
       try {
         draftLock = await client.getMailboxLock(mailbox, { readOnly: true });
-        if (previousUidValidity && Number(client.mailbox?.uidValidity) && Number(client.mailbox.uidValidity) !== previousUidValidity) return 0;
+        if (previousUidValidity && Number(client.mailbox?.uidValidity) && Number(client.mailbox.uidValidity) !== previousUidValidity) return none;
         present = await client.search({ all: true }, { uid: true });
+        if (!Array.isArray(present)) return none;
+        const live = new Set(present.map(Number));
+        const knownUids = new Set([...known.map((row) => row.uid), ...(repos.sync.skippedUids?.(account.id, mailbox) || [])]);
+        const unknown = [...live].filter((uid) => uid > 0 && !knownUids.has(uid))
+          .sort((a, b) => a - b)
+          .slice(-DRAFT_RECONCILE_MAX_UNKNOWN);
+        if (unknown.length && known.some((row) => !live.has(row.uid) && row.messageId)) {
+          for await (const message of client.fetch(unknown.join(','), { uid: true, envelope: true }, { uid: true })) {
+            unclaimed.set(Number(message.uid), normalizeMessageIds(message.envelope?.messageId)[0] || null);
+          }
+        } else {
+          for (const uid of unknown) unclaimed.set(uid, null);
+        }
       } finally {
         draftLock?.release();
       }
-      if (!Array.isArray(present)) return 0;
       const live = new Set(present.map(Number));
       let removed = 0;
+      let relocated = 0;
       for (const row of known) {
         if (live.has(row.uid)) continue;
-        if (repos.messages.remove(row.id)) removed += 1;
+        const wanted = normalizeMessageIds(row.messageId)[0] || null;
+        const moved = wanted ? [...unclaimed].find(([, messageId]) => messageId === wanted)?.[0] : null;
+        if (moved) {
+          repos.messages.relocate(row.id, { mailbox, uid: moved });
+          unclaimed.delete(moved);
+          relocated += 1;
+        } else if (repos.messages.remove(row.id)) {
+          removed += 1;
+        }
       }
-      if (removed) logger.info({ accountId: account.id, mailbox, removed }, 'Removed drafts that are no longer on the server');
-      return removed;
+      const late = [...unclaimed.keys()].filter((uid) => uid <= lastUid);
+      if (removed || relocated || late.length) {
+        logger.info({ accountId: account.id, mailbox, removed, relocated, late: late.length }, 'Reconciled the Drafts mailbox with the server');
+      }
+      return { removed, relocated, late };
+    }
+
+    // Drafts at or below lastUid the UIDNEXT pass will never revisit. One that
+    // cannot be imported (too large, gone, unparseable) is recorded as a skip
+    // so the next reconcile does not download it again.
+    async function importLateDrafts(uids) {
+      for (let index = 0; index < uids.length; index += SYNC_SOURCE_CHUNK) {
+        await fetchSources(uids.slice(index, index + SYNC_SOURCE_CHUNK).map((uid) => ({ uid, size: null })));
+      }
+      await flushWrites();
+      for (const uid of uids) {
+        if (repos.messages.findByUid?.(account.id, mailbox, uid)) continue;
+        repos.sync.recordSkip?.({ account_id: account.id, mailbox, uid, reason: 'late-draft-not-imported' });
+      }
     }
 
     try {
       const previousUidValidity = Number(previousSync?.uid_validity) || null;
       const preview = await readStatus();
+      let lateDrafts = [];
       if (role === 'drafts') {
         try {
-          await reconcileDrafts(preview, previousUidValidity);
+          lateDrafts = (await reconcileDrafts(preview, previousUidValidity)).late;
         } catch (error) {
           logger.warn({ accountId: account.id, mailbox, err: cleanupError(error) }, 'Drafts reconciliation failed');
         }
@@ -1279,7 +1329,7 @@ export function createMailService({
         previousModseq: highestModseq,
       });
       timing.mark('status');
-      if (preview && planPreview.kind === 'unchanged') {
+      if (preview && planPreview.kind === 'unchanged' && !lateDrafts.length) {
         uidValidity = preview.uidValidity;
         highestModseq = preview.highestModseq || highestModseq;
         timing.log({ accountId: account.id, mailbox, plan: planPreview.kind });
@@ -1302,6 +1352,7 @@ export function createMailService({
       uidValidity = Number(client.mailbox?.uidValidity) || preview?.uidValidity || null;
       if (client.mailbox?.highestModseq != null) highestModseq = String(client.mailbox.highestModseq);
       const uidNext = Number(client.mailbox?.uidNext || preview?.uidNext || 0);
+      if (lateDrafts.length) await importLateDrafts(lateDrafts);
       const plan = planMailboxSync({
         lastUid,
         uidValidity,
@@ -1328,7 +1379,7 @@ export function createMailService({
           mailbox,
           role,
           status: 'ok',
-          imported: 0,
+          imported,
           skipped: 0,
           skipReasons: [],
           lastUid,
@@ -1346,7 +1397,7 @@ export function createMailService({
           mailbox,
           role,
           status: 'ok',
-          imported: 0,
+          imported,
           skipped: 0,
           skipReasons: [],
           lastUid,

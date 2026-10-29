@@ -387,3 +387,57 @@ test('a Drafts sync drops local copies of drafts that left the server', async (t
   assert.equal(repos.messages.get(gone.draft.id), null);
   assert.equal(repos.messages.listDrafts(account.id).length, 1);
 });
+
+test('a draft Gmail renumbers keeps its local copy at the new UID', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const saved = await service.saveDraft({ accountId: account.id, subject: 'Renumbered', htmlBody: '<p style="color: #cc0000">Hi</p>' });
+  const [copy] = server.messages('Drafts');
+  // Gmail moves the draft to a new UID after the APPEND.
+  server.mailboxes.get('Drafts').messages.delete(copy.uid);
+  const moved = server.seedAt('Drafts', copy.uid + 3, copy.raw, ['\\Draft', '\\Seen']);
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: copy.uid, uid_validity: server.uidValidity, last_error: null, synced_at: new Date().toISOString() });
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+
+  const row = repos.messages.get(saved.draft.id);
+  assert.ok(row, 'the draft keeps its id');
+  assert.equal(row.uid, moved);
+  assert.equal(repos.messages.listDrafts(account.id).length, 1);
+  assert.match(repos.messages.composeHtml(saved.draft.id), /color/);
+});
+
+test('a draft that reappears below the sync cursor is imported again', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  await service.saveDraft({ accountId: account.id, subject: 'Other', textBody: 'o' });
+  const saved = await service.saveDraft({ accountId: account.id, subject: 'Re: Dialing for dollars', textBody: 'Lead time?' });
+  const copy = server.messages('Drafts').find((message) => message.uid === saved.server.uid);
+  const drafts = server.mailboxes.get('Drafts');
+  // Gmail takes the draft off its UID and reserves the next one before the
+  // draft shows up there, so the first sync moves its cursor past it.
+  drafts.messages.delete(copy.uid);
+  drafts.nextUid = copy.uid + 2;
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: copy.uid, uid_validity: server.uidValidity, last_error: null, synced_at: new Date().toISOString() });
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+  assert.equal(repos.messages.get(saved.draft.id), null);
+  assert.equal(repos.sync.get(account.id, 'Drafts').last_uid, copy.uid + 1);
+
+  server.seedAt('Drafts', copy.uid + 1, copy.raw, ['\\Draft', '\\Seen']);
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+
+  const subjects = repos.messages.listDrafts(account.id).map((draft) => draft.subject).sort();
+  assert.deepEqual(subjects, ['Other', 'Re: Dialing for dollars']);
+});
+
+test('a late draft that cannot be imported is downloaded once, not on every sync', async (t) => {
+  const { repos, service, server, account } = harness(t, { config: { syncMaxMessageBytes: 2048 } });
+  await service.saveDraft({ accountId: account.id, subject: 'Small', textBody: 's' });
+  const big = server.seedAt('Drafts', 5, `Message-ID: <big@example.test>\r\nSubject: Big\r\n\r\n${'x'.repeat(4096)}`, ['\\Draft']);
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: big, uid_validity: server.uidValidity, last_error: null, synced_at: new Date().toISOString() });
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+
+  const downloads = server.fetches.filter((fetch) => fetch.source && fetch.range.split(',').includes(String(big)));
+  assert.equal(downloads.length, 1);
+  assert.equal(repos.messages.listDrafts(account.id).length, 1);
+});
