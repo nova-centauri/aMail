@@ -360,6 +360,14 @@ function initSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_drafts_account ON drafts(account_id, updated_at DESC);
 
+    -- Editable HTML of drafts aMail saved to the server. messages.html_body is
+    -- the display copy (no styles, inert remote images); feeding that back to
+    -- the composer would strip a draft's formatting on every save.
+    CREATE TABLE IF NOT EXISTS draft_compose_html (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      html TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
@@ -1079,6 +1087,10 @@ export function createRepositories(db) {
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
     messageDelete: db.prepare('DELETE FROM messages WHERE id = ?'),
     threadDelete: db.prepare('DELETE FROM threads WHERE id = ?'),
+    draftComposeHtmlGet: db.prepare('SELECT html FROM draft_compose_html WHERE message_id = ?'),
+    draftComposeHtmlPut: db.prepare(`INSERT INTO draft_compose_html (message_id, html) VALUES (?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET html = excluded.html`),
+    draftComposeHtmlDelete: db.prepare('DELETE FROM draft_compose_html WHERE message_id = ?'),
     draftUidsInMailbox: db.prepare(`SELECT id, uid FROM messages
       WHERE account_id = ? AND mailbox = ? AND is_draft = 1 AND uid IS NOT NULL`),
     messageState: db.prepare(`UPDATE messages SET
@@ -1582,6 +1594,12 @@ export function createRepositories(db) {
         changes.bump('message');
         return true;
       }),
+      /** Editable HTML of a draft aMail saved, or null for drafts other clients wrote. */
+      composeHtml: (id) => queries.draftComposeHtmlGet.get(id)?.html ?? null,
+      setComposeHtml(id, html) {
+        if (html) queries.draftComposeHtmlPut.run(id, html);
+        else queries.draftComposeHtmlDelete.run(id);
+      },
       draftUids: (accountId, mailbox) => queries.draftUidsInMailbox.all(accountId, mailbox)
         .map((row) => ({ id: row.id, uid: Number(row.uid) })),
       relocate(id, { mailbox, uid }) {

@@ -42,7 +42,9 @@ export function providerDraft(repos, id) {
     cc: message.cc || [],
     bcc: message.bcc || [],
     subject: message.subject === '(no subject)' ? '' : (message.subject || ''),
-    htmlBody: message.htmlBody || '',
+    // The display copy in htmlBody has styles and remote images stripped, so
+    // prefer the editable HTML aMail kept when it wrote this draft.
+    htmlBody: repos.messages.composeHtml?.(message.id) ?? (message.htmlBody || ''),
     textBody: message.textBody || '',
     attachments: rawAttachments(repos, message),
     updatedAt: message.receivedAt || message.sentAt || message.updatedAt,

@@ -52,13 +52,22 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
      A stale UID is left alone and reported as `replaced: "kept"`.
    - Writes the local row in place (`messages.replace`), so the draft id stays
      stable across saves. A new draft is upserted like a synced message.
+   - Keeps the editable HTML in `draft_compose_html` (keyed by message id,
+     deleted with the row). `messages.html_body` is the display copy, with
+     styles removed and remote images made inert, so the composer gets the
+     editable HTML back instead and formatting survives repeated saves.
+     Drafts written by other clients have no entry and open from the display
+     copy, as before.
    - If the server refuses, nothing is stored locally and the caller gets
      `DRAFT_SAVE_FAILED` (no upstream text, which can carry credentials).
      Accounts in `IMAP_WRITE_PROTECTED_ACCOUNTS` cannot save drafts.
 2. **Attachments carry over.** Bytes aMail wrote are kept in the row. For a
    draft written by another client, bytes are fetched from the server copy
-   before the rewrite; if a file cannot be fetched, the save fails rather than
-   silently dropping it.
+   before the rewrite, through the strict attachment path (same mailbox,
+   UIDVALIDITY, UID, Message-ID and MIME part as the cached row). If a file
+   cannot be fetched or verified, the save fails rather than dropping it or
+   copying another message's file into the draft. Files over 8 MiB on a draft
+   written by another client cannot be carried over this way.
 3. **Send retires the draft.** `send_message` / `POST /api/messages` with
    `draftId` removes the server copy (same Message-ID guard) after SMTP accepts.
 4. **Drafts reconciliation in sync.** For the Drafts mailbox only, a sync pass

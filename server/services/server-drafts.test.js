@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { simpleParser } from 'mailparser';
 import { createDatabase, createRepositories } from '../db.js';
 import { createMailService } from './mail-service.js';
 import { encryptJson } from './crypto.js';
@@ -191,6 +192,73 @@ test('a draft already imported from the server is updated in place on the server
   assert.match(live[0].raw, /^In-Reply-To: <original@example\.test>$/m, 'reply headers survive the rewrite');
   assert.match(live[0].raw, /notes\.txt/);
   assert.match(live[0].raw, new RegExp(Buffer.from('server-only bytes').toString('base64')), 'attachment bytes are fetched from the server copy');
+});
+
+test('formatting and remote images survive reopening and saving a draft', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const htmlBody = '<p style="color: #cc0000">Rush order</p><img src="https://cdn.example.test/logo.png" alt="Logo">';
+  const first = await service.saveDraft({ accountId: account.id, subject: 'Rush', htmlBody });
+
+  const reopened = first.draft;
+  assert.match(reopened.htmlBody, /style="color: ?#cc0000"/, 'the composer gets the editable HTML back');
+  assert.match(reopened.htmlBody, /src="https:\/\/cdn\.example\.test\/logo\.png"/);
+  assert.doesNotMatch(repos.messages.get(reopened.id).htmlBody, /style=|src="https/, 'the display copy stays sanitized');
+
+  // The composer sends back what it was given, plus the edit.
+  const second = await service.saveDraft({ subject: 'Rush order', htmlBody: reopened.htmlBody }, reopened.id);
+  const [live] = server.messages('Drafts');
+  const { html } = await simpleParser(live.raw);
+  assert.match(html, /color: ?#cc0000/);
+  assert.match(html, /src="https:\/\/cdn\.example\.test\/logo\.png"/);
+  assert.match(second.draft.htmlBody, /style="color: ?#cc0000"/);
+
+  // A text-only save drops the stale editable HTML.
+  await service.saveDraft({ htmlBody: '', textBody: 'plain now' }, reopened.id);
+  assert.equal(repos.messages.composeHtml(reopened.id), null);
+});
+
+test('attachments are not copied from a different message at a reused UID', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const raw = [
+    'Message-ID: <someone-else@example.test>',
+    'From: other@example.test',
+    'Subject: Not the draft',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="b"',
+    '',
+    '--b',
+    'Content-Type: text/plain',
+    '',
+    'Unrelated',
+    '--b',
+    'Content-Type: text/plain; name="notes.txt"',
+    'Content-Disposition: attachment; filename="notes.txt"',
+    '',
+    'someone elses file',
+    '--b--',
+    '',
+  ].join('\r\n');
+  // The cached draft row points at a UID that now holds another message.
+  const uid = server.seed('Drafts', raw, ['\\Draft']);
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Mine', normalized_subject: 'mine', latest_at: '2026-10-28T00:00:00.000Z' });
+  const cached = repos.messages.upsert({
+    account_id: account.id, thread_id: thread.id, mailbox: 'Drafts', uid,
+    rfc_message_id: '<my-draft@example.test>', in_reply_to: null, references_json: '[]',
+    subject: 'Mine', from_name: '', from_email: account.email,
+    to_json: '[]', cc_json: '[]', bcc_json: '[]', reply_to_json: null,
+    sent_at: '2026-10-28T00:00:00.000Z', received_at: '2026-10-28T00:00:00.000Z',
+    html_body: '', text_body: 'mine', snippet: 'mine',
+    attachments_json: JSON.stringify([{ index: 0, filename: 'notes.txt', contentType: 'text/plain', size: 18 }]),
+    labels_json: '[]', is_read: 1, is_starred: 0, is_archived: 0, is_trashed: 0, is_spam: 0,
+    snoozed_until: null, is_sent: 0, is_draft: 1,
+  });
+
+  await assert.rejects(
+    service.saveDraft({ textBody: 'edited' }, cached.id),
+    (error) => error.code === 'VALIDATION_ERROR' && /notes\.txt could not be read/.test(error.message),
+  );
+  assert.equal(server.appends.length, 0, 'nothing is written to the server');
+  assert.equal(server.deletes.length, 0);
 });
 
 test('a stale UID is never deleted when it holds a different message', async (t) => {

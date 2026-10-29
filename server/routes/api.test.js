@@ -327,6 +327,8 @@ test('message API filters unified mail by smart category and account creation is
   assert.equal(all.messages.some((message) => message.subject === 'Q3 budget notes'), false);
 
   const quoteBytes = Buffer.from('%PDF quote').toString('base64');
+  // Metadata as sync records it, so the strict server fetch can verify the part.
+  const quoteSize = Buffer.from('%PDF quote').length;
   const quoteUid = imap.state.seed('[Gmail]/Drafts', [
     'Message-ID: <quote-follow-up@example.test>',
     'Subject: Quote follow-up',
@@ -339,6 +341,7 @@ test('message API filters unified mail by smart category and account creation is
     '--q',
     'Content-Type: application/pdf; name="quote.pdf"',
     'Content-Disposition: attachment; filename="quote.pdf"',
+    'Content-ID: <part-1>',
     'Content-Transfer-Encoding: base64',
     '',
     quoteBytes,
@@ -359,7 +362,7 @@ test('message API filters unified mail by smart category and account creation is
     is_draft: 1,
     is_read: 1,
     text_body: 'See the attached quote.',
-    attachments_json: JSON.stringify([{ index: 0, filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }]),
+    attachments_json: JSON.stringify([{ index: 0, filename: 'quote.pdf', contentType: 'application/pdf', size: quoteSize, contentId: 'part-1' }]),
   });
   const closedProvider = await fetch(`${origin}/api/drafts/${providerWithFile.id}`, {
     method: 'PATCH',
@@ -367,7 +370,7 @@ test('message API filters unified mail by smart category and account creation is
     body: JSON.stringify({
       subject: 'Quote follow-up',
       textBody: 'See the attached quote.',
-      attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', size: 4096, contentId: 'part-1' }],
+      attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', size: quoteSize, contentId: 'part-1' }],
     }),
   });
   // A provider draft is edited in place on the server: same id, the old

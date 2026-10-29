@@ -2478,7 +2478,18 @@ export function createMailService({
         existing.push(meta);
         continue;
       }
-      const fetched = await fetchAttachment(plan.server.id, meta.index);
+      let fetched;
+      try {
+        // Strict: the cached UID must still hold this draft (same UIDVALIDITY,
+        // Message-ID and part), or another message's file would be copied in.
+        fetched = await fetchAttachment(plan.server.id, meta.index, { strict: true });
+      } catch (error) {
+        if (!(error instanceof NotFoundError || error instanceof ServiceUnavailableError || error instanceof ValidationError)) throw error;
+        throw new ValidationError(
+          `${meta.filename || 'An attachment'} could not be read from the server copy of this draft. Sync the mailbox, or attach the file again.`,
+          { reason: error.code || 'ATTACHMENT_UNAVAILABLE' },
+        );
+      }
       existing.push({ ...meta, content: Buffer.from(fetched.body).toString('base64'), size: fetched.body.length });
     }
     const merged = mergeDraftAttachments(plan.incomingAttachments, existing);
@@ -2580,6 +2591,7 @@ export function createMailService({
       saved = repos.messages.upsert({ ...row, thread_id: thread.id });
       if (plan.legacy) repos.drafts.remove(plan.legacy.id);
     }
+    repos.messages.setComposeHtml(saved.id, plan.htmlBody);
     logger.info({
       accountId: account.id,
       draft: { mailbox: server.mailbox, hasUid: Boolean(server.uid), previous: server.previous.status, migrated: Boolean(plan.legacy) },
