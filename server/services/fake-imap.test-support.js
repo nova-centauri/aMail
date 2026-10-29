@@ -16,6 +16,7 @@ export function createFakeImapServer({
     { path: 'Drafts', name: 'Drafts', specialUse: '\\Drafts' },
   ],
   uidplus = true,
+  condstore = false,
   uidValidity = 7,
   failConnect = null,
   failAppend = null,
@@ -28,6 +29,7 @@ export function createFakeImapServer({
     deletes: [],
     fetches: [],
     connects: 0,
+    modseq: 1,
     uidplus,
     uidValidity,
   };
@@ -42,6 +44,7 @@ export function createFakeImapServer({
     const uid = mailbox.nextUid;
     mailbox.nextUid += 1;
     mailbox.messages.set(uid, { raw: Buffer.from(raw), flags: new Set(flags), messageId: headerValue(raw, 'Message-ID') });
+    state.modseq += 1;
     return uid;
   };
   // Put a message at a chosen UID, as Gmail does when it renumbers a draft.
@@ -49,6 +52,7 @@ export function createFakeImapServer({
     const mailbox = box(path);
     mailbox.messages.set(uid, { raw: Buffer.from(raw), flags: new Set(flags), messageId: headerValue(raw, 'Message-ID') });
     mailbox.nextUid = Math.max(mailbox.nextUid, uid + 1);
+    state.modseq += 1;
     return uid;
   };
   state.messages = (path) => [...box(path).messages.entries()].map(([uid, message]) => ({
@@ -101,7 +105,13 @@ export function createFakeImapServer({
     async getMailboxLock(path) {
       box(path);
       const mailbox = state.mailboxes.get(path);
-      this.mailbox = { path, uidValidity: BigInt(state.uidValidity), uidNext: mailbox.nextUid, exists: mailbox.messages.size };
+      this.mailbox = {
+        path,
+        uidValidity: BigInt(state.uidValidity),
+        uidNext: mailbox.nextUid,
+        exists: mailbox.messages.size,
+        ...(condstore ? { highestModseq: BigInt(state.modseq) } : {}),
+      };
       return { path, release: () => {} };
     }
 
@@ -148,13 +158,22 @@ export function createFakeImapServer({
     async messageDelete(uid) {
       const mailbox = box(this.mailbox.path);
       const existed = mailbox.messages.delete(Number(uid));
-      if (existed) state.deletes.push({ path: this.mailbox.path, uid: Number(uid) });
+      if (existed) {
+        state.deletes.push({ path: this.mailbox.path, uid: Number(uid) });
+        state.modseq += 1;
+      }
       return existed;
     }
 
     async status(path) {
       const mailbox = box(path);
-      return { path, uidNext: mailbox.nextUid, uidValidity: BigInt(state.uidValidity), messages: mailbox.messages.size };
+      return {
+        path,
+        uidNext: mailbox.nextUid,
+        uidValidity: BigInt(state.uidValidity),
+        messages: mailbox.messages.size,
+        ...(condstore ? { highestModseq: BigInt(state.modseq) } : {}),
+      };
     }
   }
 

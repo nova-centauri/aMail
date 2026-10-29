@@ -441,3 +441,61 @@ test('a late draft that cannot be imported is downloaded once, not on every sync
   assert.equal(downloads.length, 1);
   assert.equal(repos.messages.listDrafts(account.id).length, 1);
 });
+
+test('a followed draft another client changed drops the stale editable HTML', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const saved = await service.saveDraft({ accountId: account.id, subject: 'Edited elsewhere', htmlBody: '<p style="color: #cc0000">Original</p>' });
+  const [copy] = server.messages('Drafts');
+  // Another client rewrites the draft and keeps its Message-ID.
+  server.mailboxes.get('Drafts').messages.delete(copy.uid);
+  const edited = [
+    `Message-ID: ${copy.messageId}`,
+    'Subject: Edited elsewhere',
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '<p>Changed in Gmail</p>',
+  ].join('\r\n');
+  const moved = server.seedAt('Drafts', copy.uid + 3, edited, ['\\Draft', '\\Seen']);
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: copy.uid, uid_validity: server.uidValidity, last_error: null, synced_at: new Date().toISOString() });
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+
+  const row = repos.messages.get(saved.draft.id);
+  assert.equal(row.uid, moved);
+  assert.match(row.htmlBody, /Changed in Gmail/);
+  assert.equal(repos.messages.composeHtml(saved.draft.id), null);
+});
+
+test('late drafts stay within the per-account message budget', async (t) => {
+  const { repos, service, server, account } = harness(t, { config: { syncMaxMessagesPerAccount: 1 } });
+  await service.saveDraft({ accountId: account.id, subject: 'Known', textBody: 'k' });
+  for (const uid of [5, 6, 7]) {
+    server.seedAt('Drafts', uid, `Message-ID: <late-${uid}@example.test>\r\nSubject: Late ${uid}\r\n\r\nbody`, ['\\Draft']);
+  }
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: 7, uid_validity: server.uidValidity, last_error: null, synced_at: new Date().toISOString() });
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+  assert.equal(repos.messages.listDrafts(account.id).length, 2);
+  assert.deepEqual(repos.sync.skippedUids(account.id, 'Drafts'), []);
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+  assert.equal(repos.messages.listDrafts(account.id).length, 4);
+});
+
+test('a draft renumbered below the cursor is followed when CONDSTORE shows a change', async (t) => {
+  const { repos, service, server, account } = harness(t, { imap: { condstore: true } });
+  const saved = await service.saveDraft({ accountId: account.id, subject: 'Quietly renumbered', textBody: 'q' });
+  const [copy] = server.messages('Drafts');
+  const modseqBefore = String(server.modseq);
+  // Gmail moves the draft to a UID a sync already passed; the count is unchanged.
+  server.mailboxes.get('Drafts').messages.delete(copy.uid);
+  const moved = server.seedAt('Drafts', copy.uid + 1, copy.raw, ['\\Draft', '\\Seen']);
+  repos.sync.save({ account_id: account.id, mailbox: 'Drafts', last_uid: moved, uid_validity: server.uidValidity, highest_modseq: modseqBefore, last_error: null, synced_at: new Date().toISOString() });
+
+  await service.syncAccount(account.id, { mailbox: 'Drafts' });
+
+  assert.equal(repos.messages.get(saved.draft.id).uid, moved);
+  assert.equal(repos.messages.listDrafts(account.id).length, 1);
+});

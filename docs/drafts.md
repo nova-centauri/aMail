@@ -79,11 +79,18 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
    stayed in aMail's Drafts folder forever.
    - A local draft whose UID is gone is first matched by Message-ID against
      live UIDs aMail does not know (newest 500). On a match the row moves to
-     the new UID and keeps its id and editable HTML; only unmatched rows are
-     dropped.
+     the new UID and keeps its id. It is downloaded again in the same pass;
+     its editable HTML is kept only if the server copy's HTML (or text, for
+     a text-only draft) is unchanged, since another client may have edited
+     it under the same Message-ID. Only unmatched rows are dropped.
+   - With CONDSTORE, a changed HIGHESTMODSEQ runs the reconciliation even
+     when the message count and UIDNEXT look unchanged, which is what a
+     draft renumbered below the cursor looks like.
    - Live UIDs at or below the sync cursor that aMail has no row for are
-     imported in the same pass. One that still cannot be imported is
-     recorded in `sync_skips` so it is not downloaded on every sync.
+     imported in the same pass, newest first and within the account's
+     per-pass message budget; the rest wait for the next pass. One that
+     still cannot be imported is recorded in `sync_skips` so it is not
+     downloaded on every sync.
    - Why: Gmail renumbers drafts. On the first live save (Oct 29) a draft
      APPENDed at one UID left it within seconds; the reconcile dropped the
      row, and the UIDNEXT pass had already moved its cursor past the UID the
