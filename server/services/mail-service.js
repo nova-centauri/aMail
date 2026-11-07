@@ -393,6 +393,42 @@ const MOVE_SPECIAL_USE = {
 
 const PLACEMENT_KEYS = ['isArchived', 'isTrashed', 'isSpam'];
 
+// Retry schedule for server changes IMAP did not confirm. Retries run after an
+// account's sync has already logged in, so a bad password never turns into a
+// login storm; past the last attempt a change is "stuck" and waits for the
+// owner (or an agent) to requeue it.
+export const REMOTE_OP_MAX_ATTEMPTS = 8;
+const REMOTE_OP_BASE_DELAY_MS = 60_000;
+const REMOTE_OP_MAX_DELAY_MS = 60 * 60_000;
+const REMOTE_OP_RETRY_BATCH = 25;
+
+export function remoteOpDelayMs(attempt) {
+  const step = Math.max(0, Number(attempt) || 0);
+  return Math.min(REMOTE_OP_MAX_DELAY_MS, REMOTE_OP_BASE_DELAY_MS * (2 ** step));
+}
+
+/** Which server-visible parts of a message a state change touches. */
+export function remoteOpFields(state) {
+  const fields = [];
+  if (state?.isRead !== undefined) fields.push('read');
+  if (state?.isStarred !== undefined) fields.push('starred');
+  if (PLACEMENT_KEYS.some((key) => state?.[key] !== undefined)) fields.push('placement');
+  return fields;
+}
+
+/**
+ * Rebuild the state change for a retry from the message as it is now. A retry
+ * pushes the latest local state (archive then unarchive retries as "inbox"),
+ * so replaying a change is idempotent.
+ */
+export function remoteOpState(fields, message) {
+  const state = {};
+  if (fields.includes('read')) state.isRead = Boolean(message.isRead);
+  if (fields.includes('starred')) state.isStarred = Boolean(message.isStarred);
+  if (fields.includes('placement')) state.isArchived = Boolean(message.isArchived);
+  return state;
+}
+
 /**
  * Where the server copy should live after a placement change. The server
  * follows the message's resulting local placement, so undoing an archive,
@@ -1710,6 +1746,12 @@ export function createMailService({
           }
         }
       }
+      // The session just proved it can log in and talk to the server: the
+      // cheapest moment to push changes that failed earlier.
+      if (!singleMailbox) {
+        assertAccountGeneration(accountId, generation);
+        await retryRemoteOps(accountId);
+      }
       const imported = mailboxes.reduce((sum, item) => sum + (item.imported || 0), 0);
       const skipped = mailboxes.reduce((sum, item) => sum + (item.skipped || 0), 0);
       const remaining = mailboxes.reduce((sum, item) => sum + (item.remaining || 0), 0);
@@ -2092,6 +2134,14 @@ export function createMailService({
     }
   }
 
+  function remoteChangeCounts() {
+    try {
+      return repos.remoteOps?.counts?.() || { pending: 0, stuck: 0 };
+    } catch {
+      return { pending: 0, stuck: 0 };
+    }
+  }
+
   function runtimeStatus() {
     const started = [];
     if (inFlightSync?.startedAt) started.push(inFlightSync.startedAt);
@@ -2109,6 +2159,7 @@ export function createMailService({
       coolingDown: accountCooldown.size,
       probesQueued: probeWaiters.length,
       ingestWorker: ingest.live,
+      remoteChanges: remoteChangeCounts(),
     };
   }
 
@@ -3313,6 +3364,22 @@ export function createMailService({
     return queued;
   }
 
+  function queueRemoteOp(message, fields, error) {
+    if (!repos.remoteOps?.enqueue || !fields.length) return null;
+    try {
+      return repos.remoteOps.enqueue({
+        messageId: message.id,
+        accountId: message.accountId,
+        fields,
+        nextAttemptAt: new Date(Date.now() + remoteOpDelayMs(0)).toISOString(),
+        error: cleanupError(error),
+      });
+    } catch (queueError) {
+      logger.warn({ messageId: message.id, err: cleanupError(queueError) }, 'Could not queue a failed server change for retry');
+      return null;
+    }
+  }
+
   async function updateMessageState(id, state) {
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
@@ -3327,18 +3394,75 @@ export function createMailService({
     if (state.isAnalyzed === true && !existing.isAnalyzed && updated?.isAnalyzed) {
       metering?.recordAnalyzed?.(1);
     }
-    // Mail mutations are intentionally best-effort so offline local state stays
-    // usable. The API response says whether IMAP accepted, skipped, or failed it.
+    // A change for this message that failed earlier rides along, so the server
+    // catches up with everything still owed for it in one round trip.
+    const fields = remoteOpFields(state);
+    const pending = fields.length && state.snoozedUntil === undefined ? repos.remoteOps?.get?.(id) : null;
+    const attempt = pending ? { ...remoteOpState(pending.fields, updated), ...state } : state;
+    // Local state stays usable offline. The API response says whether IMAP
+    // accepted, skipped, or failed it; a failure is queued and retried.
     try {
-      const { message, remoteSync } = await syncMessageStateToImap(updated, state);
+      const { message, remoteSync } = await syncMessageStateToImap(updated, attempt);
+      if (pending) repos.remoteOps.complete(id, pending.revision);
       return { ...message, remoteSync };
     } catch (error) {
       logger.warn({ messageId: id, err: cleanupError(error) }, 'Could not synchronize message mutation to IMAP');
+      const queued = queueRemoteOp(updated, remoteOpFields(attempt), error);
       return {
         ...updated,
-        remoteSync: { attempted: true, status: 'failed', reason: 'imap-operation-failed' },
+        remoteSync: queued
+          ? { attempted: true, status: 'queued', reason: 'imap-operation-failed', retryAt: queued.nextAttemptAt }
+          : { attempted: true, status: 'failed', reason: 'imap-operation-failed' },
       };
     }
+  }
+
+  /**
+   * Push queued server changes for one account. Runs after that account's
+   * sync, one change at a time, and never throws: a failure only reschedules.
+   */
+  async function retryRemoteOps(accountId, { limit = REMOTE_OP_RETRY_BATCH } = {}) {
+    const summary = { attempted: 0, synced: 0, failed: 0, stuck: 0 };
+    if (!repos.remoteOps?.due) return summary;
+    try {
+      assertImapWritesAllowed(accountId);
+    } catch {
+      return summary;
+    }
+    let due;
+    try {
+      due = repos.remoteOps.due(accountId, { limit });
+    } catch (error) {
+      logger.warn({ accountId, err: cleanupError(error) }, 'Could not read queued server changes');
+      return summary;
+    }
+    for (const op of due) {
+      const message = repos.messages.get(op.messageId);
+      if (!message) continue;
+      summary.attempted += 1;
+      try {
+        await syncMessageStateToImap(message, remoteOpState(op.fields, message));
+        repos.remoteOps.complete(op.messageId, op.revision);
+        summary.synced += 1;
+      } catch (error) {
+        const attempts = op.attempts + 1;
+        const stuck = attempts >= REMOTE_OP_MAX_ATTEMPTS;
+        repos.remoteOps.recordFailure({
+          messageId: op.messageId,
+          revision: op.revision,
+          nextAttemptAt: new Date(Date.now() + remoteOpDelayMs(attempts)).toISOString(),
+          error: cleanupError(error),
+          stuck,
+        });
+        summary.failed += 1;
+        if (stuck) {
+          summary.stuck += 1;
+          logger.warn({ accountId, messageId: op.messageId, attempts, err: cleanupError(error) }, 'Server change is stuck after repeated retries');
+        }
+      }
+    }
+    if (summary.attempted) logger.info({ accountId, ...summary }, 'Retried queued server changes');
+    return summary;
   }
 
   return {
@@ -3357,6 +3481,7 @@ export function createMailService({
     saveDraft,
     migrateLocalDrafts,
     updateMessageState,
+    retryRemoteOps,
     fetchAttachment,
     hydrateMessageSource,
     searchAndMaterialize,

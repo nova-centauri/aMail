@@ -607,7 +607,50 @@ function initSchema(db) {
   }
 
   wakeLegacySnoozes(db);
+  ensureRemoteOps(db);
   ensureMessagesFts(db);
+}
+
+/**
+ * Server changes (read, star, folder moves) that IMAP has not confirmed yet.
+ * One row per message: later failures for the same message merge into it, so
+ * a retry always pushes the message's current local state, never a stale one.
+ * Additive and created with IF NOT EXISTS, so it is safe on a live database.
+ */
+function ensureRemoteOps(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS remote_ops (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      fields_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'stuck')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_remote_ops_due ON remote_ops(account_id, status, next_attempt_at);
+  `);
+}
+
+export const REMOTE_OP_FIELDS = ['read', 'starred', 'placement'];
+
+function publicRemoteOp(row) {
+  if (!row) return null;
+  return {
+    messageId: row.message_id,
+    accountId: row.account_id,
+    fields: json(row.fields_json).filter((field) => REMOTE_OP_FIELDS.includes(field)),
+    status: row.status,
+    attempts: Number(row.attempts) || 0,
+    nextAttemptAt: row.next_attempt_at,
+    lastError: row.last_error || null,
+    revision: Number(row.revision) || 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 const SNOOZE_UNARCHIVE_SETTING = 'migration.snooze_unarchive_v1';
@@ -1183,6 +1226,27 @@ export function createRepositories(db) {
     messageRow: db.prepare('SELECT rowid, * FROM messages WHERE id = ?'),
     ftsInsert: db.prepare(FTS_INSERT_SQL),
     ftsDelete: db.prepare('DELETE FROM messages_fts WHERE rowid = ?'),
+    remoteOpGet: db.prepare('SELECT * FROM remote_ops WHERE message_id = ?'),
+    remoteOpInsert: db.prepare(`INSERT INTO remote_ops (
+      message_id, account_id, fields_json, status, attempts, next_attempt_at, last_error, revision, created_at, updated_at
+    ) VALUES (@message_id, @account_id, @fields_json, 'pending', 0, @next_attempt_at, @last_error, 1, @now, @now)`),
+    remoteOpMerge: db.prepare(`UPDATE remote_ops SET fields_json = @fields_json, status = 'pending', attempts = 0,
+      next_attempt_at = @next_attempt_at, last_error = @last_error, revision = revision + 1, updated_at = @now
+      WHERE message_id = @message_id`),
+    remoteOpFailed: db.prepare(`UPDATE remote_ops SET status = @status, attempts = attempts + 1,
+      next_attempt_at = @next_attempt_at, last_error = @last_error, updated_at = @now
+      WHERE message_id = @message_id AND revision = @revision`),
+    remoteOpComplete: db.prepare('DELETE FROM remote_ops WHERE message_id = ? AND revision = ?'),
+    remoteOpDue: db.prepare(`SELECT * FROM remote_ops
+      WHERE account_id = @accountId AND status = 'pending' AND next_attempt_at <= @now
+      ORDER BY next_attempt_at ASC, message_id ASC LIMIT @limit`),
+    remoteOpList: db.prepare(`SELECT * FROM remote_ops
+      WHERE (@status IS NULL OR status = @status) AND (@accountId IS NULL OR account_id = @accountId)
+      ORDER BY status DESC, next_attempt_at ASC, message_id ASC LIMIT @limit`),
+    remoteOpCounts: db.prepare(`SELECT status, COUNT(*) AS count FROM remote_ops GROUP BY status`),
+    remoteOpRequeue: db.prepare(`UPDATE remote_ops SET status = 'pending', attempts = 0, next_attempt_at = @now,
+      revision = revision + 1, updated_at = @now
+      WHERE status = 'stuck' AND (@messageId IS NULL OR message_id = @messageId)`),
     passkeyById: db.prepare('SELECT * FROM passkeys WHERE id = ?'),
     passkeyList: db.prepare('SELECT * FROM passkeys ORDER BY created_at DESC'),
     passkeyCount: db.prepare('SELECT COUNT(*) AS count FROM passkeys'),
@@ -1872,6 +1936,58 @@ export function createRepositories(db) {
         if (removed) changes.bump('message');
         return removed;
       },
+    },
+    remoteOps: {
+      get: (messageId) => publicRemoteOp(queries.remoteOpGet.get(messageId)),
+      /**
+       * Record a server change that failed. Fields merge into any pending row
+       * for the message; a new failure revives a stuck row because it is a new
+       * intent the owner just expressed.
+       */
+      enqueue: db.transaction(({ messageId, accountId, fields, nextAttemptAt, error = null }) => {
+        const wanted = REMOTE_OP_FIELDS.filter((field) => fields.includes(field));
+        if (!wanted.length) return null;
+        const timestamp = now();
+        const existing = queries.remoteOpGet.get(messageId);
+        const params = {
+          message_id: messageId,
+          account_id: accountId,
+          next_attempt_at: nextAttemptAt,
+          last_error: error ? String(error).slice(0, 500) : null,
+          now: timestamp,
+        };
+        if (existing) {
+          const merged = REMOTE_OP_FIELDS.filter((field) => wanted.includes(field) || json(existing.fields_json).includes(field));
+          queries.remoteOpMerge.run({ ...params, fields_json: JSON.stringify(merged) });
+        } else {
+          queries.remoteOpInsert.run({ ...params, fields_json: JSON.stringify(wanted) });
+        }
+        return publicRemoteOp(queries.remoteOpGet.get(messageId));
+      }),
+      /** A retry failed. Ignored when a newer failure already replaced the row. */
+      recordFailure({ messageId, revision, nextAttemptAt, error = null, stuck = false }) {
+        return queries.remoteOpFailed.run({
+          message_id: messageId,
+          revision,
+          status: stuck ? 'stuck' : 'pending',
+          next_attempt_at: nextAttemptAt,
+          last_error: error ? String(error).slice(0, 500) : null,
+          now: now(),
+        }).changes > 0;
+      },
+      /** Done, unless a newer failure for the same message arrived meanwhile. */
+      complete: (messageId, revision) => queries.remoteOpComplete.run(messageId, revision).changes > 0,
+      due: (accountId, { limit = 25, at = now() } = {}) => queries.remoteOpDue
+        .all({ accountId, now: at, limit }).map(publicRemoteOp),
+      list: ({ status = null, accountId = null, limit = 100 } = {}) => queries.remoteOpList
+        .all({ status, accountId, limit }).map(publicRemoteOp),
+      counts() {
+        const counts = { pending: 0, stuck: 0 };
+        for (const row of queries.remoteOpCounts.all()) counts[row.status] = Number(row.count) || 0;
+        return counts;
+      },
+      /** Give stuck changes a fresh set of attempts (all, or one message). */
+      requeue: (messageId = null) => queries.remoteOpRequeue.run({ messageId, now: now() }).changes,
     },
     settings: {
       list: () => Object.fromEntries(queries.settingList.all().map((row) => [row.key, json(row.value_json, null)])),

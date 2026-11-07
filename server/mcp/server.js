@@ -585,6 +585,30 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     return { messages: receipts };
   }));
 
+  server.registerTool('list_unsynced_changes', {
+    title: 'List server changes not yet confirmed',
+    description: 'Read, star and folder changes (archive, trash, spam and their undo) that the mail server has not confirmed yet. pending changes retry automatically after each account sync; stuck changes ran out of retries and need retry_unsynced_changes. Local bookkeeping only; no IMAP connection.',
+    inputSchema: {
+      status: z.enum(['pending', 'stuck']).optional(),
+      accountId: z.string().min(1).optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ status, accountId, limit = 50 }) => runTool(async () => ({
+    counts: repos.remoteOps?.counts?.() || { pending: 0, stuck: 0 },
+    changes: repos.remoteOps?.list?.({ status: status || null, accountId: accountId || null, limit }) || [],
+  })));
+
+  server.registerTool('retry_unsynced_changes', {
+    title: 'Retry stuck server changes',
+    description: 'Give stuck server changes a fresh set of retries (all of them, or one message id). They are pushed after the next sync of their account. Never moves mail by itself.',
+    inputSchema: {
+      messageId: z.string().min(1).max(128).optional(),
+    },
+  }, async ({ messageId }) => runTool(async () => ({
+    requeued: repos.remoteOps?.requeue?.(messageId || null) || 0,
+  })));
+
   server.registerTool('sync_mail', {
     title: 'Sync mail',
     description: 'Queue a background IMAP sync and return immediately. Poll get_sync_job with the jobId. status is queued or already_running.',
