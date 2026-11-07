@@ -15,7 +15,7 @@ export function folderPredicate(alias) {
           WHEN 'all' THEN ${a}.is_trashed = 0 AND ${a}.is_spam = 0 AND ${a}.is_draft = 0
           WHEN 'trash' THEN ${a}.is_trashed = 1
           WHEN 'spam' THEN ${a}.is_spam = 1 AND ${a}.is_trashed = 0
-          WHEN 'archive' THEN ${a}.is_archived = 1 AND ${a}.is_trashed = 0 AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)
+          WHEN 'archive' THEN ${a}.is_archived = 1 AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0 AND (${a}.snoozed_until IS NULL OR ${a}.snoozed_until <= @now)
           ELSE ${a}.mailbox = @mailbox AND ${a}.is_trashed = 0 AND ${a}.is_spam = 0
         END`;
 }

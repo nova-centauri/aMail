@@ -57,7 +57,7 @@ import {
 } from '../mail/imap-search.js';
 import { emptyRuntimeStatus } from './runtime-health.js';
 import { createPhaseTimer, debugTimingEnabled } from './debug-timing.js';
-import { planMailboxSync, uidPages } from './mailbox-sync-plan.js';
+import { compareModseq, planMailboxSync, uidPages } from './mailbox-sync-plan.js';
 import { createSyncIngest } from './sync-ingest.js';
 import { createSyncJobBoard, mcpEnqueueStatus, publicSyncJob } from './sync-jobs.js';
 
@@ -384,20 +384,40 @@ const MOVE_SPECIAL_USE = {
   archive: ['\\Archive', '\\All'],
   trash: ['\\Trash'],
   spam: ['\\Junk'],
+  sent: ['\\Sent'],
+  drafts: ['\\Drafts'],
 };
 
-function remoteMoveAction(state) {
-  // Trash and Junk take precedence because the spam endpoint also marks the
-  // message archived locally for list filtering.
-  if (state.isTrashed === true) return 'trash';
-  if (state.isSpam === true) return 'spam';
-  if (state.isArchived === true) return 'archive';
-  return null;
+const PLACEMENT_KEYS = ['isArchived', 'isTrashed', 'isSpam'];
+
+/**
+ * Where the server copy should live after a placement change. The server
+ * follows the message's resulting local placement, so undoing an archive,
+ * trash or spam (a `false` value) moves the message back instead of only
+ * clearing a local flag. Trash and Junk win over Archive because older spam
+ * actions also set the archive flag.
+ */
+export function remotePlacement(state, message) {
+  if (!PLACEMENT_KEYS.some((key) => state[key] !== undefined)) return null;
+  if (message?.isTrashed) return 'trash';
+  if (message?.isSpam) return 'spam';
+  if (message?.isArchived) return 'archive';
+  if (message?.isDraft) return 'drafts';
+  if (message?.isSent) return 'sent';
+  return 'inbox';
 }
 
-function specialUseDestination(folders, action) {
+export function specialUseDestination(folders, action) {
+  // RFC 3501 makes INBOX mandatory, so restoring never depends on SPECIAL-USE.
+  if (action === 'inbox') {
+    return folders.find((folder) => String(folder.specialUse || '') === '\\Inbox')?.path || 'INBOX';
+  }
   const choices = MOVE_SPECIAL_USE[action] || [];
   return folders.find((folder) => choices.includes(String(folder.specialUse || '')))?.path || null;
+}
+
+function isAllMailFolder(folders, path) {
+  return folders.some((folder) => folder.path === path && String(folder.specialUse || '') === '\\All');
 }
 
 function mappedUid(moveResult, sourceUid) {
@@ -1441,6 +1461,15 @@ export function createMailService({
           uidValidityChanged,
           plan: plan.kind,
         };
+      }
+
+      // A pass that imports new UIDs also moves HIGHESTMODSEQ forward. Read
+      // and star changes made elsewhere since the last pass would be lost if
+      // the new modseq were saved without first applying them.
+      const previousModseq = previousSync?.highest_modseq ?? null;
+      if (!plan.resetCursor && previousModseq != null && highestModseq != null
+        && compareModseq(highestModseq, previousModseq) > 0) {
+        await applyFlagChanges(previousModseq);
       }
 
       const scanDrafts = Boolean(plan.scanDrafts);
@@ -2926,11 +2955,13 @@ export function createMailService({
     const entry = await acquirePooledClient(account, credentials);
     const client = entry.client;
     let lock;
-    const action = remoteMoveAction(state);
+    const action = remotePlacement(state, message);
     try {
       let destination = null;
+      let folders = [];
       if (action) {
-        destination = specialUseDestination(await pooledList(entry), action);
+        folders = await pooledList(entry);
+        destination = specialUseDestination(folders, action);
         if (!destination) {
           return {
             message,
@@ -2956,9 +2987,14 @@ export function createMailService({
       if (!action) {
         return { message, remoteSync: { attempted: true, status: 'synced', action: 'flags' } };
       }
-      // ImapFlow uses MOVE when available and safely falls back to COPY +
-      // EXPUNGE for servers lacking RFC 6851 support.
-      const moveResult = await client.messageMove(message.uid, destination, { uid: true });
+      // A message can't leave an "All Mail" folder (Gmail): it is a view of
+      // every message. Restoring it to the inbox is a COPY, which on Gmail
+      // adds the Inbox label. Everything else is a MOVE; ImapFlow uses MOVE when
+      // available and safely falls back to COPY + EXPUNGE.
+      const copyOnly = action === 'inbox' && isAllMailFolder(folders, message.mailbox);
+      const moveResult = copyOnly
+        ? await client.messageCopy(message.uid, destination, { uid: true })
+        : await client.messageMove(message.uid, destination, { uid: true });
       if (!moveResult) throw new Error(`IMAP ${action} move was rejected`);
 
       let movedMessage = message;

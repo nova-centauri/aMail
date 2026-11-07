@@ -14,6 +14,7 @@ import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
+import { threadActionTargets } from '../services/thread-targets.js';
 import {
   DEFAULT_ACCOUNT_COLOR,
   discoverAccountProvider,
@@ -105,7 +106,8 @@ function updateTargets(repos, mailService, id, state) {
   if (message) return Promise.all([mailService.updateMessageState(message.id, state)]);
   const thread = repos.threads.get(id);
   if (!thread) throw new NotFoundError('Message or thread not found.');
-  return Promise.all(repos.messages.forThread(thread.id).map((item) => mailService.updateMessageState(item.id, state)));
+  return Promise.all(threadActionTargets(repos.messages.forThread(thread.id), state)
+    .map((item) => mailService.updateMessageState(item.id, state)));
 }
 
 function wantsEventStream(request) {
@@ -672,13 +674,22 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     response.json({ message: messages[0], messages });
   });
   router.post('/messages/:id/spam', async (request, response) => {
-    const messages = await updateTargets(repos, mailService, request.params.id, { isSpam: request.body?.spam !== false, isArchived: true });
+    // Spam lives in Junk, not Archive. Not-spam also clears the archive flag
+    // older spam actions set, so the message goes back to the inbox.
+    const spam = request.body?.spam !== false;
+    const messages = await updateTargets(repos, mailService, request.params.id, spam ? { isSpam: true } : { isSpam: false, isArchived: false });
     response.json({ message: messages[0], messages });
   });
   router.post('/messages/:id/snooze', async (request, response) => {
     const until = request.body?.until ? new Date(request.body.until) : new Date(Date.now() + 24 * 60 * 60 * 1000);
     if (Number.isNaN(until.valueOf()) || until <= new Date()) throw new ValidationError('Snooze time must be in the future.');
-    const messages = await updateTargets(repos, mailService, request.params.id, { snoozedUntil: until.toISOString(), isArchived: true });
+    // Snooze only hides the message until `until`; it is not archived, so it
+    // comes back to the inbox on its own when the time passes.
+    const messages = await updateTargets(repos, mailService, request.params.id, { snoozedUntil: until.toISOString() });
+    response.json({ message: messages[0], messages });
+  });
+  router.post('/messages/:id/unsnooze', async (request, response) => {
+    const messages = await updateTargets(repos, mailService, request.params.id, { snoozedUntil: null });
     response.json({ message: messages[0], messages });
   });
   router.post('/messages/:id/remote-content', (request, response) => {
