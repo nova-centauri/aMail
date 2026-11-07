@@ -69,7 +69,7 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
   labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
-  smart_category_reason, source_imported, created_at, updated_at`;
+  smart_category_reason, source_imported, remote_missing_at, created_at, updated_at`;
 
 /** Inbox list hydrate: no bodies, no attachment blobs. */
 const LIST_ENVELOPE_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_message_id, subject, from_name, from_email,
@@ -142,6 +142,8 @@ function publicMessage(row) {
     analyzedAt: row.analyzed_at || null,
     analyzedBy: row.analyzed_by || null,
     sourceImported: row.source_imported === undefined || row.source_imported === null ? true : Boolean(row.source_imported),
+    // When sync last noticed this message gone from its server mailbox.
+    remoteMissingAt: row.remote_missing_at || null,
     category,
     categoryLabel: categoryLabel(category),
     categoryReason: row.smart_category_reason || 'No automated category signal matched.',
@@ -530,6 +532,13 @@ function initSchema(db) {
   if (!columnsAfterRebuild.has('is_draft')) {
     db.exec('ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0');
   }
+  // Set when a sync no longer finds the message's UID in its mailbox (another
+  // client moved or deleted it). Cleared whenever the server shows it again.
+  if (!columnsAfterRebuild.has('remote_missing_at')) {
+    db.exec('ALTER TABLE messages ADD COLUMN remote_missing_at TEXT');
+  }
+  const syncColumnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(sync_state)').all().map((column) => column.name));
+  if (!syncColumnsAfterRebuild.has('reconciled_at')) db.exec('ALTER TABLE sync_state ADD COLUMN reconciled_at TEXT');
 
   // Sidebar polling must count compact index entries rather than visit message
   // rows carrying bodies and inline attachment data on every refresh.
@@ -1149,7 +1158,8 @@ export function createRepositories(db) {
       is_sent = @is_sent, is_draft = @is_draft, smart_category = @smart_category,
       smart_category_reason = @smart_category_reason, smart_category_rule = @smart_category_rule,
       smart_category_version = @smart_category_version,
-      source_imported = COALESCE(@source_imported, source_imported), updated_at = @updated_at
+      source_imported = COALESCE(@source_imported, source_imported), remote_missing_at = NULL,
+      updated_at = @updated_at
       WHERE id = @id`),
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
     messageDelete: db.prepare('DELETE FROM messages WHERE id = ?'),
@@ -1188,6 +1198,19 @@ export function createRepositories(db) {
         reason = excluded.reason, seen_at = excluded.seen_at`),
     syncSkipClear: db.prepare('DELETE FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
     syncSkipUids: db.prepare('SELECT uid FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
+    syncReconciled: db.prepare('UPDATE sync_state SET reconciled_at = ? WHERE account_id = ? AND mailbox = ?'),
+    presenceRows: db.prepare(`SELECT id, uid, rfc_message_id, remote_missing_at FROM messages
+      WHERE account_id = ? AND mailbox = ? AND uid IS NOT NULL AND is_draft = 0`),
+    markRemoteMissing: db.prepare('UPDATE messages SET remote_missing_at = @at WHERE id = @id AND remote_missing_at IS NULL'),
+    clearRemoteMissing: db.prepare('UPDATE messages SET remote_missing_at = NULL WHERE id = ?'),
+    messagePlacement: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid,
+      is_archived = @is_archived, is_trashed = @is_trashed, is_spam = @is_spam,
+      is_read = @is_read, is_starred = @is_starred,
+      analyzed_at = @analyzed_at, analyzed_by = @analyzed_by,
+      remote_missing_at = NULL, updated_at = @updated_at
+      WHERE id = @id`),
+    messageGoneFromInbox: db.prepare(`UPDATE messages SET is_archived = 1, uid = NULL, updated_at = @updated_at
+      WHERE id = @id AND mailbox = @mailbox AND uid = @uid`),
     maxMessageUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM messages'),
     maxSyncSynced: db.prepare('SELECT MAX(synced_at) AS t FROM sync_state'),
     maxAccountUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM accounts'),
@@ -1706,6 +1729,76 @@ export function createRepositories(db) {
         changes.bump('message', timestamp);
         return publicMessage(queries.messageById.get(id));
       },
+      /** Rows sync can check against the server's UID list for one mailbox. */
+      presence: (accountId, mailbox) => queries.presenceRows.all(accountId, mailbox).map((row) => ({
+        id: row.id,
+        uid: Number(row.uid),
+        messageId: row.rfc_message_id || null,
+        missingSince: row.remote_missing_at || null,
+      })),
+      /** First sighting of a missing UID. Marks only; changes no placement. */
+      markRemoteMissing: db.transaction((ids, at = now()) => {
+        let marked = 0;
+        for (const id of ids) marked += queries.markRemoteMissing.run({ id, at }).changes;
+        if (marked) changes.bump('message');
+        return marked;
+      }),
+      clearRemoteMissing: db.transaction((ids) => {
+        let cleared = 0;
+        for (const id of ids) cleared += queries.clearRemoteMissing.run(id).changes;
+        if (cleared) changes.bump('message');
+        return cleared;
+      }),
+      /**
+       * Another client moved this message: point the row at its new mailbox and
+       * UID and set its folder flags from that mailbox's role. If sync already
+       * imported the destination copy as a second row, that copy gives way and
+       * the original row (and its id, which agents and MCC may hold) is kept,
+       * taking the copy's read and star state and analyzed mark if it has one.
+       */
+      applyRemoteMove: db.transaction((id, { mailbox, uid, role }) => {
+        const row = queries.messageById.get(id);
+        if (!row) return null;
+        const occupant = queries.messageByUid.get(row.account_id, mailbox, uid);
+        const copy = occupant && occupant.id !== id ? occupant : null;
+        if (copy) {
+          queries.messageDelete.run(copy.id);
+          if (copy.thread_id !== row.thread_id && !recomputeThread(copy.thread_id)) queries.threadDelete.run(copy.thread_id);
+        }
+        const timestamp = now();
+        queries.messagePlacement.run({
+          id,
+          mailbox,
+          uid,
+          is_archived: role === 'archive' ? 1 : 0,
+          is_trashed: role === 'trash' ? 1 : 0,
+          is_spam: role === 'spam' ? 1 : 0,
+          is_read: copy ? copy.is_read : row.is_read,
+          is_starred: copy ? copy.is_starred : row.is_starred,
+          analyzed_at: row.analyzed_at || copy?.analyzed_at || null,
+          analyzed_by: row.analyzed_at ? row.analyzed_by : (copy?.analyzed_by || ''),
+          updated_at: timestamp,
+        });
+        finishMessageWrite([row.thread_id], id);
+        changes.bump('message', timestamp);
+        return { message: publicMessage(queries.messageById.get(id)), mergedCopyId: copy?.id || null };
+      }),
+      /**
+       * A message gone from the inbox that sync could not find anywhere else:
+       * deleted for good, or moved to a folder aMail can't search. Keep the
+       * row and show it under Archive; dropping the UID keeps later actions
+       * local instead of aiming at a UID the server no longer has.
+       */
+      goneFromInbox(id, { mailbox, uid }) {
+        const timestamp = now();
+        const changed = queries.messageGoneFromInbox.run({ id, mailbox, uid, updated_at: timestamp }).changes > 0;
+        if (changed) {
+          const row = queries.messageById.get(id);
+          finishMessageWrite([row?.thread_id], id);
+          changes.bump('message', timestamp);
+        }
+        return changed;
+      },
       searchConversations({
         accountIds = [],
         folder = 'inbox',
@@ -1900,6 +1993,7 @@ export function createRepositories(db) {
       },
       clearSkips: (accountId, mailbox) => queries.syncSkipClear.run(accountId, mailbox),
       skippedUids: (accountId, mailbox) => queries.syncSkipUids.all(accountId, mailbox).map((row) => Number(row.uid)),
+      markReconciled: (accountId, mailbox, at = now()) => queries.syncReconciled.run(at, accountId, mailbox).changes > 0,
     },
     changes,
     retention: {

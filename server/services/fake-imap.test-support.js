@@ -137,6 +137,8 @@ export function createFakeImapServer({
 
     async search(query) {
       if (state.failures.search) throw state.failures.search;
+      // A provider glitch: SEARCH ALL answers empty though the mailbox has mail.
+      if (state.lieAboutSearch && query?.all) return [];
       const mailbox = box(this.mailbox.path);
       const matches = (message, part) => {
         if (part?.all) return true;
