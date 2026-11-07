@@ -213,8 +213,9 @@ export function createKeyslotStore({ dataDir, filePath = path.join(dataDir, KEYS
 
   function write(data) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-    const temporary = `${filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(data, null, 2), { mode: 0o600 });
+    // Two containers can both run as pid 1, so the pid alone can collide.
+    const temporary = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(data, null, 2), { mode: 0o600, flag: 'wx' });
     fs.renameSync(temporary, filePath);
     cache = data;
     cachedSignature = signatureOf(fs.statSync(filePath));

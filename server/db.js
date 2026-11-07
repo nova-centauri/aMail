@@ -606,7 +606,31 @@ function initSchema(db) {
       .run(SMART_FILTER_FINGERPRINT_SETTING, JSON.stringify(fingerprint), now());
   }
 
+  wakeLegacySnoozes(db);
   ensureMessagesFts(db);
+}
+
+const SNOOZE_UNARCHIVE_SETTING = 'migration.snooze_unarchive_v1';
+
+/**
+ * Snooze used to also set the local archive flag, so a snoozed message came
+ * back in Archive instead of the inbox when its time passed. Snooze never
+ * moved the server copy, so a snoozed row still in INBOX was archived only by
+ * that bug. Runs once; a message archived on the server lives in another
+ * mailbox and is left alone.
+ */
+function wakeLegacySnoozes(db) {
+  const columns = new Set(db.prepare('PRAGMA table_info(messages)').all().map((column) => column.name));
+  if (!['snoozed_until', 'is_archived', 'mailbox'].every((column) => columns.has(column))) return;
+  const done = db.prepare('SELECT 1 FROM settings WHERE key = ?').get(SNOOZE_UNARCHIVE_SETTING);
+  if (done) return;
+  db.transaction(() => {
+    const { changes } = db.prepare(`UPDATE messages SET is_archived = 0
+      WHERE snoozed_until IS NOT NULL AND is_archived = 1 AND mailbox = 'INBOX'`).run();
+    db.prepare(`INSERT INTO settings (key, value_json, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`)
+      .run(SNOOZE_UNARCHIVE_SETTING, JSON.stringify({ changes }), now());
+  })();
 }
 
 const FTS_BACKFILL_BATCH = 100;
@@ -907,7 +931,7 @@ export function createRepositories(db) {
           WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
-          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
         END
         AND (@category = '' OR m.smart_category = @category)
@@ -986,7 +1010,7 @@ export function createRepositories(db) {
           WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
-          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
         END
         AND (@category = '' OR m.smart_category = @category)
@@ -1005,7 +1029,7 @@ export function createRepositories(db) {
           WHEN 'all' THEN m.is_trashed = 0 AND m.is_spam = 0 AND m.is_draft = 0
           WHEN 'trash' THEN m.is_trashed = 1
           WHEN 'spam' THEN m.is_spam = 1 AND m.is_trashed = 0
-          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
+          WHEN 'archive' THEN m.is_archived = 1 AND m.is_trashed = 0 AND m.is_spam = 0 AND (m.snoozed_until IS NULL OR m.snoozed_until <= @now)
           ELSE m.mailbox = @mailbox AND m.is_trashed = 0 AND m.is_spam = 0
         END
     ), ranked AS (
@@ -1099,7 +1123,7 @@ export function createRepositories(db) {
       is_archived = COALESCE(@is_archived, is_archived),
       is_trashed = COALESCE(@is_trashed, is_trashed),
       is_spam = COALESCE(@is_spam, is_spam),
-      snoozed_until = COALESCE(@snoozed_until, snoozed_until),
+      snoozed_until = CASE WHEN @snoozed_change = 1 THEN @snoozed_until ELSE snoozed_until END,
       analyzed_at = CASE WHEN @analyzed_change = 1 THEN @analyzed_at ELSE analyzed_at END,
       analyzed_by = CASE WHEN @analyzed_change = 1 THEN @analyzed_by ELSE analyzed_by END,
       updated_at = @updated_at
@@ -1108,7 +1132,11 @@ export function createRepositories(db) {
     syncStateUpsert: db.prepare(`INSERT INTO sync_state (account_id, mailbox, last_uid, uid_validity, last_error, synced_at, highest_modseq)
       VALUES (@account_id, @mailbox, @last_uid, @uid_validity, @last_error, @synced_at, @highest_modseq)
       ON CONFLICT(account_id, mailbox) DO UPDATE SET
-        last_uid = excluded.last_uid, uid_validity = excluded.uid_validity,
+        last_uid = CASE
+          WHEN excluded.uid_validity IS NULL OR excluded.uid_validity IS sync_state.uid_validity
+            THEN MAX(excluded.last_uid, sync_state.last_uid)
+          ELSE excluded.last_uid END,
+        uid_validity = COALESCE(excluded.uid_validity, sync_state.uid_validity),
         last_error = excluded.last_error, synced_at = excluded.synced_at,
         highest_modseq = COALESCE(excluded.highest_modseq, highest_modseq)`),
     syncSkipUpsert: db.prepare(`INSERT INTO sync_skips (account_id, mailbox, uid, reason, seen_at)
@@ -1537,7 +1565,9 @@ export function createRepositories(db) {
           is_archived: state.isArchived === undefined ? null : Number(Boolean(state.isArchived)),
           is_trashed: state.isTrashed === undefined ? null : Number(Boolean(state.isTrashed)),
           is_spam: state.isSpam === undefined ? null : Number(Boolean(state.isSpam)),
-          snoozed_until: state.snoozedUntil === undefined ? null : state.snoozedUntil,
+          // null clears a snooze; undefined leaves it alone.
+          snoozed_change: state.snoozedUntil === undefined ? 0 : 1,
+          snoozed_until: state.snoozedUntil ?? null,
           analyzed_change: state.isAnalyzed === undefined ? 0 : 1,
           analyzed_at: state.isAnalyzed ? (state.analyzedAt || now()) : null,
           analyzed_by: state.isAnalyzed ? String(state.analyzedBy || '').slice(0, 120) : '',
@@ -1706,7 +1736,7 @@ export function createRepositories(db) {
                   WHEN 'all' THEN is_trashed = 0 AND is_spam = 0 AND COALESCE(is_draft, 0) = 0
                   WHEN 'trash' THEN is_trashed = 1
                   WHEN 'spam' THEN is_spam = 1 AND is_trashed = 0
-                  WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+                  WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND is_spam = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
                   ELSE mailbox = ? AND is_trashed = 0 AND is_spam = 0
                 END`;
         const sql = `SELECT ${LIST_ENVELOPE_COLUMNS}, flags.has_attachment
@@ -1747,7 +1777,7 @@ export function createRepositories(db) {
             WHEN 'all' THEN is_trashed = 0 AND is_spam = 0 AND is_draft = 0
             WHEN 'trash' THEN is_trashed = 1
             WHEN 'spam' THEN is_spam = 1 AND is_trashed = 0
-            WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
+            WHEN 'archive' THEN is_archived = 1 AND is_trashed = 0 AND is_spam = 0 AND (snoozed_until IS NULL OR snoozed_until <= ?)
             ELSE mailbox = ? AND is_trashed = 0 AND is_spam = 0
           END` : ''}
           ORDER BY COALESCE(sent_at, received_at, created_at) ASC`;

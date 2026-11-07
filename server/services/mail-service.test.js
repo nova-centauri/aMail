@@ -197,6 +197,7 @@ function syncHarness({
   imapPoolIdleMs, syncMinIntervalMs, connectFailure = false, fetchHangs = false, syncPassBudgetMs, syncAccountTimeoutMs,
   threadsBySubject = new Map(), folders = null, messagesByMailbox = null,
   extraAccounts = [], hangHosts = null, scheduleTimeout, syncMailboxTimeoutMs, syncMaxMessagesPerAccount,
+  highestModseq = undefined, knownRows = [],
 }) {
   const account = {
     id: 'sync-account',
@@ -263,7 +264,7 @@ function syncHarness({
       this.lockedMailbox = path;
       const pool = messagesByMailbox ? (messagesByMailbox[path] || []) : state.messages;
       const maxUid = pool.reduce((max, message) => Math.max(max, Number(message.uid) || 0), 0);
-      this.mailbox = { uidValidity, uidNext: maxUid + 1 };
+      this.mailbox = { uidValidity, uidNext: maxUid + 1, highestModseq };
       state.onLock?.(this, path);
       return { release() {} };
     }
@@ -271,7 +272,7 @@ function syncHarness({
       this.assertIdle('STATUS');
       const pool = messagesByMailbox ? (messagesByMailbox[path] || []) : state.messages;
       const maxUid = (pool || []).reduce((max, message) => Math.max(max, Number(message.uid) || 0), 0);
-      return { uidNext: maxUid + 1, uidValidity, highestModseq: undefined };
+      return { uidNext: maxUid + 1, uidValidity, highestModseq };
     }
     async *fetch(range, query, options) {
       this.assertIdle('FETCH');
@@ -283,7 +284,11 @@ function syncHarness({
       const pool = messagesByMailbox
         ? (messagesByMailbox[this.lockedMailbox] || [])
         : state.messages;
-      const matches = pool.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end));
+      let matches = pool.filter((message) => wanted.some(([start, end]) => message.uid >= start && message.uid <= end)
+        || String(range) === '1:*');
+      if (options?.changedSince != null) {
+        matches = matches.filter((message) => BigInt(message.modseq || 0) > BigInt(options.changedSince));
+      }
       const shouldHang = hangHosts ? hangHosts.has(this.host) : fetchHangs;
       if (shouldHang) {
         this.fetching = true;
@@ -311,6 +316,7 @@ function syncHarness({
           const row = { uid: message.uid };
           if (query.size && message.size !== undefined) row.size = message.size;
           if (query.envelope) Object.assign(row, message);
+          if (query.flags) row.flags = new Set(message.flags || []);
           if (query.source) {
             const source = sources.get(message.uid);
             if (source !== undefined) row.source = source.subarray(0, query.source.maxLength);
@@ -354,9 +360,10 @@ function syncHarness({
     },
     messages: {
       findByRfcId: () => null,
-      findByUid: (accountId, mailbox, uid) => state.savedMessages.find((row) => (
+      findByUid: (accountId, mailbox, uid) => [...knownRows, ...state.savedMessages].find((row) => (
         row.account_id === accountId && row.mailbox === mailbox && row.uid === uid
       )) || null,
+      setState(id, value) { (state.flagUpdates ||= []).push({ id, ...value }); return { id }; },
       upsert(value) {
         if (rejectUpsert(value)) throw new Error('UNIQUE constraint failed: messages.account_id, mailbox, uid');
         state.savedMessages.push(value);
@@ -496,6 +503,44 @@ function plainSource(uid) {
     `Body ${uid}`,
   ].join('\r\n'));
 }
+
+test('a pass that imports new mail still applies read and star changes made elsewhere', async () => {
+  const { messages, sources } = mailboxOf([1, 2, 3]);
+  messages[0].modseq = 120;
+  messages[0].flags = ['\\Seen', '\\Flagged'];
+  messages[2].modseq = 130;
+  const { service, state } = syncHarness({
+    messages,
+    sources,
+    maxMessageBytes: 4096,
+    highestModseq: '130',
+    previousSync: { last_uid: 2, uid_validity: 41, highest_modseq: '100' },
+    knownRows: [{ id: 'known-1', account_id: 'sync-account', mailbox: 'INBOX', uid: 1 }],
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.imported, 1);
+  assert.deepEqual(state.flagUpdates, [{ id: 'known-1', isRead: true, isStarred: true }]);
+  assert.equal(state.savedSync.highest_modseq, '130');
+  assert.ok(state.fetchCalls.some((call) => call.options?.changedSince === '100'));
+  await service.close();
+});
+
+test('a pass with no stored modseq does not ask for flag changes', async () => {
+  const { service, state } = syncHarness({
+    ...mailboxOf([1, 2]),
+    maxMessageBytes: 4096,
+    highestModseq: '50',
+    previousSync: { last_uid: 1, uid_validity: 41 },
+  });
+
+  await service.syncAccount('sync-account');
+
+  assert.equal(state.fetchCalls.some((call) => call.options?.changedSince != null), false);
+  assert.equal(state.flagUpdates, undefined);
+  await service.close();
+});
 
 function mailboxOf(uids) {
   const sources = new Map(uids.map((uid) => [uid, plainSource(uid)]));
@@ -2155,5 +2200,116 @@ test('periodic Drafts sync does not scan below a caught-up high-water mark', asy
   assert.equal(state.savedMessages[0].is_draft, 1);
   assert.equal(state.savedMessages[0].mailbox, '[Gmail]/Drafts');
   assert.equal(state.savedMessages[0].subject, 'Open quote');
+  await service.close();
+});
+
+function placementHarness({ folders, message }) {
+  const account = {
+    id: 'placement-account',
+    email: 'place@example.test',
+    provider: 'custom',
+    imap_host: 'mail.example.test',
+    imap_port: 993,
+    imap_secure: 1,
+    credential_ciphertext: encryptJson({ username: 'place@example.test', password: 'test-password' }, config.credentialKey),
+  };
+  const state = { moves: [], copies: [], row: { id: 'm1', accountId: account.id, uid: 7, ...message } };
+  class FakeImapClient extends EventEmitter {
+    async connect() {}
+    async list() { return folders; }
+    async mailboxOpen() {}
+    async getMailboxLock() { return { release() {} }; }
+    async messageFlagsAdd() { return true; }
+    async messageFlagsRemove() { return true; }
+    async messageMove(uid, destination) { state.moves.push({ from: state.row.mailbox, uid, destination }); return { uidMap: new Map([[uid, 70]]) }; }
+    async messageCopy(uid, destination) { state.copies.push({ from: state.row.mailbox, uid, destination }); return { uidMap: new Map([[uid, 71]]) }; }
+    async logout() { this.closed = true; }
+    close() { void this.logout(); }
+  }
+  const service = createMailService({
+    config: { ...config, imapPoolIdleMs: 60_000 },
+    repos: {
+      accounts: { getRaw: (id) => (id === account.id ? account : null) },
+      messages: {
+        get: () => state.row,
+        setState: (id, value) => {
+          state.row = { ...state.row, ...Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) };
+          return state.row;
+        },
+        relocate: (id, { mailbox, uid }) => { state.row = { ...state.row, mailbox, uid }; return state.row; },
+      },
+    },
+    logger: { info() {}, warn() {} },
+    ImapClient: FakeImapClient,
+  });
+  return { service, state };
+}
+
+const gmailFolders = [
+  { path: 'INBOX', specialUse: '\\Inbox' },
+  { path: '[Gmail]/All Mail', specialUse: '\\All' },
+  { path: '[Gmail]/Trash', specialUse: '\\Trash' },
+  { path: '[Gmail]/Spam', specialUse: '\\Junk' },
+];
+
+test('undoing an archive moves the message back to the inbox on the server', async () => {
+  const { service, state } = placementHarness({
+    folders: [{ path: 'INBOX', specialUse: '\\Inbox' }, { path: 'Archive', specialUse: '\\Archive' }],
+    message: { mailbox: 'INBOX' },
+  });
+
+  const archived = await service.updateMessageState('m1', { isArchived: true });
+  assert.equal(archived.remoteSync.status, 'moved');
+  const restored = await service.updateMessageState('m1', { isArchived: false });
+
+  assert.equal(restored.remoteSync.status, 'moved');
+  assert.deepEqual(state.moves, [
+    { from: 'INBOX', uid: 7, destination: 'Archive' },
+    { from: 'Archive', uid: 70, destination: 'INBOX' },
+  ]);
+  assert.equal(state.row.mailbox, 'INBOX');
+  await service.close();
+});
+
+test('restoring a Gmail message from All Mail copies it to the inbox instead of moving it', async () => {
+  const { service, state } = placementHarness({ folders: gmailFolders, message: { mailbox: '[Gmail]/All Mail', isArchived: true } });
+
+  const restored = await service.updateMessageState('m1', { isArchived: false });
+
+  assert.equal(restored.remoteSync.status, 'moved');
+  assert.deepEqual(state.moves, []);
+  assert.deepEqual(state.copies, [{ from: '[Gmail]/All Mail', uid: 7, destination: 'INBOX' }]);
+  await service.close();
+});
+
+test('restoring from trash puts an archived message back in the archive, not the inbox', async () => {
+  const { service, state } = placementHarness({
+    folders: gmailFolders,
+    message: { mailbox: '[Gmail]/Trash', isTrashed: true, isArchived: true },
+  });
+
+  await service.updateMessageState('m1', { isTrashed: false });
+
+  assert.deepEqual(state.moves, [{ from: '[Gmail]/Trash', uid: 7, destination: '[Gmail]/All Mail' }]);
+  await service.close();
+});
+
+test('not spam moves the message out of the spam folder to the inbox', async () => {
+  const { service, state } = placementHarness({ folders: gmailFolders, message: { mailbox: '[Gmail]/Spam', isSpam: true } });
+
+  await service.updateMessageState('m1', { isSpam: false, isArchived: false });
+
+  assert.deepEqual(state.moves, [{ from: '[Gmail]/Spam', uid: 7, destination: 'INBOX' }]);
+  await service.close();
+});
+
+test('a read change alone never moves the message', async () => {
+  const { service, state } = placementHarness({ folders: gmailFolders, message: { mailbox: '[Gmail]/All Mail', isArchived: true } });
+
+  const result = await service.updateMessageState('m1', { isRead: true });
+
+  assert.equal(result.remoteSync.action, 'flags');
+  assert.deepEqual(state.moves, []);
+  assert.deepEqual(state.copies, []);
   await service.close();
 });

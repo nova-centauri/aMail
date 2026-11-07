@@ -499,3 +499,37 @@ test('a draft renumbered below the cursor is followed when CONDSTORE shows a cha
   assert.equal(repos.messages.get(saved.draft.id).uid, moved);
   assert.equal(repos.messages.listDrafts(account.id).length, 1);
 });
+
+test('two saves of one draft at once leave one copy on the server', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const first = await service.saveDraft({ accountId: account.id, subject: 'Race', textBody: 'v1' });
+
+  const [a, b] = await Promise.all([
+    service.saveDraft({ textBody: 'v2' }, first.draft.id),
+    service.saveDraft({ textBody: 'v3' }, first.draft.id),
+  ]);
+
+  assert.equal(a.draft.id, first.draft.id);
+  assert.equal(b.draft.id, first.draft.id);
+  const live = server.messages('Drafts');
+  assert.equal(live.length, 1, 'the second save replaced the first save\'s copy');
+  assert.match(live[0].raw, /v3/);
+  assert.equal(repos.messages.listDrafts(account.id).length, 1);
+});
+
+test('a draft saved while a Drafts sync runs keeps its id and is not duplicated', async (t) => {
+  const { repos, service, server, account } = harness(t);
+  const first = await service.saveDraft({ accountId: account.id, subject: 'During sync', textBody: 'v1' });
+
+  const [, saved] = await Promise.all([
+    service.syncAccount(account.id, { mailbox: 'Drafts', force: true }),
+    service.saveDraft({ textBody: 'v2' }, first.draft.id),
+  ]);
+  await service.syncAccount(account.id, { mailbox: 'Drafts', force: true });
+
+  assert.equal(saved.draft.id, first.draft.id);
+  assert.equal(server.messages('Drafts').length, 1);
+  const drafts = repos.messages.listDrafts(account.id);
+  assert.equal(drafts.length, 1);
+  assert.equal(drafts[0].id, first.draft.id);
+});

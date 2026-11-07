@@ -57,7 +57,7 @@ import {
 } from '../mail/imap-search.js';
 import { emptyRuntimeStatus } from './runtime-health.js';
 import { createPhaseTimer, debugTimingEnabled } from './debug-timing.js';
-import { planMailboxSync, uidPages } from './mailbox-sync-plan.js';
+import { compareModseq, planMailboxSync, uidPages } from './mailbox-sync-plan.js';
 import { createSyncIngest } from './sync-ingest.js';
 import { createSyncJobBoard, mcpEnqueueStatus, publicSyncJob } from './sync-jobs.js';
 
@@ -80,6 +80,9 @@ export const SYNC_SCAN_YIELD_EVERY = 32;
 const SYNC_SOURCE_CHUNK = 25;
 // Unknown live UIDs a Drafts reconcile looks at; Drafts folders are small.
 const DRAFT_RECONCILE_MAX_UNKNOWN = 500;
+// A draft save waits this long for a Drafts sync (or another save) on the
+// same account before going ahead anyway, so a stuck sync can't block saving.
+const DRAFT_LOCK_WAIT_MS = 30_000;
 
 export function yieldEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -384,20 +387,40 @@ const MOVE_SPECIAL_USE = {
   archive: ['\\Archive', '\\All'],
   trash: ['\\Trash'],
   spam: ['\\Junk'],
+  sent: ['\\Sent'],
+  drafts: ['\\Drafts'],
 };
 
-function remoteMoveAction(state) {
-  // Trash and Junk take precedence because the spam endpoint also marks the
-  // message archived locally for list filtering.
-  if (state.isTrashed === true) return 'trash';
-  if (state.isSpam === true) return 'spam';
-  if (state.isArchived === true) return 'archive';
-  return null;
+const PLACEMENT_KEYS = ['isArchived', 'isTrashed', 'isSpam'];
+
+/**
+ * Where the server copy should live after a placement change. The server
+ * follows the message's resulting local placement, so undoing an archive,
+ * trash or spam (a `false` value) moves the message back instead of only
+ * clearing a local flag. Trash and Junk win over Archive because older spam
+ * actions also set the archive flag.
+ */
+export function remotePlacement(state, message) {
+  if (!PLACEMENT_KEYS.some((key) => state[key] !== undefined)) return null;
+  if (message?.isTrashed) return 'trash';
+  if (message?.isSpam) return 'spam';
+  if (message?.isArchived) return 'archive';
+  if (message?.isDraft) return 'drafts';
+  if (message?.isSent) return 'sent';
+  return 'inbox';
 }
 
-function specialUseDestination(folders, action) {
+export function specialUseDestination(folders, action) {
+  // RFC 3501 makes INBOX mandatory, so restoring never depends on SPECIAL-USE.
+  if (action === 'inbox') {
+    return folders.find((folder) => String(folder.specialUse || '') === '\\Inbox')?.path || 'INBOX';
+  }
   const choices = MOVE_SPECIAL_USE[action] || [];
   return folders.find((folder) => choices.includes(String(folder.specialUse || '')))?.path || null;
+}
+
+function isAllMailFolder(folders, path) {
+  return folders.some((folder) => folder.path === path && String(folder.specialUse || '') === '\\All');
 }
 
 function mappedUid(moveResult, sourceUid) {
@@ -598,6 +621,31 @@ export function createMailService({
   const attachmentCache = new Map();
   const attachmentFetches = new Map();
   const imapPool = new Map();
+  // Draft saves and Drafts-mailbox syncs on one account take turns. Without
+  // this a sync can delete a draft row mid-save, or import the new copy as a
+  // second draft, and two saves of one draft both APPEND and leave a duplicate.
+  const draftLocks = new Map();
+  async function withDraftLock(accountId, fn) {
+    const previous = draftLocks.get(accountId) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    const tail = previous.then(() => current);
+    draftLocks.set(accountId, tail);
+    let timer;
+    const waited = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), DRAFT_LOCK_WAIT_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([previous.then(() => 'ready'), waited]);
+    clearTimeout(timer);
+    if (outcome === 'timeout') logger.warn({ accountId }, 'Draft lock wait timed out; continuing');
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (draftLocks.get(accountId) === tail) draftLocks.delete(accountId);
+    }
+  }
   const accountGenerations = new Map();
   let searchGeneration = 0;
   let activeSearchAbort = null;
@@ -1443,6 +1491,15 @@ export function createMailService({
         };
       }
 
+      // A pass that imports new UIDs also moves HIGHESTMODSEQ forward. Read
+      // and star changes made elsewhere since the last pass would be lost if
+      // the new modseq were saved without first applying them.
+      const previousModseq = previousSync?.highest_modseq ?? null;
+      if (!plan.resetCursor && previousModseq != null && highestModseq != null
+        && compareModseq(highestModseq, previousModseq) > 0) {
+        await applyFlagChanges(previousModseq);
+      }
+
       const scanDrafts = Boolean(plan.scanDrafts);
       const latestUid = Math.max(0, uidNext - 1);
       const pages = uidPages(plan.firstUid, plan.endUid, limit);
@@ -1546,7 +1603,9 @@ export function createMailService({
     const accountId = args?.account?.id;
     return withImapDeadline(
       mailboxTimeoutMs,
-      Promise.resolve().then(() => syncMailbox(args)),
+      Promise.resolve().then(() => (args?.descriptor?.role === 'drafts'
+        ? withDraftLock(accountId, () => syncMailbox(args))
+        : syncMailbox(args))),
       () => {
         abortPooledImap(accountId, args.generation);
         logger.warn(
@@ -2593,6 +2652,14 @@ export function createMailService({
    * draft; the latter is moved to the server and its local copy removed.
    */
   async function saveDraft(input = {}, draftId = null) {
+    // Plan once to learn the account; plan again inside the lock so a save
+    // that waited sees the UID the previous save left behind.
+    const firstPlan = prepareDraft(repos, input, draftId);
+    assertImapWritesAllowed(firstPlan.accountId);
+    return withDraftLock(firstPlan.accountId, () => saveDraftLocked(input, draftId));
+  }
+
+  async function saveDraftLocked(input, draftId) {
     const plan = prepareDraft(repos, input, draftId);
     assertImapWritesAllowed(plan.accountId);
     const { account, credentials } = accountAndCredentials(plan.accountId);
@@ -2663,11 +2730,14 @@ export function createMailService({
       is_draft: 1,
       source_imported: 1,
     };
-    let saved;
+    let saved = null;
     if (plan.server) {
       const thread = plan.threadId ? repos.threads.get(plan.threadId) : null;
       saved = repos.messages.replace(plan.server.id, { ...row, thread_id: thread?.id || plan.server.threadId });
-    } else {
+    }
+    // The row can be gone if a Drafts sync removed it while this save ran;
+    // the server already holds the new copy, so store it as a fresh row.
+    if (!saved) {
       const thread = resolveThread({
         accountId: account.id,
         subject: plan.subject,
@@ -2926,11 +2996,13 @@ export function createMailService({
     const entry = await acquirePooledClient(account, credentials);
     const client = entry.client;
     let lock;
-    const action = remoteMoveAction(state);
+    const action = remotePlacement(state, message);
     try {
       let destination = null;
+      let folders = [];
       if (action) {
-        destination = specialUseDestination(await pooledList(entry), action);
+        folders = await pooledList(entry);
+        destination = specialUseDestination(folders, action);
         if (!destination) {
           return {
             message,
@@ -2956,9 +3028,14 @@ export function createMailService({
       if (!action) {
         return { message, remoteSync: { attempted: true, status: 'synced', action: 'flags' } };
       }
-      // ImapFlow uses MOVE when available and safely falls back to COPY +
-      // EXPUNGE for servers lacking RFC 6851 support.
-      const moveResult = await client.messageMove(message.uid, destination, { uid: true });
+      // A message can't leave an "All Mail" folder (Gmail): it is a view of
+      // every message. Restoring it to the inbox is a COPY, which on Gmail
+      // adds the Inbox label. Everything else is a MOVE; ImapFlow uses MOVE when
+      // available and safely falls back to COPY + EXPUNGE.
+      const copyOnly = action === 'inbox' && isAllMailFolder(folders, message.mailbox);
+      const moveResult = copyOnly
+        ? await client.messageCopy(message.uid, destination, { uid: true })
+        : await client.messageMove(message.uid, destination, { uid: true });
       if (!moveResult) throw new Error(`IMAP ${action} move was rejected`);
 
       let movedMessage = message;

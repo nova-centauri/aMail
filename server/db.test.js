@@ -585,3 +585,81 @@ test('envelope-only IMAP hits stay out of the review queue until source is impor
   assert.equal(overwritten.sourceImported, true);
   assert.equal(overwritten.textBody, 'old body');
 });
+
+function placementFixture(t) {
+  const config = tempConfig(t);
+  const db = createDatabase(config);
+  const repos = createRepositories(db);
+  t.after(() => repos.close());
+  const account = seedAccount(repos);
+  const thread = repos.threads.create({
+    account_id: account.id,
+    subject: 'Placement',
+    normalized_subject: 'placement',
+    latest_at: '2026-01-01T00:00:00.000Z',
+  });
+  return { config, db, repos, account, thread };
+}
+
+test('spam stays out of Archive even when the message was archived first', (t) => {
+  const { repos, account, thread } = placementFixture(t);
+  const message = repos.messages.upsert(messageFields(account.id, thread.id, { is_archived: 1, is_spam: 1 }));
+
+  const archive = repos.messages.list({ accountId: account.id, folder: 'archive' });
+  const spam = repos.messages.list({ accountId: account.id, folder: 'spam' });
+
+  assert.equal(archive.items.some((item) => item.id === message.id), false);
+  assert.equal(spam.items.some((item) => item.id === message.id), true);
+});
+
+test('snooze can be cleared and a cleared snooze lands back in the inbox', (t) => {
+  const { repos, account, thread } = placementFixture(t);
+  const message = repos.messages.upsert(messageFields(account.id, thread.id));
+  const later = new Date(Date.now() + 86_400_000).toISOString();
+
+  repos.messages.setState(message.id, { snoozedUntil: later });
+  assert.equal(repos.messages.get(message.id).snoozedUntil, later);
+  repos.messages.setState(message.id, { isRead: true });
+  assert.equal(repos.messages.get(message.id).snoozedUntil, later, 'an unrelated change keeps the snooze');
+  repos.messages.setState(message.id, { snoozedUntil: null });
+
+  assert.equal(repos.messages.get(message.id).snoozedUntil, null);
+  const inbox = repos.messages.list({ accountId: account.id, folder: 'inbox' });
+  assert.equal(inbox.items.some((item) => item.id === message.id), true);
+});
+
+test('messages archived by the old snooze come back to the inbox once on upgrade', (t) => {
+  const { config, db, repos, account, thread } = placementFixture(t);
+  const legacy = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 1, rfc_message_id: '<legacy@example.test>', is_archived: 1, snoozed_until: '2026-01-02T00:00:00.000Z',
+  }));
+  const archived = repos.messages.upsert(messageFields(account.id, thread.id, {
+    uid: 2, rfc_message_id: '<archived@example.test>', mailbox: 'Archive', is_archived: 1, snoozed_until: '2026-01-02T00:00:00.000Z',
+  }));
+  db.prepare("DELETE FROM settings WHERE key = 'migration.snooze_unarchive_v1'").run();
+  repos.close();
+
+  const reopened = createRepositories(createDatabase(config));
+  t.after(() => reopened.close());
+  assert.equal(reopened.messages.get(legacy.id).isArchived, false);
+  assert.equal(reopened.messages.get(archived.id).isArchived, true);
+
+  // It runs once: a later archive of a snoozed inbox row is left alone.
+  reopened.messages.setState(legacy.id, { isArchived: true });
+  reopened.close();
+  const third = createRepositories(createDatabase(config));
+  t.after(() => third.close());
+  assert.equal(third.messages.get(legacy.id).isArchived, true);
+});
+
+test('a slower sync can not move the mailbox cursor backwards', (t) => {
+  const { repos, account } = placementFixture(t);
+  const base = { account_id: account.id, mailbox: 'INBOX', uid_validity: 41, last_error: null, synced_at: new Date().toISOString() };
+
+  repos.sync.save({ ...base, last_uid: 500 });
+  repos.sync.save({ ...base, last_uid: 300 });
+  assert.equal(repos.sync.get(account.id, 'INBOX').last_uid, 500);
+
+  repos.sync.save({ ...base, last_uid: 10, uid_validity: 42 });
+  assert.equal(repos.sync.get(account.id, 'INBOX').last_uid, 10, 'a new UIDVALIDITY resets it');
+});

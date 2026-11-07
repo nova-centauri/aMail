@@ -47,18 +47,24 @@ export function createSearchRead({ config = {}, logger } = {}) {
       logger?.warn?.({ err: String(error?.message || error) }, 'Search read worker could not start');
       return;
     }
-    worker.on('message', (msg) => {
+    // A worker that was terminated for a timeout still fires error/exit
+    // later. Only the current worker may fail requests or clear the slot,
+    // or the replacement's in-flight searches are rejected too.
+    const current = worker;
+    current.on('message', (msg) => {
       const waiter = pending.get(msg?.id);
       if (!waiter) return;
       pending.delete(msg.id);
       waiter.resolve(msg);
     });
-    worker.on('error', (error) => {
+    current.on('error', (error) => {
       logger?.warn?.({ err: String(error?.message || error) }, 'Search read worker failed');
+      if (worker !== current) return;
       failAll(error);
       worker = null;
     });
-    worker.on('exit', () => {
+    current.on('exit', () => {
+      if (worker !== current) return;
       if (pending.size) failAll(new Error('Search read worker exited'));
       worker = null;
     });

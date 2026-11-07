@@ -12,6 +12,7 @@ import { configuredOpsSources } from '../services/smart-filter.js';
 import { publicAttachmentMeta } from '../services/compose-attachments.js';
 import { AppError, ConflictError, NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { logMcpToolCall } from '../services/messages-query-log.js';
+import { threadActionTargets } from '../services/thread-targets.js';
 
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
@@ -96,7 +97,7 @@ async function updateTargets(repos, mailService, id, state) {
   if (message) return [await mailService.updateMessageState(message.id, state)];
   const thread = repos.threads.get(id);
   if (!thread) throw new NotFoundError('Message or thread not found.');
-  const stored = repos.messages.forThread(thread.id).slice(0, MCP_MAX_THREAD_ACTIONS);
+  const stored = threadActionTargets(repos.messages.forThread(thread.id), state).slice(0, MCP_MAX_THREAD_ACTIONS);
   return mapYielding(stored, (item) => mailService.updateMessageState(item.id, state));
 }
 
@@ -485,12 +486,12 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
 
   server.registerTool('message_action', {
     title: 'Message action',
-    description: 'Apply read/unread/star/unstar/archive/unarchive/trash/untrash/spam/unspam/snooze/analyzed/unanalyzed to a message or thread id. Use `analyzed` after processing a message so `is:unanalyzed` searches skip it next time.',
+    description: 'Apply read/unread/star/unstar/archive/unarchive/trash/untrash/spam/unspam/snooze/unsnooze/analyzed/unanalyzed to a message or thread id. Use `analyzed` after processing a message so `is:unanalyzed` searches skip it next time.',
     inputSchema: {
       id: z.string().describe('Message id or thread id'),
       action: z.enum([
         'read', 'unread', 'star', 'unstar', 'archive', 'unarchive',
-        'trash', 'untrash', 'spam', 'unspam', 'snooze', 'analyzed', 'unanalyzed',
+        'trash', 'untrash', 'spam', 'unspam', 'snooze', 'unsnooze', 'analyzed', 'unanalyzed',
       ]),
       until: z.string().optional().describe('ISO timestamp for snooze (must be in the future)'),
       by: z.string().optional().describe('Agent or person name recorded with the analyzed flag'),
@@ -529,19 +530,24 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
         state = { isTrashed: false };
         break;
       case 'spam':
-        state = { isSpam: true, isArchived: true };
+        state = { isSpam: true };
         break;
       case 'unspam':
-        state = { isSpam: false };
+        // Older spam actions also set the archive flag; clear it so the
+        // message returns to the inbox.
+        state = { isSpam: false, isArchived: false };
         break;
       case 'snooze': {
         const snoozeUntil = until ? new Date(until) : new Date(Date.now() + 24 * 60 * 60 * 1000);
         if (Number.isNaN(snoozeUntil.valueOf()) || snoozeUntil <= new Date()) {
           throw new ValidationError('Snooze time must be in the future.');
         }
-        state = { snoozedUntil: snoozeUntil.toISOString(), isArchived: true };
+        state = { snoozedUntil: snoozeUntil.toISOString() };
         break;
       }
+      case 'unsnooze':
+        state = { snoozedUntil: null };
+        break;
       default:
         throw new ValidationError(`Unknown action: ${action}`);
     }

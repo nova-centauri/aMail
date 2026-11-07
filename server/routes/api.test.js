@@ -1391,3 +1391,74 @@ test('GET /api/events is Bearer-gated SSE and pushes mailbox events', async (t) 
   }
 });
 
+
+test('thread placement actions skip your own sent copies and send the right state', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-api-placement-'));
+  const config = {
+    dataDir,
+    dbPath: path.join(dataDir, 'mail.sqlite'),
+    credentialKey: Buffer.alloc(32, 4),
+    accessToken: null,
+    syncBatchSize: 50,
+    remoteContentProxyUrl: null,
+    allowDirectRemoteContent: false,
+  };
+  const repos = createRepositories(createDatabase(config));
+  const calls = [];
+  const mailService = {
+    async updateMessageState(id, state) {
+      calls.push({ id, state });
+      const updated = repos.messages.setState(id, state);
+      return { ...updated, remoteSync: { attempted: false, status: 'local-only', reason: 'test-double' } };
+    },
+  };
+  const app = express();
+  app.use(express.json());
+  registerApi(app, { config, repos, mailService, remoteContent: { canIssueTokens: false } });
+  app.use(errorHandler({ error() {} }));
+  const server = app.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    repos.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', avatar_blob: null, avatar_mime: null, color: '#1a73e8',
+    provider: 'custom', imap_host: 'imap.example.test', imap_port: 993, imap_secure: 1,
+    smtp_host: 'smtp.example.test', smtp_port: 465, smtp_secure: 1, credential_ciphertext: 'x', signature: '', sync_enabled: 1,
+  });
+  const timestamp = '2026-01-01T00:00:00.000Z';
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Lunch', normalized_subject: 'lunch', latest_at: timestamp });
+  const received = repos.messages.upsert(messageInput({ accountId: account.id, threadId: thread.id, uid: 1, subject: 'Lunch', fromEmail: 'friend@example.test', timestamp }));
+  const sent = repos.messages.upsert({
+    ...messageInput({ accountId: account.id, threadId: thread.id, uid: 2, subject: 'Re: Lunch', fromEmail: 'owner@example.test', timestamp }),
+    mailbox: 'Sent', is_sent: 1,
+  });
+  const post = (action, body = {}) => fetch(`${origin}/api/messages/${thread.id}/${action}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  assert.equal((await post('archive')).status, 200);
+  assert.deepEqual(calls.map((call) => call.id), [received.id], 'archive leaves your Sent copy alone');
+
+  calls.length = 0;
+  const until = new Date(Date.now() + 3_600_000).toISOString();
+  assert.equal((await post('snooze', { until })).status, 200);
+  assert.deepEqual(calls, [{ id: received.id, state: { snoozedUntil: until } }]);
+
+  calls.length = 0;
+  assert.equal((await post('unsnooze')).status, 200);
+  assert.deepEqual(calls, [{ id: received.id, state: { snoozedUntil: null } }]);
+  assert.equal(repos.messages.get(received.id).snoozedUntil, null);
+
+  calls.length = 0;
+  assert.equal((await post('spam')).status, 200);
+  assert.deepEqual(calls.map((call) => call.state), [{ isSpam: true }, { isSpam: true }], 'spam applies to the whole thread');
+
+  calls.length = 0;
+  assert.equal((await post('spam', { spam: false })).status, 200);
+  assert.deepEqual(calls[0].state, { isSpam: false, isArchived: false });
+  assert.equal(repos.messages.get(sent.id).isSent, true);
+});

@@ -291,3 +291,47 @@ test('message writes notify the search indexer after the database transaction', 
   repos.accounts.remove(account.id);
   assert.equal(events.at(-1).accountRemoved, account.id);
 });
+
+test('a failed Typesense update is kept and sent with the next flush', async (t) => {
+  let importFails = true;
+  const asked = [];
+  const fetchImpl = async (url, options = {}) => {
+    const ok = (body = '{}') => new Response(body, { status: 200 });
+    if (!options.method || options.method === 'GET') return ok();
+    if (String(url).includes('/documents/import')) {
+      if (importFails) return new Response('down', { status: 503 });
+      return ok(String(options.body).split('\n').filter(Boolean).map(() => '{"success":true}').join('\n'));
+    }
+    return ok();
+  };
+  const row = (id) => ({
+    id, account_id: 'acct', thread_id: `thread-${id}`, mailbox: 'INBOX',
+    subject: 'Hello', from_name: '', from_email: 'a@b.test', to_json: '[]', cc_json: '[]', bcc_json: '[]',
+    sent_at: '2026-01-01T00:00:00.000Z', text_body: '', snippet: 'Hello', attachments_json: '[]',
+    is_read: 1, is_starred: 0, is_archived: 0, is_trashed: 0, is_spam: 0, is_sent: 0,
+    analyzed_at: null, smart_category: 'primary', source_imported: 1,
+  });
+  const engine = createSearchEngine({
+    config: { searchEngine: 'typesense', typesenseUrl: 'http://typesense.test', typesenseApiKey: 'k', encryptDatabase: false, keyMode: 'env' },
+    repos: {
+      messages: {
+        searchThreadPage() { return []; },
+        searchThreadIdsForMessages(ids) { asked.push([...ids]); return ids; },
+        searchRowsForThreads(ids) { return ids.map(row); },
+      },
+    },
+    logger,
+    fetchImpl,
+  });
+  t.after(() => engine.stop());
+  engine.start();
+  await engine.whenIdle();
+
+  engine.noteWrite({ messageIds: ['m1'] });
+  await engine.whenIdle();
+  importFails = false;
+  engine.noteWrite({ messageIds: ['m2'] });
+  await engine.whenIdle();
+
+  assert.deepEqual(asked.at(-1).sort(), ['m1', 'm2']);
+});
