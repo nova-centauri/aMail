@@ -526,11 +526,30 @@ export function createSearchEngine({ config, repos, logger = null, fetchImpl = g
     pendingIds.clear();
     removedAccounts.clear();
     if (!ids.length && !accounts.length) return;
-    await ensureCollection();
-    for (const accountId of accounts) await deleteByFilter(`account_id:=${filterToken(accountId)}`);
-    if (!ids.length) return;
-    const threadIds = repos.messages.searchThreadIdsForMessages(ids);
-    await importRows(repos.messages.searchRowsForThreads(threadIds));
+    try {
+      await ensureCollection();
+      for (const accountId of accounts) await deleteByFilter(`account_id:=${filterToken(accountId)}`);
+      if (!ids.length) return;
+      const threadIds = repos.messages.searchThreadIdsForMessages(ids);
+      await importRows(repos.messages.searchRowsForThreads(threadIds));
+    } catch (error) {
+      // Keep the changes for the next flush instead of dropping them, or a
+      // Typesense blip leaves search showing old folders until a re-index.
+      for (const id of ids) pendingIds.add(id);
+      for (const accountId of accounts) removedAccounts.add(accountId);
+      scheduleFlushRetry();
+      throw error;
+    }
+  }
+
+  let flushRetryTimer = null;
+  function scheduleFlushRetry() {
+    if (stopped || flushRetryTimer) return;
+    flushRetryTimer = setTimeout(() => {
+      flushRetryTimer = null;
+      if (!stopped) scheduleFlush();
+    }, 15_000);
+    flushRetryTimer.unref?.();
   }
 
   function scheduleFlush() {
@@ -599,6 +618,7 @@ export function createSearchEngine({ config, repos, logger = null, fetchImpl = g
       stopped = true;
       ready = false;
       if (retryTimer) clearTimeout(retryTimer);
+      if (flushRetryTimer) clearTimeout(flushRetryTimer);
     },
     whenIdle() {
       return tail;
