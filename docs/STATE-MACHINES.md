@@ -7,7 +7,7 @@ This is a map of every place where aMail keeps state that moves through stages w
 - The code was read on branch `claude/project-thread-e1sdf7`, based on `main` at `4891acd` (2026-11-07). Paths are relative to the repo root. Line numbers are approximate and will drift.
 - Reading only. No mail, account or live-server writes were made against mail.xer0.io.
 - **Confirmed** means the behavior was reproduced by running the real repository code against a scratch database, or is plain from a single line of code (for example a missing import). **Inferred** means it follows from reading the code but depends on timing or deploy setup and has not been exercised.
-- This document changes no behavior. Fix ideas are suggestions only.
+- The map describes the code before the fixes listed under Fix status below.
 
 **Count:** 58 machines: 16 rated high, 24 medium (including the medium-low and low-medium ones) and 18 low.
 
@@ -41,6 +41,29 @@ The third: **the same state is defined in several places that must agree** (five
 | 16 | Typesense index drops failed updates and never deletes | 2.3 | High | Confirmed in code |
 
 Everything else is listed in its section with its rating.
+
+## Fix status (2026-11-07)
+
+Fixed in the same pull request as this map, each with a test that fails before the fix:
+
+- **1.1 placement.** Archive, trash and spam changes, and their undo, now move the message on the server to wherever the resulting local state says it belongs. Restoring from Gmail's All Mail copies it to the inbox. Spam no longer sets the archive flag, Archive excludes spam in every folder predicate, and not-spam returns the message to the inbox. Thread archive and snooze skip your own Sent copies and drafts.
+- **1.2 snooze.** Snooze no longer archives, so it returns to the inbox when its time passes. `snoozedUntil: null` clears it (new `unsnooze` API route and MCP action). A one-time migration (`migration.snooze_unarchive_v1`) un-archives INBOX rows the old snooze had archived.
+- **1.3 sync cursor.** A pass that imports new UIDs applies CONDSTORE read/star changes before saving the new modseq. The stored `last_uid` never moves backwards within one UIDVALIDITY.
+- **1.4 drafts.** Draft saves and Drafts-mailbox syncs take turns per account (a save waits at most 30 seconds). A row removed mid-save is stored again instead of throwing.
+- **2.2 search-read worker.** A terminated worker's late error or exit no longer fails the replacement's searches.
+- **2.3 Typesense.** A failed flush keeps its changes and retries. (Deleting documents for removed messages is still open.)
+- **3.1-3.4 frontend.** `normalizeMessage` is imported, sign-out clears the list ETag, load id and deep search, `loadRemoteContent` tolerates a closed reader, and Escape can't dismiss a required unlock.
+- **Keyslots.** Temp files get a random suffix.
+
+Still open, because each needs a product decision or is risky to change on the live mailbox without one:
+
+- A durable outbox with retry for remote moves (1.1). Moves are still best-effort; a failure is reported in `remoteSync`.
+- Expunge and remote-move detection (1.3).
+- Connector grant list and revoke, and OAuth tokens unlocking a locked vault (4.2, 4.4).
+- Atomic harness init (4.1).
+- Analyzed-flag claim and one definition of "unanalyzed" (2.1).
+- Send idempotency and durable progress (1.5).
+- Refresh-then-switch-folder race (3.5).
 
 ---
 
