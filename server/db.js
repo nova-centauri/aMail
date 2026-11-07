@@ -69,7 +69,8 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
   labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
-  smart_category_reason, source_imported, remote_missing_at, created_at, updated_at`;
+  smart_category_reason, source_imported, remote_missing_at, claimed_by, claimed_until,
+  created_at, updated_at`;
 
 /** Inbox list hydrate: no bodies, no attachment blobs. */
 const LIST_ENVELOPE_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_message_id, subject, from_name, from_email,
@@ -144,6 +145,10 @@ function publicMessage(row) {
     sourceImported: row.source_imported === undefined || row.source_imported === null ? true : Boolean(row.source_imported),
     // When sync last noticed this message gone from its server mailbox.
     remoteMissingAt: row.remote_missing_at || null,
+    // An agent's lease on reviewing this message (claim_messages). A claim
+    // whose time has passed is free for anyone to take.
+    claimedBy: row.claimed_by || null,
+    claimedUntil: row.claimed_by ? (row.claimed_until || null) : null,
     category,
     categoryLabel: categoryLabel(category),
     categoryReason: row.smart_category_reason || 'No automated category signal matched.',
@@ -537,6 +542,9 @@ function initSchema(db) {
   if (!columnsAfterRebuild.has('remote_missing_at')) {
     db.exec('ALTER TABLE messages ADD COLUMN remote_missing_at TEXT');
   }
+  // One agent per email: who is reviewing an unanalyzed message, and until when.
+  if (!columnsAfterRebuild.has('claimed_by')) db.exec('ALTER TABLE messages ADD COLUMN claimed_by TEXT');
+  if (!columnsAfterRebuild.has('claimed_until')) db.exec('ALTER TABLE messages ADD COLUMN claimed_until TEXT');
   const syncColumnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(sync_state)').all().map((column) => column.name));
   if (!syncColumnsAfterRebuild.has('reconciled_at')) db.exec('ALTER TABLE sync_state ADD COLUMN reconciled_at TEXT');
 
@@ -989,8 +997,12 @@ export function createRepositories(db) {
         AND (@category = '' OR m.smart_category = @category)
         AND (@query = '' OR m.subject LIKE @likeQuery OR m.from_name LIKE @likeQuery OR m.from_email LIKE @likeQuery OR m.snippet LIKE @likeQuery)
       ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC LIMIT @limit OFFSET @offset`;
+  // With a reviewer name, other agents' live claims drop out of the queue.
+  const CLAIM_VISIBLE_SQL = `(@claimant IS NULL OR claimed_by IS NULL OR claimed_by = @claimant
+        OR claimed_until IS NULL OR claimed_until <= @now)`;
   const reviewQueueSql = (scoped, after) => `SELECT ${MESSAGE_METADATA_COLUMNS}
       FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+        AND ${CLAIM_VISIBLE_SQL}
         ${scoped ? 'AND account_id = @accountId' : ''}
         ${after ? 'AND (COALESCE(received_at, sent_at, created_at), id) > (@afterTimestamp, @afterId)' : ''}
       ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
@@ -1044,8 +1056,22 @@ export function createRepositories(db) {
     unanalyzedMessagesAfter: db.prepare(reviewQueueSql(false, true)),
     unanalyzedAccountMessages: db.prepare(reviewQueueSql(true, false)),
     unanalyzedAccountMessagesAfter: db.prepare(reviewQueueSql(true, true)),
-    unanalyzedMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1'),
-    unanalyzedAccountMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1 AND account_id = @accountId'),
+    unanalyzedMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND ${CLAIM_VISIBLE_SQL}`),
+    unanalyzedAccountMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND ${CLAIM_VISIBLE_SQL} AND account_id = @accountId`),
+    claimedByOthersCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND claimed_by IS NOT NULL AND claimed_by <> @claimant AND claimed_until > @now
+      AND (@accountId IS NULL OR account_id = @accountId)`),
+    messageClaimRow: db.prepare('SELECT id, account_id, analyzed_at, claimed_by, claimed_until, source_imported FROM messages WHERE id = ?'),
+    // The WHERE clause is the lock: only a free, expired or own claim is taken.
+    messageClaim: db.prepare(`UPDATE messages SET claimed_by = @claimant, claimed_until = @until
+      WHERE id = @id AND analyzed_at IS NULL
+        AND (claimed_by IS NULL OR claimed_by = @claimant OR claimed_until IS NULL OR claimed_until <= @now)`),
+    messageReleaseClaim: db.prepare(`UPDATE messages SET claimed_by = NULL, claimed_until = NULL
+      WHERE id = @id AND claimed_by = @claimant`),
+    messageReleaseAllClaims: db.prepare(`UPDATE messages SET claimed_by = NULL, claimed_until = NULL
+      WHERE claimed_by = @claimant`),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
@@ -1179,6 +1205,8 @@ export function createRepositories(db) {
       snoozed_until = CASE WHEN @snoozed_change = 1 THEN @snoozed_until ELSE snoozed_until END,
       analyzed_at = CASE WHEN @analyzed_change = 1 THEN @analyzed_at ELSE analyzed_at END,
       analyzed_by = CASE WHEN @analyzed_change = 1 THEN @analyzed_by ELSE analyzed_by END,
+      claimed_by = CASE WHEN @analyzed_change = 1 THEN NULL ELSE claimed_by END,
+      claimed_until = CASE WHEN @analyzed_change = 1 THEN NULL ELSE claimed_until END,
       updated_at = @updated_at
       WHERE id = @id`),
     syncState: db.prepare('SELECT * FROM sync_state WHERE account_id = ? AND mailbox = ?'),
@@ -1462,7 +1490,7 @@ export function createRepositories(db) {
           analyzedBy: row.analyzed_by || null } : null;
       })),
       getRaw: (id) => queries.messageById.get(id) || null,
-      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null, includeTotal = true } = {}) => {
+      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null, includeTotal = true, claimant = null } = {}) => {
         if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
           throw new RangeError('Review queue limit must be an integer from 1 to 200.');
         }
@@ -1474,10 +1502,49 @@ export function createRepositories(db) {
           : (afterTimestamp === null ? queries.unanalyzedMessages : queries.unanalyzedMessagesAfter);
         // COUNT(*) over every unanalyzed row is a SQLCipher scan. Cursor
         // pages skip it; hasMore still comes from the limit+1 fetch.
-        const total = includeTotal ? count.get({ accountId }).count : null;
-        const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
+        const at = now();
+        const total = includeTotal ? count.get({ accountId, claimant, now: at }).count : null;
+        const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId, claimant, now: at });
         const items = rows.slice(0, limit).map(publicReviewMessage);
-        return { items, total, hasMore: rows.length > limit };
+        const claimedByOthers = claimant === null ? null
+          : queries.claimedByOthersCount.get({ accountId, claimant, now: at }).count;
+        return { items, total, hasMore: rows.length > limit, claimedByOthers };
+      }),
+      /**
+       * Claim unanalyzed messages for one reviewer until a lease runs out, so
+       * two agents never work the same email. With ids, each one is claimed or
+       * refused; without, the oldest messages nobody else holds are taken. An
+       * expired claim is free, and marking a message analyzed releases it.
+       */
+      claim: db.transaction(({ claimant, ids = null, accountId = null, limit = 20, leaseMs, at = now() }) => {
+        const owner = String(claimant || '').trim().slice(0, 120);
+        if (!owner) throw new RangeError('A claim needs the reviewer name.');
+        const until = new Date(Date.parse(at) + leaseMs).toISOString();
+        const claimed = [];
+        const refused = [];
+        const take = (id) => queries.messageClaim.run({ id, claimant: owner, until, now: at }).changes === 1;
+        if (Array.isArray(ids)) {
+          for (const id of ids) {
+            const row = queries.messageClaimRow.get(id);
+            if (!row) refused.push({ id, reason: 'not-found' });
+            else if (row.analyzed_at) refused.push({ id, reason: 'already-analyzed' });
+            else if (take(id)) claimed.push(id);
+            else refused.push({ id, reason: 'claimed', claimedBy: row.claimed_by, claimedUntil: row.claimed_until });
+          }
+        } else {
+          const page = accountId === null ? queries.unanalyzedMessages : queries.unanalyzedAccountMessages;
+          for (const row of page.all({ accountId, limit, claimant: owner, now: at })) {
+            if (take(row.id)) claimed.push(row.id);
+          }
+        }
+        const messages = claimed.map((id) => publicReviewMessage(queries.messageById.get(id)));
+        return { claimedBy: owner, claimedUntil: until, messages, refused };
+      }).immediate,
+      releaseClaims: db.transaction(({ claimant, ids = null }) => {
+        const owner = String(claimant || '').trim().slice(0, 120);
+        if (!owner) throw new RangeError('Releasing claims needs the reviewer name.');
+        if (!Array.isArray(ids)) return queries.messageReleaseAllClaims.run({ claimant: owner }).changes;
+        return ids.reduce((sum, id) => sum + queries.messageReleaseClaim.run({ id, claimant: owner }).changes, 0);
       }),
       list({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '', category = '', limit = 50, offset = 0, includeBodies = true, includeTotal = true }) {
         const params = {
