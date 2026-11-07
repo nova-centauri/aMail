@@ -80,6 +80,9 @@ export const SYNC_SCAN_YIELD_EVERY = 32;
 const SYNC_SOURCE_CHUNK = 25;
 // Unknown live UIDs a Drafts reconcile looks at; Drafts folders are small.
 const DRAFT_RECONCILE_MAX_UNKNOWN = 500;
+// A draft save waits this long for a Drafts sync (or another save) on the
+// same account before going ahead anyway, so a stuck sync can't block saving.
+const DRAFT_LOCK_WAIT_MS = 30_000;
 
 export function yieldEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
@@ -618,6 +621,31 @@ export function createMailService({
   const attachmentCache = new Map();
   const attachmentFetches = new Map();
   const imapPool = new Map();
+  // Draft saves and Drafts-mailbox syncs on one account take turns. Without
+  // this a sync can delete a draft row mid-save, or import the new copy as a
+  // second draft, and two saves of one draft both APPEND and leave a duplicate.
+  const draftLocks = new Map();
+  async function withDraftLock(accountId, fn) {
+    const previous = draftLocks.get(accountId) || Promise.resolve();
+    let release;
+    const current = new Promise((resolve) => { release = resolve; });
+    const tail = previous.then(() => current);
+    draftLocks.set(accountId, tail);
+    let timer;
+    const waited = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), DRAFT_LOCK_WAIT_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([previous.then(() => 'ready'), waited]);
+    clearTimeout(timer);
+    if (outcome === 'timeout') logger.warn({ accountId }, 'Draft lock wait timed out; continuing');
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (draftLocks.get(accountId) === tail) draftLocks.delete(accountId);
+    }
+  }
   const accountGenerations = new Map();
   let searchGeneration = 0;
   let activeSearchAbort = null;
@@ -1575,7 +1603,9 @@ export function createMailService({
     const accountId = args?.account?.id;
     return withImapDeadline(
       mailboxTimeoutMs,
-      Promise.resolve().then(() => syncMailbox(args)),
+      Promise.resolve().then(() => (args?.descriptor?.role === 'drafts'
+        ? withDraftLock(accountId, () => syncMailbox(args))
+        : syncMailbox(args))),
       () => {
         abortPooledImap(accountId, args.generation);
         logger.warn(
@@ -2622,6 +2652,14 @@ export function createMailService({
    * draft; the latter is moved to the server and its local copy removed.
    */
   async function saveDraft(input = {}, draftId = null) {
+    // Plan once to learn the account; plan again inside the lock so a save
+    // that waited sees the UID the previous save left behind.
+    const firstPlan = prepareDraft(repos, input, draftId);
+    assertImapWritesAllowed(firstPlan.accountId);
+    return withDraftLock(firstPlan.accountId, () => saveDraftLocked(input, draftId));
+  }
+
+  async function saveDraftLocked(input, draftId) {
     const plan = prepareDraft(repos, input, draftId);
     assertImapWritesAllowed(plan.accountId);
     const { account, credentials } = accountAndCredentials(plan.accountId);
@@ -2692,11 +2730,14 @@ export function createMailService({
       is_draft: 1,
       source_imported: 1,
     };
-    let saved;
+    let saved = null;
     if (plan.server) {
       const thread = plan.threadId ? repos.threads.get(plan.threadId) : null;
       saved = repos.messages.replace(plan.server.id, { ...row, thread_id: thread?.id || plan.server.threadId });
-    } else {
+    }
+    // The row can be gone if a Drafts sync removed it while this save ran;
+    // the server already holds the new copy, so store it as a fresh row.
+    if (!saved) {
       const thread = resolveThread({
         accountId: account.id,
         subject: plan.subject,
