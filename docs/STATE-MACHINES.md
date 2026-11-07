@@ -55,13 +55,17 @@ Fixed in the same pull request as this map, each with a test that fails before t
 - **3.1-3.4 frontend.** `normalizeMessage` is imported, sign-out clears the list ETag, load id and deep search, `loadRemoteContent` tolerates a closed reader, and Escape can't dismiss a required unlock.
 - **Keyslots.** Temp files get a random suffix.
 
+Fixed in the follow-up pull request (retry queue, remote moves, claims):
+
+- **1.1 retry queue.** A read, star or folder change the server didn't confirm goes into `remote_ops` and is retried after each account sync. See "Retry queue for server changes" under 1.1.
+- **1.3 remote moves and deletes.** Sync now notices mail moved, filed or deleted in another client. See "Remote presence check" under 1.3.
+- **2.1 claims.** Agents can claim messages with a lease so each email has one reviewer. See "Claims" under 2.1.
+
 Still open, because each needs a product decision or is risky to change on the live mailbox without one:
 
-- A durable outbox with retry for remote moves (1.1). Moves are still best-effort; a failure is reported in `remoteSync`.
-- Expunge and remote-move detection (1.3).
 - Connector grant list and revoke, and OAuth tokens unlocking a locked vault (4.2, 4.4).
 - Atomic harness init (4.1).
-- Analyzed-flag claim and one definition of "unanalyzed" (2.1).
+- One definition of "unanalyzed" (2.1).
 - Send idempotency and durable progress (1.5).
 - Refresh-then-switch-folder race (3.5).
 
@@ -90,6 +94,11 @@ Still open, because each needs a product decision or is risky to change on the l
   - **Thread actions hit your own Sent copies and drafts (inferred).** Thread actions expand to every message in the thread. Archiving a thread on Gmail would move the Sent copies out of Sent.
   - **Predicate drift.** A fix in one copy of the folder rules (say, adding `is_spam = 0` to archive) silently leaves badges, search or Typesense disagreeing with the list. Typesense already disagrees on drafts (see 2.3).
 - **Suggestion.** One derived `folder` function (or a generated column) used by every reader, plus a small outbox table for remote moves that retries and can be inspected.
+- **Retry queue for server changes (fixed).** Table `remote_ops`, one row per message, holds what the server still owes: a subset of `read`, `starred` and `placement`.
+  - **States.** No row (in step), `pending` (waiting for `next_attempt_at`), `stuck` (failed `REMOTE_OP_MAX_ATTEMPTS` = 8 times).
+  - **In.** A failed IMAP call in `updateMessageState` enqueues the fields it touched, merged with any already owed, attempts reset to 0. The API answers `remoteSync.status = 'queued'` with `retryAt`, and the UI says aMail will retry.
+  - **Out.** A retry pushes the message's *current* local state, so it is idempotent and an undo cancels an owed move. Success deletes the row only if its `revision` is unchanged, so a newer failure is never dropped. Any later successful change to the same message carries the owed fields with it.
+  - **Retries.** After each account sync's login, due rows run one at a time. Backoff is 1 minute doubling to 1 hour. At 8 failures the row turns `stuck` and stops; `retry_unsynced_changes` (MCP) or `POST /api/sync/remote-changes/retry` puts it back to `pending`. `list_unsynced_changes` and `runtimeStatus().remoteChanges` show what's owed.
 
 ### 1.2 Snooze — HIGH (confirmed)
 
@@ -120,6 +129,14 @@ Still open, because each needs a product decision or is risky to change on the l
   - **The cursor can go backwards (inferred).** `previousSync` is read before the mailbox lock. Two syncs of the same mailbox with different limits get different `accountInFlight` keys and both run. The slower one writes an older `last_uid`, and the next pass re-imports.
   - `jumpCursor` deliberately skips old UIDs in Drafts, Trash and Spam. That is a design choice, but it means older messages there are never imported.
 - **Suggestion.** Always apply CONDSTORE changes on `new-uids` passes, and add a cheap periodic `UID SEARCH ALL` diff (or QRESYNC `VANISHED` where offered) to detect expunges.
+- **Remote presence check (fixed).** `reconcileRemotePresence` in `mail-service.js`, run at the end of each full account sync.
+  - **When.** Each inbox, archive, trash and spam mailbox at most every 10 minutes (`sync_state.reconciled_at`). One read-only `UID SEARCH ALL` per mailbox, compared with local rows up to `last_uid`.
+  - **States per row.** Present; missing once (`messages.remote_missing_at` set); resolved. A UID that comes back clears the mark.
+  - **Resolving (second sighting, at least 5 minutes later).** aMail searches the account's other folders (not Sent or Drafts) by Message-ID.
+    - Found in one folder: the row moves there (`applyRemoteMove`) and takes that folder's role. A custom folder or Gmail label counts as Archive. The row keeps its id, read and star state and analyzed mark. If sync already imported the destination copy as a second row, that copy is folded in and deleted.
+    - Found nowhere and it was in the inbox: archived locally, `uid` cleared so later actions stay local. Never deleted.
+    - Found nowhere from Archive, Trash or Spam: marked only.
+  - **Guards.** It skips a mailbox whose UIDVALIDITY changed or isn't known, whose SEARCH count disagrees with EXISTS, or where at least 200 rows and 90% of them vanished at once. It skips messages with a change still in the retry queue, and a Message-ID that appears twice in one folder. It resolves at most 50 rows a pass within 20 seconds.
 
 ### 1.4 Draft lifecycle (server drafts) — HIGH
 
@@ -220,6 +237,10 @@ Still open, because each needs a product decision or is risky to change on the l
   - `mark_messages_analyzed` applies a batch one row at a time; a row removed mid-batch throws partway and no receipts come back.
   - The review cursor sorts on `received_at`, which re-sync can rewrite, so a message can slip behind the cursor.
 - **Suggestion.** Decide which definition "caught up" means, make the others derive from it, and add a claim (`claimed_by`, `claimed_until`) for agent sweeps.
+- **Claims (fixed).** Columns `messages.claimed_by` and `claimed_until`.
+  - **States.** Unclaimed; claimed by an agent until a time; expired (time passed, free to anyone); released (analyzed, unanalyzed or `release_message_claims`).
+  - **Claim.** MCP `claim_messages(by, ids? | accountId? + limit?, leaseMinutes?)` runs in one IMMEDIATE transaction. Each row is taken by an `UPDATE ... WHERE` that only matches a free, expired or own claim, so another agent's live claim is never overwritten. Lease 15 minutes by default, 1 to 120; claiming again extends your own. With ids, each refused id says why (`claimed` with who and until when, `already-analyzed`, `not-found`).
+  - **Queue.** `list_unanalyzed_messages` with `by` leaves out other agents' live claims and returns `claimedByOthers`. Without `by` it behaves as before, so the protection only applies to sweeps that claim.
 
 ### 2.2 Search-read worker thread — HIGH (inferred timing)
 
@@ -489,11 +510,11 @@ All store transitions here are synchronous within one process, so real races nee
 
 ## Suggested order of fixes
 
-1. Make remote moves durable and reversible: an outbox with retry for placement changes, and undo that moves mail back on the server (1.1).
+1. ~~Make remote moves durable and reversible: an outbox with retry for placement changes, and undo that moves mail back on the server (1.1).~~ Done.
 2. Fix snooze: clear the archive flag on wake (or don't set it), and make `snoozedUntil: null` clear the field (1.2).
-3. Apply CONDSTORE flag changes on every pass and detect expunges (1.3).
+3. ~~Apply CONDSTORE flag changes on every pass and detect expunges (1.3).~~ Done.
 4. Add an owner-visible list and revoke for connector grants, and stop OAuth tokens from unlocking a locked vault (4.2, 4.4).
 5. Make harness init atomic (write slots only after the database opens) (4.1).
 6. Serialize draft save with Drafts reconcile (1.4).
 7. One-line frontend fixes: import `normalizeMessage` (3.1), clear the ETag on sign-out (3.2), null-check in `loadRemoteContent` and add an error boundary (3.3), bump the load id in `lockSession` (3.4).
-8. Agree on one meaning of "unanalyzed" and add a claim for agent sweeps (2.1).
+8. Agree on one meaning of "unanalyzed" (still open) and add a claim for agent sweeps (2.1, done).
