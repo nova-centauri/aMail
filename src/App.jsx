@@ -23,7 +23,7 @@ import { isUnauthorizedError, useLiveMailboxSync } from './mail/live-sync.js';
 import { composeWindowKey, shouldDismissCompose } from './mail/compose-session.js';
 import { quotedComposeHtml } from './mail/html.js';
 import { bodiesToFill } from './mail/open-message.js';
-import { formatMessageDate, getArray, normalizeAccount, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
+import { formatMessageDate, getArray, normalizeAccount, normalizeMessage, normalizePerson, normalizeThread, recipientArray, formatRecipients } from './mail/normalize.js';
 import { collectKnownPeople } from './mail/people.js';
 import { PANEL_EASE_MS, prefersReducedMotion, usePresence } from './mail/presence.js';
 import { mergeOpenThread, nextThreadAfterRemoval, reconcileSelectedThread, sameOpenThread } from './mail/selection.js';
@@ -946,7 +946,8 @@ export default function App() {
         setSettingsOpen(false);
         setProfileOpen(false);
         setMobileSidebarOpen(false);
-        setAccessOpen(false);
+        // The unlock dialog can't be dismissed while the server requires it.
+        if (!authRequired) setAccessOpen(false);
         setSelectedThread(null);
       }
       if (action === 'next' || action === 'previous') {
@@ -975,15 +976,18 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeys);
     return () => window.removeEventListener('keydown', handleKeys);
-  }, [composePresence.mounted, editingAccount, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds]);
+  }, [composePresence.mounted, editingAccount, shortcutsOpen, cursorThread, selectedThread, visibleThreads, selectedIds, authRequired]);
 
   const loadRemoteContent = async (message) => {
     try {
       const response = !isDemo ? await api(`/messages/${encodeURIComponent(message.id)}/remote-content`, { method: 'POST' }) : null;
       const hydrated = response?.message || response;
-      const update = (thread) => ({ ...thread, messages: thread.messages.map((item) => item.id === message.id ? { ...item, remoteContentLoaded: true, bodyHtml: hydrated?.htmlBody || item.bodyHtml } : item) });
+      const update = (thread) => (thread?.messages
+        ? { ...thread, messages: thread.messages.map((item) => item.id === message.id ? { ...item, remoteContentLoaded: true, bodyHtml: hydrated?.htmlBody || item.bodyHtml } : item) }
+        : thread);
       setThreads((current) => current.map(update));
-      setSelectedThread((current) => update(current));
+      // The thread may have been closed while the images loaded.
+      setSelectedThread((current) => (current ? update(current) : current));
       setNotice('Remote content loaded through the privacy relay.');
     } catch {
       setNotice('Remote content could not be loaded privately.');
@@ -1102,6 +1106,11 @@ export default function App() {
 
   const lockSession = async () => {
     persistAccessToken('');
+    // Drop in-flight list loads and the cached list version, so the next
+    // sign-in fetches the mailbox instead of getting a 304 for an empty list.
+    loadRequestRef.current += 1;
+    mailEtagRef.current = '';
+    cancelDeepSearch();
     setProfileOpen(false);
     setSettingsOpen(false);
     closeCompose('sign-out');
