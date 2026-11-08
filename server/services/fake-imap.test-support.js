@@ -21,6 +21,8 @@ export function createFakeImapServer({
   failConnect = null,
   failAppend = null,
 } = {}) {
+  // Tests flip these at runtime: a thrown Error makes the next calls fail.
+  const failures = { move: null, flags: null, search: null };
   const state = {
     folders: folders.map((folder) => ({ ...folder })),
     mailboxes: new Map(),
@@ -32,6 +34,9 @@ export function createFakeImapServer({
     modseq: 1,
     uidplus,
     uidValidity,
+    failures,
+    moves: [],
+    copies: [],
   };
   const box = (path) => {
     if (!state.mailboxes.has(path)) state.mailboxes.set(path, { nextUid: 1, messages: new Map() });
@@ -52,6 +57,21 @@ export function createFakeImapServer({
     const mailbox = box(path);
     mailbox.messages.set(uid, { raw: Buffer.from(raw), flags: new Set(flags), messageId: headerValue(raw, 'Message-ID') });
     mailbox.nextUid = Math.max(mailbox.nextUid, uid + 1);
+    state.modseq += 1;
+    return uid;
+  };
+  // Another client moves or deletes a message: the UID just disappears here.
+  state.expunge = (path, uid) => {
+    const removed = box(path).messages.get(Number(uid));
+    box(path).messages.delete(Number(uid));
+    state.modseq += 1;
+    return removed || null;
+  };
+  state.place = (path, message) => {
+    const target = box(path);
+    const uid = target.nextUid;
+    target.nextUid += 1;
+    target.messages.set(uid, message);
     state.modseq += 1;
     return uid;
   };
@@ -116,11 +136,68 @@ export function createFakeImapServer({
     }
 
     async search(query) {
+      if (state.failures.search) throw state.failures.search;
+      // A provider glitch: SEARCH ALL answers empty though the mailbox has mail.
+      if (state.lieAboutSearch && query?.all) return [];
       const mailbox = box(this.mailbox.path);
-      const wanted = query?.header?.['message-id'];
+      const matches = (message, part) => {
+        if (part?.all) return true;
+        if (Array.isArray(part?.or)) return part.or.some((item) => matches(message, item));
+        const wanted = part?.header?.['message-id'];
+        return wanted ? message.messageId === wanted : false;
+      };
       return [...mailbox.messages.entries()]
-        .filter(([, message]) => (query?.all ? true : (wanted ? message.messageId === wanted : false)))
+        .filter(([, message]) => matches(message, query))
         .map(([uid]) => uid);
+    }
+
+    async messageFlagsAdd(range, flags) {
+      if (state.failures.flags) throw state.failures.flags;
+      const message = box(this.mailbox.path).messages.get(Number(range));
+      if (!message) return false;
+      for (const flag of flags) message.flags.add(flag);
+      state.modseq += 1;
+      return true;
+    }
+
+    async messageFlagsRemove(range, flags) {
+      if (state.failures.flags) throw state.failures.flags;
+      const message = box(this.mailbox.path).messages.get(Number(range));
+      if (!message) return false;
+      for (const flag of flags) message.flags.delete(flag);
+      state.modseq += 1;
+      return true;
+    }
+
+    // UID MOVE / COPY with UIDPLUS-style uidMap, like ImapFlow returns.
+    async messageMove(range, destination) {
+      if (state.failures.move) throw state.failures.move;
+      const source = box(this.mailbox.path);
+      const uid = Number(range);
+      const message = source.messages.get(uid);
+      if (!message) return false;
+      source.messages.delete(uid);
+      const target = box(destination);
+      const newUid = target.nextUid;
+      target.nextUid += 1;
+      target.messages.set(newUid, message);
+      state.modseq += 1;
+      state.moves.push({ from: this.mailbox.path, uid, destination, newUid });
+      return { path: this.mailbox.path, destination, uidMap: new Map([[uid, newUid]]) };
+    }
+
+    async messageCopy(range, destination) {
+      if (state.failures.move) throw state.failures.move;
+      const uid = Number(range);
+      const message = box(this.mailbox.path).messages.get(uid);
+      if (!message) return false;
+      const target = box(destination);
+      const newUid = target.nextUid;
+      target.nextUid += 1;
+      target.messages.set(newUid, { ...message, flags: new Set(message.flags) });
+      state.modseq += 1;
+      state.copies.push({ from: this.mailbox.path, uid, destination, newUid });
+      return { path: this.mailbox.path, destination, uidMap: new Map([[uid, newUid]]) };
     }
 
     async* fetch(range, query = {}) {

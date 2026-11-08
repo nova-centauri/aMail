@@ -917,8 +917,10 @@ export default function App() {
             .map((message) => message?.remoteSync)
             .filter(Boolean);
           const failed = outcomes.find((outcome) => outcome.status === 'failed');
+          const queued = outcomes.find((outcome) => outcome.status === 'queued');
           const unsynced = outcomes.find((outcome) => ['local-only', 'skipped'].includes(outcome.status));
           if (failed) setNotice(`${labels[action] || 'Updated'} locally; IMAP did not confirm the change.`);
+          else if (queued) setNotice(`${labels[action] || 'Updated'} locally; the server didn't answer, so aMail will retry.`);
           else if (unsynced && !['snooze', 'analyzed', 'unanalyzed'].includes(action)) setNotice(`${labels[action] || 'Updated'} locally; the provider change was not available.`);
           else if (action === 'snooze') setNotice(labels.snooze);
         })

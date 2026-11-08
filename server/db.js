@@ -69,7 +69,8 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   bcc_json, reply_to_json, sent_at, received_at, snippet, attachments_json,
   labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
-  smart_category_reason, source_imported, created_at, updated_at`;
+  smart_category_reason, source_imported, remote_missing_at, claimed_by, claimed_until,
+  created_at, updated_at`;
 
 /** Inbox list hydrate: no bodies, no attachment blobs. */
 const LIST_ENVELOPE_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_message_id, subject, from_name, from_email,
@@ -142,6 +143,12 @@ function publicMessage(row) {
     analyzedAt: row.analyzed_at || null,
     analyzedBy: row.analyzed_by || null,
     sourceImported: row.source_imported === undefined || row.source_imported === null ? true : Boolean(row.source_imported),
+    // When sync last noticed this message gone from its server mailbox.
+    remoteMissingAt: row.remote_missing_at || null,
+    // An agent's lease on reviewing this message (claim_messages). A claim
+    // whose time has passed is free for anyone to take.
+    claimedBy: row.claimed_by || null,
+    claimedUntil: row.claimed_by ? (row.claimed_until || null) : null,
     category,
     categoryLabel: categoryLabel(category),
     categoryReason: row.smart_category_reason || 'No automated category signal matched.',
@@ -530,6 +537,16 @@ function initSchema(db) {
   if (!columnsAfterRebuild.has('is_draft')) {
     db.exec('ALTER TABLE messages ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0');
   }
+  // Set when a sync no longer finds the message's UID in its mailbox (another
+  // client moved or deleted it). Cleared whenever the server shows it again.
+  if (!columnsAfterRebuild.has('remote_missing_at')) {
+    db.exec('ALTER TABLE messages ADD COLUMN remote_missing_at TEXT');
+  }
+  // One agent per email: who is reviewing an unanalyzed message, and until when.
+  if (!columnsAfterRebuild.has('claimed_by')) db.exec('ALTER TABLE messages ADD COLUMN claimed_by TEXT');
+  if (!columnsAfterRebuild.has('claimed_until')) db.exec('ALTER TABLE messages ADD COLUMN claimed_until TEXT');
+  const syncColumnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(sync_state)').all().map((column) => column.name));
+  if (!syncColumnsAfterRebuild.has('reconciled_at')) db.exec('ALTER TABLE sync_state ADD COLUMN reconciled_at TEXT');
 
   // Sidebar polling must count compact index entries rather than visit message
   // rows carrying bodies and inline attachment data on every refresh.
@@ -607,7 +624,55 @@ function initSchema(db) {
   }
 
   wakeLegacySnoozes(db);
+  ensureRemoteOps(db);
   ensureMessagesFts(db);
+}
+
+/**
+ * Server changes (read, star, folder moves) that IMAP has not confirmed yet.
+ * One row per message: later failures for the same message merge into it, so
+ * a retry always pushes the message's current local state, never a stale one.
+ * Additive and created with IF NOT EXISTS, so it is safe on a live database.
+ */
+function ensureRemoteOps(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS remote_ops (
+      message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      fields_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'stuck')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_remote_ops_due ON remote_ops(account_id, status, next_attempt_at);
+  `);
+}
+
+export const REMOTE_OP_FIELDS = ['read', 'starred', 'placement'];
+
+function remoteOpFields(fieldsJson) {
+  const fields = json(fieldsJson);
+  return Array.isArray(fields) ? fields.filter((field) => REMOTE_OP_FIELDS.includes(field)) : [];
+}
+
+function publicRemoteOp(row) {
+  if (!row) return null;
+  return {
+    messageId: row.message_id,
+    accountId: row.account_id,
+    fields: remoteOpFields(row.fields_json),
+    status: row.status,
+    attempts: Number(row.attempts) || 0,
+    nextAttemptAt: row.next_attempt_at,
+    lastError: row.last_error || null,
+    revision: Number(row.revision) || 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 const SNOOZE_UNARCHIVE_SETTING = 'migration.snooze_unarchive_v1';
@@ -937,8 +1002,12 @@ export function createRepositories(db) {
         AND (@category = '' OR m.smart_category = @category)
         AND (@query = '' OR m.subject LIKE @likeQuery OR m.from_name LIKE @likeQuery OR m.from_email LIKE @likeQuery OR m.snippet LIKE @likeQuery)
       ORDER BY COALESCE(m.sent_at, m.received_at, m.created_at) DESC LIMIT @limit OFFSET @offset`;
+  // With a reviewer name, other agents' live claims drop out of the queue.
+  const CLAIM_VISIBLE_SQL = `(@claimant IS NULL OR claimed_by IS NULL OR claimed_by = @claimant
+        OR claimed_until IS NULL OR claimed_until <= @now)`;
   const reviewQueueSql = (scoped, after) => `SELECT ${MESSAGE_METADATA_COLUMNS}
       FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+        AND ${CLAIM_VISIBLE_SQL}
         ${scoped ? 'AND account_id = @accountId' : ''}
         ${after ? 'AND (COALESCE(received_at, sent_at, created_at), id) > (@afterTimestamp, @afterId)' : ''}
       ORDER BY COALESCE(received_at, sent_at, created_at) ASC, id ASC
@@ -992,8 +1061,22 @@ export function createRepositories(db) {
     unanalyzedMessagesAfter: db.prepare(reviewQueueSql(false, true)),
     unanalyzedAccountMessages: db.prepare(reviewQueueSql(true, false)),
     unanalyzedAccountMessagesAfter: db.prepare(reviewQueueSql(true, true)),
-    unanalyzedMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1'),
-    unanalyzedAccountMessageCount: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1 AND account_id = @accountId'),
+    unanalyzedMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND ${CLAIM_VISIBLE_SQL}`),
+    unanalyzedAccountMessageCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND ${CLAIM_VISIBLE_SQL} AND account_id = @accountId`),
+    claimedByOthersCount: db.prepare(`SELECT COUNT(*) AS count FROM messages WHERE analyzed_at IS NULL AND COALESCE(source_imported, 1) = 1
+      AND claimed_by IS NOT NULL AND claimed_by <> @claimant AND claimed_until > @now
+      AND (@accountId IS NULL OR account_id = @accountId)`),
+    messageClaimRow: db.prepare('SELECT id, account_id, analyzed_at, claimed_by, claimed_until, source_imported FROM messages WHERE id = ?'),
+    // The WHERE clause is the lock: only a free, expired or own claim is taken.
+    messageClaim: db.prepare(`UPDATE messages SET claimed_by = @claimant, claimed_until = @until
+      WHERE id = @id AND analyzed_at IS NULL
+        AND (claimed_by IS NULL OR claimed_by = @claimant OR claimed_until IS NULL OR claimed_until <= @now)`),
+    messageReleaseClaim: db.prepare(`UPDATE messages SET claimed_by = NULL, claimed_until = NULL
+      WHERE id = @id AND claimed_by = @claimant`),
+    messageReleaseAllClaims: db.prepare(`UPDATE messages SET claimed_by = NULL, claimed_until = NULL
+      WHERE claimed_by = @claimant`),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
@@ -1106,7 +1189,8 @@ export function createRepositories(db) {
       is_sent = @is_sent, is_draft = @is_draft, smart_category = @smart_category,
       smart_category_reason = @smart_category_reason, smart_category_rule = @smart_category_rule,
       smart_category_version = @smart_category_version,
-      source_imported = COALESCE(@source_imported, source_imported), updated_at = @updated_at
+      source_imported = COALESCE(@source_imported, source_imported), remote_missing_at = NULL,
+      updated_at = @updated_at
       WHERE id = @id`),
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
     messageDelete: db.prepare('DELETE FROM messages WHERE id = ?'),
@@ -1126,6 +1210,8 @@ export function createRepositories(db) {
       snoozed_until = CASE WHEN @snoozed_change = 1 THEN @snoozed_until ELSE snoozed_until END,
       analyzed_at = CASE WHEN @analyzed_change = 1 THEN @analyzed_at ELSE analyzed_at END,
       analyzed_by = CASE WHEN @analyzed_change = 1 THEN @analyzed_by ELSE analyzed_by END,
+      claimed_by = CASE WHEN @analyzed_change = 1 THEN NULL ELSE claimed_by END,
+      claimed_until = CASE WHEN @analyzed_change = 1 THEN NULL ELSE claimed_until END,
       updated_at = @updated_at
       WHERE id = @id`),
     syncState: db.prepare('SELECT * FROM sync_state WHERE account_id = ? AND mailbox = ?'),
@@ -1145,6 +1231,19 @@ export function createRepositories(db) {
         reason = excluded.reason, seen_at = excluded.seen_at`),
     syncSkipClear: db.prepare('DELETE FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
     syncSkipUids: db.prepare('SELECT uid FROM sync_skips WHERE account_id = ? AND mailbox = ?'),
+    syncReconciled: db.prepare('UPDATE sync_state SET reconciled_at = ? WHERE account_id = ? AND mailbox = ?'),
+    presenceRows: db.prepare(`SELECT id, uid, rfc_message_id, remote_missing_at FROM messages
+      WHERE account_id = ? AND mailbox = ? AND uid IS NOT NULL AND is_draft = 0`),
+    markRemoteMissing: db.prepare('UPDATE messages SET remote_missing_at = @at WHERE id = @id AND remote_missing_at IS NULL'),
+    clearRemoteMissing: db.prepare('UPDATE messages SET remote_missing_at = NULL WHERE id = ?'),
+    messagePlacement: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid,
+      is_archived = @is_archived, is_trashed = @is_trashed, is_spam = @is_spam,
+      is_read = @is_read, is_starred = @is_starred,
+      analyzed_at = @analyzed_at, analyzed_by = @analyzed_by,
+      remote_missing_at = NULL, updated_at = @updated_at
+      WHERE id = @id`),
+    messageGoneFromInbox: db.prepare(`UPDATE messages SET is_archived = 1, uid = NULL, updated_at = @updated_at
+      WHERE id = @id AND mailbox = @mailbox AND uid = @uid`),
     maxMessageUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM messages'),
     maxSyncSynced: db.prepare('SELECT MAX(synced_at) AS t FROM sync_state'),
     maxAccountUpdated: db.prepare('SELECT MAX(updated_at) AS t FROM accounts'),
@@ -1183,6 +1282,29 @@ export function createRepositories(db) {
     messageRow: db.prepare('SELECT rowid, * FROM messages WHERE id = ?'),
     ftsInsert: db.prepare(FTS_INSERT_SQL),
     ftsDelete: db.prepare('DELETE FROM messages_fts WHERE rowid = ?'),
+    remoteOpGet: db.prepare('SELECT * FROM remote_ops WHERE message_id = ?'),
+    remoteOpInsert: db.prepare(`INSERT INTO remote_ops (
+      message_id, account_id, fields_json, status, attempts, next_attempt_at, last_error, revision, created_at, updated_at
+    ) VALUES (@message_id, @account_id, @fields_json, 'pending', 0, @next_attempt_at, @last_error, 1, @now, @now)`),
+    remoteOpMerge: db.prepare(`UPDATE remote_ops SET fields_json = @fields_json, status = 'pending', attempts = 0,
+      next_attempt_at = @next_attempt_at, last_error = @last_error, revision = revision + 1, updated_at = @now
+      WHERE message_id = @message_id`),
+    remoteOpFailed: db.prepare(`UPDATE remote_ops SET status = @status, attempts = attempts + 1,
+      next_attempt_at = @next_attempt_at, last_error = @last_error, updated_at = @now
+      WHERE message_id = @message_id AND revision = @revision`),
+    remoteOpComplete: db.prepare('DELETE FROM remote_ops WHERE message_id = ? AND revision = ?'),
+    remoteOpReassign: db.prepare(`UPDATE remote_ops SET message_id = @to, revision = revision + 1, updated_at = @now
+      WHERE message_id = @from`),
+    remoteOpDue: db.prepare(`SELECT * FROM remote_ops
+      WHERE account_id = @accountId AND status = 'pending' AND next_attempt_at <= @now
+      ORDER BY next_attempt_at ASC, message_id ASC LIMIT @limit`),
+    remoteOpList: db.prepare(`SELECT * FROM remote_ops
+      WHERE (@status IS NULL OR status = @status) AND (@accountId IS NULL OR account_id = @accountId)
+      ORDER BY status DESC, next_attempt_at ASC, message_id ASC LIMIT @limit`),
+    remoteOpCounts: db.prepare(`SELECT status, COUNT(*) AS count FROM remote_ops GROUP BY status`),
+    remoteOpRequeue: db.prepare(`UPDATE remote_ops SET status = 'pending', attempts = 0, next_attempt_at = @now,
+      revision = revision + 1, updated_at = @now
+      WHERE status = 'stuck' AND (@messageId IS NULL OR message_id = @messageId)`),
     passkeyById: db.prepare('SELECT * FROM passkeys WHERE id = ?'),
     passkeyList: db.prepare('SELECT * FROM passkeys ORDER BY created_at DESC'),
     passkeyCount: db.prepare('SELECT COUNT(*) AS count FROM passkeys'),
@@ -1283,7 +1405,19 @@ export function createRepositories(db) {
     return publicMessage(queries.messageById.get(row.id));
   };
 
-  const updateMessageRow = (existing, row) => {
+  const updateMessageRow = (existing, input) => {
+    // Fields still waiting in the retry queue keep their local value: the
+    // server copy being re-imported predates the change aMail owes it.
+    const owed = queries.remoteOpGet.get(existing.id);
+    const fields = owed ? remoteOpFields(owed.fields_json) : [];
+    const row = { ...input };
+    if (fields.includes('read')) row.is_read = existing.is_read;
+    if (fields.includes('starred')) row.is_starred = existing.is_starred;
+    if (fields.includes('placement')) {
+      row.is_archived = existing.is_archived;
+      row.is_trashed = existing.is_trashed;
+      row.is_spam = existing.is_spam;
+    }
     queries.messageUpdate.run(row);
     const threads = existing.thread_id === row.thread_id
       ? [existing.thread_id]
@@ -1375,7 +1509,7 @@ export function createRepositories(db) {
           analyzedBy: row.analyzed_by || null } : null;
       })),
       getRaw: (id) => queries.messageById.get(id) || null,
-      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null, includeTotal = true } = {}) => {
+      listUnanalyzed: db.transaction(({ accountId = null, limit = 50, afterTimestamp = null, afterId = null, includeTotal = true, claimant = null } = {}) => {
         if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
           throw new RangeError('Review queue limit must be an integer from 1 to 200.');
         }
@@ -1387,10 +1521,49 @@ export function createRepositories(db) {
           : (afterTimestamp === null ? queries.unanalyzedMessages : queries.unanalyzedMessagesAfter);
         // COUNT(*) over every unanalyzed row is a SQLCipher scan. Cursor
         // pages skip it; hasMore still comes from the limit+1 fetch.
-        const total = includeTotal ? count.get({ accountId }).count : null;
-        const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId });
+        const at = now();
+        const total = includeTotal ? count.get({ accountId, claimant, now: at }).count : null;
+        const rows = page.all({ accountId, limit: limit + 1, afterTimestamp, afterId, claimant, now: at });
         const items = rows.slice(0, limit).map(publicReviewMessage);
-        return { items, total, hasMore: rows.length > limit };
+        const claimedByOthers = claimant === null ? null
+          : queries.claimedByOthersCount.get({ accountId, claimant, now: at }).count;
+        return { items, total, hasMore: rows.length > limit, claimedByOthers };
+      }),
+      /**
+       * Claim unanalyzed messages for one reviewer until a lease runs out, so
+       * two agents never work the same email. With ids, each one is claimed or
+       * refused; without, the oldest messages nobody else holds are taken. An
+       * expired claim is free, and marking a message analyzed releases it.
+       */
+      claim: db.transaction(({ claimant, ids = null, accountId = null, limit = 20, leaseMs, at = now() }) => {
+        const owner = String(claimant || '').trim().slice(0, 120);
+        if (!owner) throw new RangeError('A claim needs the reviewer name.');
+        const until = new Date(Date.parse(at) + leaseMs).toISOString();
+        const claimed = [];
+        const refused = [];
+        const take = (id) => queries.messageClaim.run({ id, claimant: owner, until, now: at }).changes === 1;
+        if (Array.isArray(ids)) {
+          for (const id of ids) {
+            const row = queries.messageClaimRow.get(id);
+            if (!row) refused.push({ id, reason: 'not-found' });
+            else if (row.analyzed_at) refused.push({ id, reason: 'already-analyzed' });
+            else if (take(id)) claimed.push(id);
+            else refused.push({ id, reason: 'claimed', claimedBy: row.claimed_by, claimedUntil: row.claimed_until });
+          }
+        } else {
+          const page = accountId === null ? queries.unanalyzedMessages : queries.unanalyzedAccountMessages;
+          for (const row of page.all({ accountId, limit, claimant: owner, now: at })) {
+            if (take(row.id)) claimed.push(row.id);
+          }
+        }
+        const messages = claimed.map((id) => publicReviewMessage(queries.messageById.get(id)));
+        return { claimedBy: owner, claimedUntil: until, messages, refused };
+      }).immediate,
+      releaseClaims: db.transaction(({ claimant, ids = null }) => {
+        const owner = String(claimant || '').trim().slice(0, 120);
+        if (!owner) throw new RangeError('Releasing claims needs the reviewer name.');
+        if (!Array.isArray(ids)) return queries.messageReleaseAllClaims.run({ claimant: owner }).changes;
+        return ids.reduce((sum, id) => sum + queries.messageReleaseClaim.run({ id, claimant: owner }).changes, 0);
       }),
       list({ accountId, folder = 'inbox', mailbox = 'INBOX', query = '', category = '', limit = 50, offset = 0, includeBodies = true, includeTotal = true }) {
         const params = {
@@ -1642,6 +1815,92 @@ export function createRepositories(db) {
         changes.bump('message', timestamp);
         return publicMessage(queries.messageById.get(id));
       },
+      /** Rows sync can check against the server's UID list for one mailbox. */
+      presence: (accountId, mailbox) => queries.presenceRows.all(accountId, mailbox).map((row) => ({
+        id: row.id,
+        uid: Number(row.uid),
+        messageId: row.rfc_message_id || null,
+        missingSince: row.remote_missing_at || null,
+      })),
+      /** First sighting of a missing UID. Marks only; changes no placement. */
+      markRemoteMissing: db.transaction((ids, at = now()) => {
+        let marked = 0;
+        for (const id of ids) marked += queries.markRemoteMissing.run({ id, at }).changes;
+        if (marked) changes.bump('message');
+        return marked;
+      }),
+      clearRemoteMissing: db.transaction((ids) => {
+        let cleared = 0;
+        for (const id of ids) cleared += queries.clearRemoteMissing.run(id).changes;
+        if (cleared) changes.bump('message');
+        return cleared;
+      }),
+      /**
+       * Another client moved this message: point the row at its new mailbox and
+       * UID and set its folder flags from that mailbox's role. If sync already
+       * imported the destination copy as a second row, that copy gives way and
+       * the original row (and its id, which agents and MCC may hold) is kept,
+       * taking the copy's read and star state and analyzed mark if it has one.
+       */
+      applyRemoteMove: db.transaction((id, { mailbox, uid, role }) => {
+        const row = queries.messageById.get(id);
+        if (!row) return null;
+        const occupant = queries.messageByUid.get(row.account_id, mailbox, uid);
+        const copy = occupant && occupant.id !== id ? occupant : null;
+        if (copy) {
+          // A change still owed for the copy follows it to the surviving row,
+          // which takes the copy's UID; deleting the copy would cascade it away.
+          const copyOp = queries.remoteOpGet.get(copy.id);
+          if (copyOp) {
+            const ownOp = queries.remoteOpGet.get(id);
+            if (ownOp) {
+              const merged = REMOTE_OP_FIELDS.filter((field) => remoteOpFields(ownOp.fields_json).includes(field)
+                || remoteOpFields(copyOp.fields_json).includes(field));
+              queries.remoteOpMerge.run({
+                message_id: id, fields_json: JSON.stringify(merged), next_attempt_at: copyOp.next_attempt_at,
+                last_error: copyOp.last_error, now: now(),
+              });
+            } else {
+              queries.remoteOpReassign.run({ from: copy.id, to: id, now: now() });
+            }
+          }
+          queries.messageDelete.run(copy.id);
+          if (copy.thread_id !== row.thread_id && !recomputeThread(copy.thread_id)) queries.threadDelete.run(copy.thread_id);
+        }
+        const timestamp = now();
+        queries.messagePlacement.run({
+          id,
+          mailbox,
+          uid,
+          is_archived: role === 'archive' ? 1 : 0,
+          is_trashed: role === 'trash' ? 1 : 0,
+          is_spam: role === 'spam' ? 1 : 0,
+          is_read: copy ? copy.is_read : row.is_read,
+          is_starred: copy ? copy.is_starred : row.is_starred,
+          analyzed_at: row.analyzed_at || copy?.analyzed_at || null,
+          analyzed_by: row.analyzed_at ? row.analyzed_by : (copy?.analyzed_by || ''),
+          updated_at: timestamp,
+        });
+        finishMessageWrite([row.thread_id], id);
+        changes.bump('message', timestamp);
+        return { message: publicMessage(queries.messageById.get(id)), mergedCopyId: copy?.id || null };
+      }),
+      /**
+       * A message gone from the inbox that sync could not find anywhere else:
+       * deleted for good, or moved to a folder aMail can't search. Keep the
+       * row and show it under Archive; dropping the UID keeps later actions
+       * local instead of aiming at a UID the server no longer has.
+       */
+      goneFromInbox(id, { mailbox, uid }) {
+        const timestamp = now();
+        const changed = queries.messageGoneFromInbox.run({ id, mailbox, uid, updated_at: timestamp }).changes > 0;
+        if (changed) {
+          const row = queries.messageById.get(id);
+          finishMessageWrite([row?.thread_id], id);
+          changes.bump('message', timestamp);
+        }
+        return changed;
+      },
       searchConversations({
         accountIds = [],
         folder = 'inbox',
@@ -1836,6 +2095,7 @@ export function createRepositories(db) {
       },
       clearSkips: (accountId, mailbox) => queries.syncSkipClear.run(accountId, mailbox),
       skippedUids: (accountId, mailbox) => queries.syncSkipUids.all(accountId, mailbox).map((row) => Number(row.uid)),
+      markReconciled: (accountId, mailbox, at = now()) => queries.syncReconciled.run(at, accountId, mailbox).changes > 0,
     },
     changes,
     retention: {
@@ -1872,6 +2132,58 @@ export function createRepositories(db) {
         if (removed) changes.bump('message');
         return removed;
       },
+    },
+    remoteOps: {
+      get: (messageId) => publicRemoteOp(queries.remoteOpGet.get(messageId)),
+      /**
+       * Record a server change that failed. Fields merge into any pending row
+       * for the message; a new failure revives a stuck row because it is a new
+       * intent the owner just expressed.
+       */
+      enqueue: db.transaction(({ messageId, accountId, fields, nextAttemptAt, error = null }) => {
+        const wanted = REMOTE_OP_FIELDS.filter((field) => fields.includes(field));
+        if (!wanted.length) return null;
+        const timestamp = now();
+        const existing = queries.remoteOpGet.get(messageId);
+        const params = {
+          message_id: messageId,
+          account_id: accountId,
+          next_attempt_at: nextAttemptAt,
+          last_error: error ? String(error).slice(0, 500) : null,
+          now: timestamp,
+        };
+        if (existing) {
+          const merged = REMOTE_OP_FIELDS.filter((field) => wanted.includes(field) || json(existing.fields_json).includes(field));
+          queries.remoteOpMerge.run({ ...params, fields_json: JSON.stringify(merged) });
+        } else {
+          queries.remoteOpInsert.run({ ...params, fields_json: JSON.stringify(wanted) });
+        }
+        return publicRemoteOp(queries.remoteOpGet.get(messageId));
+      }),
+      /** A retry failed. Ignored when a newer failure already replaced the row. */
+      recordFailure({ messageId, revision, nextAttemptAt, error = null, stuck = false }) {
+        return queries.remoteOpFailed.run({
+          message_id: messageId,
+          revision,
+          status: stuck ? 'stuck' : 'pending',
+          next_attempt_at: nextAttemptAt,
+          last_error: error ? String(error).slice(0, 500) : null,
+          now: now(),
+        }).changes > 0;
+      },
+      /** Done, unless a newer failure for the same message arrived meanwhile. */
+      complete: (messageId, revision) => queries.remoteOpComplete.run(messageId, revision).changes > 0,
+      due: (accountId, { limit = 25, at = now() } = {}) => queries.remoteOpDue
+        .all({ accountId, now: at, limit }).map(publicRemoteOp),
+      list: ({ status = null, accountId = null, limit = 100 } = {}) => queries.remoteOpList
+        .all({ status, accountId, limit }).map(publicRemoteOp),
+      counts() {
+        const counts = { pending: 0, stuck: 0 };
+        for (const row of queries.remoteOpCounts.all()) counts[row.status] = Number(row.count) || 0;
+        return counts;
+      },
+      /** Give stuck changes a fresh set of attempts (all, or one message). */
+      requeue: (messageId = null) => queries.remoteOpRequeue.run({ messageId, now: now() }).changes,
     },
     settings: {
       list: () => Object.fromEntries(queries.settingList.all().map((row) => [row.key, json(row.value_json, null)])),

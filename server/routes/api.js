@@ -538,6 +538,20 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     if (!job) throw new NotFoundError('Sync job not found.');
     response.json({ job });
   });
+  // Server changes (read, star, folder moves) IMAP has not confirmed yet.
+  // Pending ones retry after each sync; stuck ones ran out of attempts.
+  router.get('/sync/remote-changes', (request, response) => {
+    const status = ['pending', 'stuck'].includes(request.query.status) ? request.query.status : null;
+    response.json({
+      counts: repos.remoteOps?.counts?.() || { pending: 0, stuck: 0 },
+      changes: repos.remoteOps?.list?.({ status, limit: parseNumber(request.query.limit, 100, 1, 500) }) || [],
+    });
+  });
+  router.post('/sync/remote-changes/retry', (request, response) => {
+    const messageId = typeof request.body?.messageId === 'string' && request.body.messageId ? request.body.messageId : null;
+    const requeued = repos.remoteOps?.requeue?.(messageId) || 0;
+    response.json({ requeued });
+  });
   router.get('/events', (request, response) => {
     attachMailboxEventStream(request, response, eventsHub);
   });

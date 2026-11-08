@@ -393,6 +393,81 @@ const MOVE_SPECIAL_USE = {
 
 const PLACEMENT_KEYS = ['isArchived', 'isTrashed', 'isSpam'];
 
+// Retry schedule for server changes IMAP did not confirm. Retries run after an
+// account's sync has already logged in, so a bad password never turns into a
+// login storm; past the last attempt a change is "stuck" and waits for the
+// owner (or an agent) to requeue it.
+export const REMOTE_OP_MAX_ATTEMPTS = 8;
+const REMOTE_OP_BASE_DELAY_MS = 60_000;
+const REMOTE_OP_MAX_DELAY_MS = 60 * 60_000;
+const REMOTE_OP_RETRY_BATCH = 25;
+
+// Noticing mail moved or deleted by other clients. A UID missing from its
+// mailbox is first only marked; the row changes on a later pass, after it is
+// still missing at least RECONCILE_CONFIRM_MS later, so a glitchy listing can
+// never empty the inbox. Each pass is bounded so it fits a sync deadline.
+const RECONCILE_ROLES = new Set(['inbox', 'archive', 'trash', 'spam']);
+const RECONCILE_INTERVAL_MS = 10 * 60_000;
+const RECONCILE_CONFIRM_MS = 5 * 60_000;
+const RECONCILE_MAX_RESOLVE = 50;
+const RECONCILE_SEARCH_BATCH = 25;
+const RECONCILE_MAX_FOLDERS = 12;
+const RECONCILE_BUDGET_MS = 20_000;
+// Most of a big mailbox vanishing at once looks like a provider problem, not
+// a person tidying up: hold off and log instead of acting.
+const RECONCILE_MASS_MIN = 200;
+const RECONCILE_MASS_SHARE = 0.9;
+
+/** The folder role a found message takes on, or null to leave it alone. */
+const SPECIAL_USE_ROLES = {
+  '\\Inbox': 'inbox',
+  '\\Sent': 'sent',
+  '\\Drafts': 'drafts',
+  '\\Trash': 'trash',
+  '\\Junk': 'spam',
+  '\\Archive': 'archive',
+  '\\All': 'archive',
+};
+
+export function reconcileRole(path, folders, descriptors) {
+  const known = descriptors.find((descriptor) => descriptor.mailbox === path);
+  const special = String(folders.find((folder) => folder.path === path)?.specialUse || '');
+  const role = known?.role
+    || SPECIAL_USE_ROLES[special]
+    || (path.toUpperCase() === 'INBOX' ? 'inbox' : folderForMailbox(path));
+  if (role === 'sent' || role === 'drafts') return null;
+  // A custom folder (Receipts, a Gmail label) is "filed away": Archive.
+  if (role === 'inbox' && path.toUpperCase() !== 'INBOX' && !known) return 'archive';
+  return role;
+}
+
+export function remoteOpDelayMs(attempt) {
+  const step = Math.max(0, Number(attempt) || 0);
+  return Math.min(REMOTE_OP_MAX_DELAY_MS, REMOTE_OP_BASE_DELAY_MS * (2 ** step));
+}
+
+/** Which server-visible parts of a message a state change touches. */
+export function remoteOpFields(state) {
+  const fields = [];
+  if (state?.isRead !== undefined) fields.push('read');
+  if (state?.isStarred !== undefined) fields.push('starred');
+  if (PLACEMENT_KEYS.some((key) => state?.[key] !== undefined)) fields.push('placement');
+  return fields;
+}
+
+/**
+ * Rebuild the state change for a retry from the message as it is now. A retry
+ * pushes the latest local state (archive then unarchive retries as "inbox"),
+ * so replaying a change is idempotent.
+ */
+export function remoteOpState(fields, message) {
+  const state = {};
+  if (fields.includes('read')) state.isRead = Boolean(message.isRead);
+  if (fields.includes('starred')) state.isStarred = Boolean(message.isStarred);
+  if (fields.includes('placement')) state.isArchived = Boolean(message.isArchived);
+  return state;
+}
+
 /**
  * Where the server copy should live after a placement change. The server
  * follows the message's resulting local placement, so undoing an archive,
@@ -1271,10 +1346,14 @@ export function createMailService({
         const existing = uid ? repos.messages.findByUid?.(account.id, mailbox, uid) : null;
         if (!existing?.id || typeof repos.messages.setState !== 'function') continue;
         const flags = new Set(setValues(message.flags));
-        repos.messages.setState(existing.id, {
-          isRead: flags.has('\\Seen'),
-          isStarred: flags.has('\\Flagged'),
-        });
+        // A read or star the server hasn't confirmed yet (retry queue) is the
+        // newer value; taking the server's would undo it and the retry with it.
+        const owed = repos.remoteOps?.get?.(existing.id)?.fields || [];
+        const incoming = {
+          ...(owed.includes('read') ? {} : { isRead: flags.has('\\Seen') }),
+          ...(owed.includes('starred') ? {} : { isStarred: flags.has('\\Flagged') }),
+        };
+        if (Object.keys(incoming).length) repos.messages.setState(existing.id, incoming);
         await yieldEventLoop();
       }
     }
@@ -1710,6 +1789,13 @@ export function createMailService({
           }
         }
       }
+      // The session just proved it can log in and talk to the server: the
+      // cheapest moment to push changes that failed earlier.
+      if (!singleMailbox) {
+        assertAccountGeneration(accountId, generation);
+        await retryRemoteOps(accountId);
+        await reconcileRemotePresence({ account, client, folders, descriptors, results: mailboxes, generation });
+      }
       const imported = mailboxes.reduce((sum, item) => sum + (item.imported || 0), 0);
       const skipped = mailboxes.reduce((sum, item) => sum + (item.skipped || 0), 0);
       const remaining = mailboxes.reduce((sum, item) => sum + (item.remaining || 0), 0);
@@ -1740,6 +1826,143 @@ export function createMailService({
     } finally {
       if (imapPool.get(account.id) === entry) releasePooledClient(account.id);
     }
+  }
+
+
+  /**
+   * Notice mail another client moved or deleted. For each synced inbox,
+   * archive, trash and spam mailbox (at most every RECONCILE_INTERVAL_MS),
+   * compare the server's UID list with the local rows. Missing rows are
+   * marked first; on a later pass they are looked up by Message-ID in the
+   * account's other folders and moved there locally. A message gone from the
+   * inbox and found nowhere is archived locally, never deleted. Never throws.
+   */
+  async function reconcileRemotePresence({ account, client, folders, descriptors, results, generation, force = false }) {
+    const summary = { checked: 0, marked: 0, cleared: 0, moved: 0, archived: 0, held: 0 };
+    if (!repos.messages.presence || typeof client.search !== 'function') return summary;
+    const started = Date.now();
+    const intervalMs = Number.isFinite(config.reconcileIntervalMs) ? config.reconcileIntervalMs : RECONCILE_INTERVAL_MS;
+    const confirmMs = Number.isFinite(config.reconcileConfirmMs) ? config.reconcileConfirmMs : RECONCILE_CONFIRM_MS;
+    const pendingFor = (id) => {
+      try { return repos.remoteOps?.get?.(id) || null; } catch { return null; }
+    };
+    const resolved = [];
+    for (const descriptor of descriptors) {
+      if (!RECONCILE_ROLES.has(descriptor.role)) continue;
+      if (Date.now() - started > RECONCILE_BUDGET_MS) break;
+      const result = results.find((item) => item.mailbox === descriptor.mailbox);
+      if (!result || result.status === 'failed' || result.uidValidityChanged) continue;
+      const previous = repos.sync.get(account.id, descriptor.mailbox);
+      if (!previous?.uid_validity) continue;
+      const lastChecked = Date.parse(previous.reconciled_at || '') || 0;
+      if (!force && Date.now() - lastChecked < intervalMs) continue;
+      const rows = repos.messages.presence(account.id, descriptor.mailbox)
+        .filter((row) => row.uid <= Number(previous.last_uid || 0));
+      let lock;
+      let present;
+      let exists = null;
+      try {
+        assertAccountGeneration(account.id, generation);
+        if (!rows.length) {
+          repos.sync.markReconciled?.(account.id, descriptor.mailbox);
+          continue;
+        }
+        lock = await client.getMailboxLock(descriptor.mailbox, { readOnly: true });
+        if (Number(client.mailbox?.uidValidity) !== Number(previous.uid_validity)) continue;
+        exists = Number.isSafeInteger(Number(client.mailbox?.exists)) ? Number(client.mailbox.exists) : null;
+        present = await client.search({ all: true }, { uid: true });
+      } catch (error) {
+        logger.warn({ accountId: account.id, mailbox: descriptor.mailbox, err: cleanupError(error) }, 'Could not list server UIDs to check for moved mail');
+        continue;
+      } finally {
+        lock?.release();
+      }
+      // A listing that disagrees with the mailbox's own count is not a
+      // snapshot we can trust to say what is gone.
+      if (!Array.isArray(present) || (exists !== null && present.length !== exists)) continue;
+      summary.checked += 1;
+      const live = new Set(present.map(Number));
+      const back = rows.filter((row) => row.missingSince && live.has(row.uid)).map((row) => row.id);
+      if (back.length) summary.cleared += repos.messages.clearRemoteMissing(back);
+      const missing = rows.filter((row) => !live.has(row.uid));
+      if (missing.length >= RECONCILE_MASS_MIN && missing.length >= rows.length * RECONCILE_MASS_SHARE) {
+        summary.held += missing.length;
+        logger.warn({ accountId: account.id, mailbox: descriptor.mailbox, missing: missing.length, local: rows.length },
+          'Most of this mailbox vanished from the server at once; not changing local mail');
+        repos.sync.markReconciled?.(account.id, descriptor.mailbox);
+        continue;
+      }
+      // A change aMail still owes the server explains the difference; the
+      // retry queue settles it.
+      const eligible = missing.filter((row) => !pendingFor(row.id));
+      const fresh = eligible.filter((row) => !row.missingSince).map((row) => row.id);
+      if (fresh.length) summary.marked += repos.messages.markRemoteMissing(fresh);
+      const confirmedBefore = Date.now() - confirmMs;
+      for (const row of eligible) {
+        if (row.missingSince && Date.parse(row.missingSince) <= confirmedBefore && resolved.length < RECONCILE_MAX_RESOLVE) {
+          resolved.push({ ...row, source: descriptor });
+        }
+      }
+      repos.sync.markReconciled?.(account.id, descriptor.mailbox);
+    }
+    if (!resolved.length) return summary;
+
+    // Look the confirmed ones up by Message-ID: special-use folders first,
+    // then other selectable folders, never Sent or Drafts.
+    const found = new Map();
+    const candidates = discoverSearchMailboxes(folders)
+      .filter((item) => item.role !== 'sent' && item.role !== 'drafts')
+      .slice(0, RECONCILE_MAX_FOLDERS);
+    const lookup = resolved.filter((row) => row.messageId);
+    for (const candidate of candidates) {
+      if (Date.now() - started > RECONCILE_BUDGET_MS) break;
+      const wanted = lookup.filter((row) => !found.has(row.id) && row.source.mailbox !== candidate.mailbox);
+      if (!wanted.length) continue;
+      let lock;
+      try {
+        assertAccountGeneration(account.id, generation);
+        lock = await client.getMailboxLock(candidate.mailbox, { readOnly: true });
+        for (let index = 0; index < wanted.length; index += RECONCILE_SEARCH_BATCH) {
+          const batch = wanted.slice(index, index + RECONCILE_SEARCH_BATCH);
+          const clauses = batch.map((row) => ({ header: { 'message-id': row.messageId } }));
+          const uids = await client.search(clauses.length === 1 ? clauses[0] : { or: clauses }, { uid: true });
+          if (!Array.isArray(uids) || !uids.length) continue;
+          const byMessageId = new Map();
+          for await (const message of client.fetch(uids.map(Number).join(','), { uid: true, envelope: true }, { uid: true })) {
+            const id = normalizeMessageIds(message.envelope?.messageId)[0] || null;
+            // Two server copies with one Message-ID is ambiguous: leave it.
+            if (id) byMessageId.set(id, byMessageId.has(id) ? null : Number(message.uid));
+          }
+          for (const row of batch) {
+            const uid = byMessageId.get(normalizeMessageIds(row.messageId)[0] || row.messageId);
+            if (Number.isSafeInteger(uid) && uid > 0) found.set(row.id, { mailbox: candidate.mailbox, uid });
+          }
+        }
+      } catch (error) {
+        logger.warn({ accountId: account.id, mailbox: candidate.mailbox, err: cleanupError(error) }, 'Could not search a folder for moved mail');
+      } finally {
+        lock?.release();
+      }
+    }
+
+    for (const row of resolved) {
+      try {
+        const destination = found.get(row.id);
+        if (destination) {
+          const role = reconcileRole(destination.mailbox, folders, descriptors);
+          if (!role) continue;
+          if (repos.messages.applyRemoteMove(row.id, { ...destination, role })) summary.moved += 1;
+        } else if (row.source.role === 'inbox') {
+          if (repos.messages.goneFromInbox(row.id, { mailbox: row.source.mailbox, uid: row.uid })) summary.archived += 1;
+        }
+        // Gone from archive, trash or spam and found nowhere: purged or filed
+        // somewhere we can't see. The mark is all we keep; placement stays.
+      } catch (error) {
+        logger.warn({ accountId: account.id, messageId: row.id, err: cleanupError(error) }, 'Could not apply a remote move locally');
+      }
+    }
+    logger.info({ accountId: account.id, ...summary }, 'Reconciled mail moved or deleted by other clients');
+    return summary;
   }
 
   const accountInFlight = new Map();
@@ -2092,6 +2315,14 @@ export function createMailService({
     }
   }
 
+  function remoteChangeCounts() {
+    try {
+      return repos.remoteOps?.counts?.() || { pending: 0, stuck: 0 };
+    } catch {
+      return { pending: 0, stuck: 0 };
+    }
+  }
+
   function runtimeStatus() {
     const started = [];
     if (inFlightSync?.startedAt) started.push(inFlightSync.startedAt);
@@ -2109,6 +2340,7 @@ export function createMailService({
       coolingDown: accountCooldown.size,
       probesQueued: probeWaiters.length,
       ingestWorker: ingest.live,
+      remoteChanges: remoteChangeCounts(),
     };
   }
 
@@ -2997,24 +3229,22 @@ export function createMailService({
     const client = entry.client;
     let lock;
     const action = remotePlacement(state, message);
+    const flagChange = state.isRead !== undefined || state.isStarred !== undefined;
     try {
       let destination = null;
       let folders = [];
+      let skipped = null;
       if (action) {
         folders = await pooledList(entry);
         destination = specialUseDestination(folders, action);
         if (!destination) {
-          return {
-            message,
-            remoteSync: { attempted: false, status: 'skipped', action, reason: 'special-use-mailbox-not-found' },
-          };
+          skipped = { attempted: false, status: 'skipped', action, reason: 'special-use-mailbox-not-found' };
+        } else if (destination === message.mailbox) {
+          skipped = { attempted: false, status: 'skipped', action, reason: 'already-in-destination', destination };
         }
-        if (destination === message.mailbox) {
-          return {
-            message,
-            remoteSync: { attempted: false, status: 'skipped', action, reason: 'already-in-destination', destination },
-          };
-        }
+        // No move to make, but a read or star riding along (a retried change
+        // merged with this one) still has to reach the server.
+        if (skipped && !flagChange) return { message, remoteSync: skipped };
       }
       lock = await client.getMailboxLock(message.mailbox || 'INBOX');
       if (state.isRead !== undefined) {
@@ -3025,8 +3255,11 @@ export function createMailService({
         const method = state.isStarred ? 'messageFlagsAdd' : 'messageFlagsRemove';
         await client[method](message.uid, ['\\Flagged'], { uid: true });
       }
-      if (!action) {
-        return { message, remoteSync: { attempted: true, status: 'synced', action: 'flags' } };
+      if (!action || skipped) {
+        return {
+          message,
+          remoteSync: { attempted: true, status: 'synced', action: 'flags', ...(skipped ? { placement: skipped.reason } : {}) },
+        };
       }
       // A message can't leave an "All Mail" folder (Gmail): it is a view of
       // every message. Restoring it to the inbox is a COPY, which on Gmail
@@ -3313,6 +3546,22 @@ export function createMailService({
     return queued;
   }
 
+  function queueRemoteOp(message, fields, error) {
+    if (!repos.remoteOps?.enqueue || !fields.length) return null;
+    try {
+      return repos.remoteOps.enqueue({
+        messageId: message.id,
+        accountId: message.accountId,
+        fields,
+        nextAttemptAt: new Date(Date.now() + remoteOpDelayMs(0)).toISOString(),
+        error: cleanupError(error),
+      });
+    } catch (queueError) {
+      logger.warn({ messageId: message.id, err: cleanupError(queueError) }, 'Could not queue a failed server change for retry');
+      return null;
+    }
+  }
+
   async function updateMessageState(id, state) {
     const existing = repos.messages.get(id);
     if (!existing) throw new NotFoundError('Message not found.');
@@ -3327,18 +3576,75 @@ export function createMailService({
     if (state.isAnalyzed === true && !existing.isAnalyzed && updated?.isAnalyzed) {
       metering?.recordAnalyzed?.(1);
     }
-    // Mail mutations are intentionally best-effort so offline local state stays
-    // usable. The API response says whether IMAP accepted, skipped, or failed it.
+    // A change for this message that failed earlier rides along, so the server
+    // catches up with everything still owed for it in one round trip.
+    const fields = remoteOpFields(state);
+    const pending = fields.length && state.snoozedUntil === undefined ? repos.remoteOps?.get?.(id) : null;
+    const attempt = pending ? { ...remoteOpState(pending.fields, updated), ...state } : state;
+    // Local state stays usable offline. The API response says whether IMAP
+    // accepted, skipped, or failed it; a failure is queued and retried.
     try {
-      const { message, remoteSync } = await syncMessageStateToImap(updated, state);
+      const { message, remoteSync } = await syncMessageStateToImap(updated, attempt);
+      if (pending) repos.remoteOps.complete(id, pending.revision);
       return { ...message, remoteSync };
     } catch (error) {
       logger.warn({ messageId: id, err: cleanupError(error) }, 'Could not synchronize message mutation to IMAP');
+      const queued = queueRemoteOp(updated, remoteOpFields(attempt), error);
       return {
         ...updated,
-        remoteSync: { attempted: true, status: 'failed', reason: 'imap-operation-failed' },
+        remoteSync: queued
+          ? { attempted: true, status: 'queued', reason: 'imap-operation-failed', retryAt: queued.nextAttemptAt }
+          : { attempted: true, status: 'failed', reason: 'imap-operation-failed' },
       };
     }
+  }
+
+  /**
+   * Push queued server changes for one account. Runs after that account's
+   * sync, one change at a time, and never throws: a failure only reschedules.
+   */
+  async function retryRemoteOps(accountId, { limit = REMOTE_OP_RETRY_BATCH } = {}) {
+    const summary = { attempted: 0, synced: 0, failed: 0, stuck: 0 };
+    if (!repos.remoteOps?.due) return summary;
+    try {
+      assertImapWritesAllowed(accountId);
+    } catch {
+      return summary;
+    }
+    let due;
+    try {
+      due = repos.remoteOps.due(accountId, { limit });
+    } catch (error) {
+      logger.warn({ accountId, err: cleanupError(error) }, 'Could not read queued server changes');
+      return summary;
+    }
+    for (const op of due) {
+      const message = repos.messages.get(op.messageId);
+      if (!message) continue;
+      summary.attempted += 1;
+      try {
+        await syncMessageStateToImap(message, remoteOpState(op.fields, message));
+        repos.remoteOps.complete(op.messageId, op.revision);
+        summary.synced += 1;
+      } catch (error) {
+        const attempts = op.attempts + 1;
+        const stuck = attempts >= REMOTE_OP_MAX_ATTEMPTS;
+        repos.remoteOps.recordFailure({
+          messageId: op.messageId,
+          revision: op.revision,
+          nextAttemptAt: new Date(Date.now() + remoteOpDelayMs(attempts)).toISOString(),
+          error: cleanupError(error),
+          stuck,
+        });
+        summary.failed += 1;
+        if (stuck) {
+          summary.stuck += 1;
+          logger.warn({ accountId, messageId: op.messageId, attempts, err: cleanupError(error) }, 'Server change is stuck after repeated retries');
+        }
+      }
+    }
+    if (summary.attempted) logger.info({ accountId, ...summary }, 'Retried queued server changes');
+    return summary;
   }
 
   return {
@@ -3357,6 +3663,7 @@ export function createMailService({
     saveDraft,
     migrateLocalDrafts,
     updateMessageState,
+    retryRemoteOps,
     fetchAttachment,
     hydrateMessageSource,
     searchAndMaterialize,
