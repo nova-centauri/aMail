@@ -30,7 +30,7 @@ function raw(id, subject = 'Quote follow-up') {
   ].join('\r\n');
 }
 
-async function harness(t) {
+async function harness(t, { condstore = false } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-remote-ops-'));
   const config = {
     dataDir,
@@ -42,7 +42,7 @@ async function harness(t) {
   };
   const db = createDatabase(config);
   const repos = createRepositories(db);
-  const server = createFakeImapServer({ folders });
+  const server = createFakeImapServer({ folders, condstore });
   const service = createMailService({
     config,
     repos,
@@ -226,6 +226,69 @@ test('completing a retry never drops a newer failure for the same message', asyn
   assert.equal(h.repos.remoteOps.complete(message.id, first.revision), false);
   assert.deepEqual(h.repos.remoteOps.get(message.id).fields, ['read', 'placement']);
   assert.equal(h.repos.remoteOps.complete(message.id, second.revision), true);
+});
+
+test('an undo that needs no server move still pushes a star that was owed', async (t) => {
+  const h = await harness(t);
+  const message = await importedInboxMessage(h);
+
+  h.imap.failures.move = new Error('timeout');
+  h.imap.failures.flags = new Error('timeout');
+  await h.service.updateMessageState(message.id, { isArchived: true });
+  await h.service.updateMessageState(message.id, { isStarred: true });
+  assert.deepEqual(h.repos.remoteOps.get(message.id).fields, ['starred', 'placement']);
+  h.imap.failures.move = null;
+  h.imap.failures.flags = null;
+
+  // The server copy never left the inbox, so the undo needs no move, but the
+  // star it carries still has to reach the server.
+  await h.service.updateMessageState(message.id, { isArchived: false });
+
+  assert.ok(h.imap.messages('INBOX')[0].flags.includes('\\Flagged'));
+  assert.equal(h.repos.remoteOps.get(message.id), null);
+});
+
+test('a flag change from another client does not overwrite one aMail still owes', async (t) => {
+  const h = await harness(t, { condstore: true });
+  const message = await importedInboxMessage(h);
+
+  h.imap.failures.flags = new Error('NO server busy');
+  await h.service.updateMessageState(message.id, { isStarred: true });
+  h.imap.failures.flags = null;
+  // Meanwhile the phone marks it read; the server still has no star.
+  const [{ uid }] = h.imap.messages('INBOX');
+  h.imap.mailboxes.get('INBOX').messages.get(uid).flags.add('\\Seen');
+  h.imap.modseq += 1;
+
+  await h.service.syncAccount(h.account.id);
+  const local = h.repos.messages.get(message.id);
+  assert.equal(local.isRead, true, 'the read from the phone arrives');
+  assert.equal(local.isStarred, true, 'the owed star is kept');
+
+  makeDue(h.db);
+  await h.service.retryRemoteOps(h.account.id);
+  const flags = h.imap.messages('INBOX')[0].flags;
+  assert.ok(flags.includes('\\Flagged'));
+  assert.ok(flags.includes('\\Seen'));
+  assert.equal(h.repos.remoteOps.get(message.id), null);
+});
+
+test('re-importing a message keeps the read, star and folder aMail still owes', async (t) => {
+  const h = await harness(t);
+  const message = await importedInboxMessage(h);
+
+  h.imap.failures.move = new Error('timeout');
+  h.imap.failures.flags = new Error('timeout');
+  await h.service.updateMessageState(message.id, { isArchived: true });
+  await h.service.updateMessageState(message.id, { isRead: true });
+  h.imap.failures.move = null;
+  h.imap.failures.flags = null;
+  // A full resync downloads the inbox copy again.
+  await h.service.syncAccount(h.account.id, { mode: 'full' });
+
+  const local = h.repos.messages.get(message.id);
+  assert.equal(local.isArchived, true);
+  assert.equal(local.isRead, true);
 });
 
 test('retry backoff doubles and caps at an hour', () => {

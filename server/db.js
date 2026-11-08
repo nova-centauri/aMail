@@ -654,12 +654,17 @@ function ensureRemoteOps(db) {
 
 export const REMOTE_OP_FIELDS = ['read', 'starred', 'placement'];
 
+function remoteOpFields(fieldsJson) {
+  const fields = json(fieldsJson);
+  return Array.isArray(fields) ? fields.filter((field) => REMOTE_OP_FIELDS.includes(field)) : [];
+}
+
 function publicRemoteOp(row) {
   if (!row) return null;
   return {
     messageId: row.message_id,
     accountId: row.account_id,
-    fields: json(row.fields_json).filter((field) => REMOTE_OP_FIELDS.includes(field)),
+    fields: remoteOpFields(row.fields_json),
     status: row.status,
     attempts: Number(row.attempts) || 0,
     nextAttemptAt: row.next_attempt_at,
@@ -1288,6 +1293,8 @@ export function createRepositories(db) {
       next_attempt_at = @next_attempt_at, last_error = @last_error, updated_at = @now
       WHERE message_id = @message_id AND revision = @revision`),
     remoteOpComplete: db.prepare('DELETE FROM remote_ops WHERE message_id = ? AND revision = ?'),
+    remoteOpReassign: db.prepare(`UPDATE remote_ops SET message_id = @to, revision = revision + 1, updated_at = @now
+      WHERE message_id = @from`),
     remoteOpDue: db.prepare(`SELECT * FROM remote_ops
       WHERE account_id = @accountId AND status = 'pending' AND next_attempt_at <= @now
       ORDER BY next_attempt_at ASC, message_id ASC LIMIT @limit`),
@@ -1398,7 +1405,19 @@ export function createRepositories(db) {
     return publicMessage(queries.messageById.get(row.id));
   };
 
-  const updateMessageRow = (existing, row) => {
+  const updateMessageRow = (existing, input) => {
+    // Fields still waiting in the retry queue keep their local value: the
+    // server copy being re-imported predates the change aMail owes it.
+    const owed = queries.remoteOpGet.get(existing.id);
+    const fields = owed ? remoteOpFields(owed.fields_json) : [];
+    const row = { ...input };
+    if (fields.includes('read')) row.is_read = existing.is_read;
+    if (fields.includes('starred')) row.is_starred = existing.is_starred;
+    if (fields.includes('placement')) {
+      row.is_archived = existing.is_archived;
+      row.is_trashed = existing.is_trashed;
+      row.is_spam = existing.is_spam;
+    }
     queries.messageUpdate.run(row);
     const threads = existing.thread_id === row.thread_id
       ? [existing.thread_id]
@@ -1829,6 +1848,22 @@ export function createRepositories(db) {
         const occupant = queries.messageByUid.get(row.account_id, mailbox, uid);
         const copy = occupant && occupant.id !== id ? occupant : null;
         if (copy) {
+          // A change still owed for the copy follows it to the surviving row,
+          // which takes the copy's UID; deleting the copy would cascade it away.
+          const copyOp = queries.remoteOpGet.get(copy.id);
+          if (copyOp) {
+            const ownOp = queries.remoteOpGet.get(id);
+            if (ownOp) {
+              const merged = REMOTE_OP_FIELDS.filter((field) => remoteOpFields(ownOp.fields_json).includes(field)
+                || remoteOpFields(copyOp.fields_json).includes(field));
+              queries.remoteOpMerge.run({
+                message_id: id, fields_json: JSON.stringify(merged), next_attempt_at: copyOp.next_attempt_at,
+                last_error: copyOp.last_error, now: now(),
+              });
+            } else {
+              queries.remoteOpReassign.run({ from: copy.id, to: id, now: now() });
+            }
+          }
           queries.messageDelete.run(copy.id);
           if (copy.thread_id !== row.thread_id && !recomputeThread(copy.thread_id)) queries.threadDelete.run(copy.thread_id);
         }

@@ -111,6 +111,28 @@ test('mail archived in another client leaves the inbox, keeping its id and analy
   assert.deepEqual(h.inbox().map((message) => message.id), []);
 });
 
+test('a change still owed on the destination copy survives the merge', async (t) => {
+  const h = harness(t);
+  const { uid, row } = await seedAndImport(h, 'o1');
+
+  h.imap.place('Archive', h.imap.expunge('INBOX', uid));
+  await h.service.syncAccount(h.account.id);
+  const copy = h.archive().find((message) => message.messageId === row.messageId && message.id !== row.id);
+  assert.ok(copy, 'the Archive copy arrived as its own row');
+  h.repos.messages.setState(copy.id, { isStarred: true });
+  h.repos.remoteOps.enqueue({
+    messageId: copy.id, accountId: h.account.id, fields: ['starred'], nextAttemptAt: '2999-01-01T00:00:00.000Z',
+  });
+
+  await h.service.syncAccount(h.account.id);
+
+  assert.equal(h.repos.messages.get(copy.id), null, 'merged into the original row');
+  const owed = h.repos.remoteOps.get(row.id);
+  assert.ok(owed, 'the owed star moved to the surviving row');
+  assert.deepEqual(owed.fields, ['starred']);
+  assert.equal(h.repos.messages.get(row.id).isStarred, true);
+});
+
 test('Gmail: archived on the web, the inbox row follows the message to All Mail', async (t) => {
   const h = harness(t, { folders: gmailFolders });
   const source = raw('g1');

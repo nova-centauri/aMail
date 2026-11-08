@@ -1346,10 +1346,14 @@ export function createMailService({
         const existing = uid ? repos.messages.findByUid?.(account.id, mailbox, uid) : null;
         if (!existing?.id || typeof repos.messages.setState !== 'function') continue;
         const flags = new Set(setValues(message.flags));
-        repos.messages.setState(existing.id, {
-          isRead: flags.has('\\Seen'),
-          isStarred: flags.has('\\Flagged'),
-        });
+        // A read or star the server hasn't confirmed yet (retry queue) is the
+        // newer value; taking the server's would undo it and the retry with it.
+        const owed = repos.remoteOps?.get?.(existing.id)?.fields || [];
+        const incoming = {
+          ...(owed.includes('read') ? {} : { isRead: flags.has('\\Seen') }),
+          ...(owed.includes('starred') ? {} : { isStarred: flags.has('\\Flagged') }),
+        };
+        if (Object.keys(incoming).length) repos.messages.setState(existing.id, incoming);
         await yieldEventLoop();
       }
     }
@@ -3225,24 +3229,22 @@ export function createMailService({
     const client = entry.client;
     let lock;
     const action = remotePlacement(state, message);
+    const flagChange = state.isRead !== undefined || state.isStarred !== undefined;
     try {
       let destination = null;
       let folders = [];
+      let skipped = null;
       if (action) {
         folders = await pooledList(entry);
         destination = specialUseDestination(folders, action);
         if (!destination) {
-          return {
-            message,
-            remoteSync: { attempted: false, status: 'skipped', action, reason: 'special-use-mailbox-not-found' },
-          };
+          skipped = { attempted: false, status: 'skipped', action, reason: 'special-use-mailbox-not-found' };
+        } else if (destination === message.mailbox) {
+          skipped = { attempted: false, status: 'skipped', action, reason: 'already-in-destination', destination };
         }
-        if (destination === message.mailbox) {
-          return {
-            message,
-            remoteSync: { attempted: false, status: 'skipped', action, reason: 'already-in-destination', destination },
-          };
-        }
+        // No move to make, but a read or star riding along (a retried change
+        // merged with this one) still has to reach the server.
+        if (skipped && !flagChange) return { message, remoteSync: skipped };
       }
       lock = await client.getMailboxLock(message.mailbox || 'INBOX');
       if (state.isRead !== undefined) {
@@ -3253,8 +3255,11 @@ export function createMailService({
         const method = state.isStarred ? 'messageFlagsAdd' : 'messageFlagsRemove';
         await client[method](message.uid, ['\\Flagged'], { uid: true });
       }
-      if (!action) {
-        return { message, remoteSync: { attempted: true, status: 'synced', action: 'flags' } };
+      if (!action || skipped) {
+        return {
+          message,
+          remoteSync: { attempted: true, status: 'synced', action: 'flags', ...(skipped ? { placement: skipped.reason } : {}) },
+        };
       }
       // A message can't leave an "All Mail" folder (Gmail): it is a view of
       // every message. Restoring it to the inbox is a COPY, which on Gmail
