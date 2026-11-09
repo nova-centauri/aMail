@@ -252,6 +252,22 @@ test('a server that never finishes is cut off at the timeout', async (t) => {
   );
 });
 
+test('a discarded error response that never ends is closed, not drained', async (t) => {
+  let closed = false;
+  const { port } = await localHost(t, (request, response) => {
+    response.writeHead(413, { 'content-type': 'application/octet-stream' });
+    const timer = setInterval(() => response.write(Buffer.alloc(1024)), 5);
+    request.socket.on('close', () => { closed = true; clearInterval(timer); });
+  });
+  const { fetcher } = fetcherFor(port, { timeoutMs: 2_000 });
+  await assert.rejects(
+    fetcher.fetchAttachment({ url: 'https://files.example.test/endless' }),
+    (error) => error.code === 'ATTACHMENT_URL_HTTP_ERROR',
+  );
+  for (let i = 0; i < 50 && !closed; i += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(closed, true, 'the connection is dropped right away');
+});
+
 test('resolveAttachmentReferences downloads url items and passes others through', async () => {
   const calls = [];
   const fetcher = {

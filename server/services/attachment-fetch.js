@@ -238,13 +238,19 @@ export function createDraftAttachmentFetcher({
         },
       }, (response) => {
         const status = response.statusCode || 0;
+        // Discarded responses are closed, not drained: draining would keep
+        // reading an endless body after the deadline was cleared.
+        const discard = () => {
+          response.destroy();
+          req.destroy();
+        };
         if (REDIRECT_STATUSES.has(status)) {
-          response.resume();
           finish(resolve, { redirect: response.headers.location });
+          discard();
           return;
         }
         if (status < 200 || status >= 300) {
-          response.resume();
+          discard();
           finish(reject, fetchError(
             `${url.hostname} answered HTTP ${status} for the attachment.`,
             'ATTACHMENT_URL_HTTP_ERROR',
@@ -254,7 +260,7 @@ export function createDraftAttachmentFetcher({
         }
         const declared = Number.parseInt(response.headers['content-length'], 10);
         if (Number.isFinite(declared) && declared > maxBytes) {
-          response.resume();
+          discard();
           finish(reject, tooLarge());
           return;
         }

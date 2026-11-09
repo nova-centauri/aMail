@@ -699,3 +699,24 @@ test('URL attachments are refused with a clear error when the server has no allo
   );
   assert.equal(server.appends.length, 0);
 });
+
+test('too many files are refused before any URL is downloaded', async (t) => {
+  const fetcher = fakeFetcher({});
+  const { service, server, account } = harness(t, { attachmentFetcher: fetcher });
+  const first = await service.saveDraft({
+    accountId: account.id,
+    subject: 'Quote',
+    attachments: [{ filename: 'a.txt', content: Buffer.from('a').toString('base64') }],
+  });
+  const urls = Array.from({ length: 8 }, (_, i) => ({ url: `https://files.example.test/${i}.pdf` }));
+  await assert.rejects(
+    service.saveDraft({ addAttachments: urls }, first.draft.id),
+    (error) => error.code === 'VALIDATION_ERROR' && /at most 8 files/.test(error.message),
+  );
+  await assert.rejects(
+    service.saveDraft({ accountId: account.id, attachments: [...urls, { url: 'https://files.example.test/9.pdf' }] }),
+    (error) => error.code === 'VALIDATION_ERROR',
+  );
+  assert.deepEqual(fetcher.calls, []);
+  assert.equal(server.appends.length, 1);
+});

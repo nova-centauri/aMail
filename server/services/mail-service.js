@@ -26,6 +26,7 @@ import { createDraftAttachmentFetcher, resolveAttachmentReferences } from './att
 import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
+  MAX_COMPOSE_ATTACHMENT_COUNT,
   mailerAttachments,
   mergeDraftAttachments,
   normalizeComposeAttachments,
@@ -2908,6 +2909,12 @@ export function createMailService({
     // download does not hold up other saves on the account.
     const firstPlan = prepareDraft(repos, withoutUrlAttachments(input), draftId);
     assertImapWritesAllowed(firstPlan.accountId);
+    // Check the file count with the URLs included before downloading any.
+    const urlCount = ['attachments', 'addAttachments']
+      .reduce((sum, key) => sum + (Array.isArray(input?.[key]) ? input[key].filter((item) => item?.url).length : 0), 0);
+    if (urlCount && firstPlan.attachments.length + urlCount > MAX_COMPOSE_ATTACHMENT_COUNT) {
+      throw new ValidationError(`Attach at most ${MAX_COMPOSE_ATTACHMENT_COUNT} files.`);
+    }
     const resolved = await resolveAttachmentReferences(input, draftAttachmentFetcher);
     return withDraftLock(firstPlan.accountId, () => saveDraftLocked(resolved, draftId));
   }
