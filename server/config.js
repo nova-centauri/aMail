@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DEFAULT_LOG_LEVEL, normalizeLogLevel } from './logging.js';
 import { deriveSubkey } from './services/crypto.js';
+import { parseAuthHeaders, parseHostAllowlist } from './services/attachment-fetch.js';
 
 export const APP_NAME = 'aMail';
 export const DATABASE_KEY_INFO = 'amail/database-key/v1';
@@ -187,6 +188,16 @@ export function loadConfig(env = process.env) {
     // as an explicit non-production development escape hatch.
     allowDirectRemoteContent: (env.NODE_ENV || 'development') !== 'production'
       && boolean(readEnv(env, 'ALLOW_DIRECT_REMOTE_CONTENT')),
+    // Attach-by-URL for drafts (save_draft `url` attachments). Off until the
+    // operator lists hosts; https only, public addresses only. See
+    // docs/drafts.md, "Attaching files by URL".
+    draftAttachmentUrlHosts: parseHostAllowlist(readEnv(env, 'DRAFT_ATTACHMENT_URL_HOSTS')),
+    // JSON {"host": {"Header": "value"}}; null when the value is not valid JSON.
+    draftAttachmentUrlAuth: parseAuthHeaders(readEnv(env, 'DRAFT_ATTACHMENT_URL_AUTH')),
+    draftAttachmentFetchTimeoutMs: integer(readEnv(env, 'DRAFT_ATTACHMENT_FETCH_TIMEOUT_MS'), 20_000, {
+      min: 1_000,
+      max: 120_000,
+    }),
     // `error` is the hosted profile: failures only, no per-request entries.
     logLevel: normalizeLogLevel(env.LOG_LEVEL, keyslotMode ? 'error' : DEFAULT_LOG_LEVEL),
     // Hosted-only usage metering. Unset means no-op: nothing is buffered or

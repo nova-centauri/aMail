@@ -579,6 +579,16 @@ test('drafts saved through MCP and REST land in the account server Drafts folder
   const patched = await rest(`/drafts/${draft.id}`, { method: 'PATCH', body: JSON.stringify({ subject: 'Edited in the UI' }) });
   assert.equal(patched.status, 200);
   assert.equal((await patched.json()).draft.textBody, 'Second version');
+  const added = await call({
+    draftId: draft.id,
+    addAttachments: [{ filename: 'extra.txt', contentType: 'text/plain', content: Buffer.from('extra').toString('base64') }],
+  });
+  const withExtra = JSON.parse(added.body.result.content[0].text).draft;
+  assert.deepEqual(withExtra.attachments.map((file) => file.filename), ['notes.txt', 'extra.txt'], 'addAttachments keeps the files already on the draft');
+  assert.equal(withExtra.textBody, 'Second version');
+  const byUrl = await call({ draftId: draft.id, addAttachments: [{ url: 'https://files.example.test/q.pdf' }] });
+  assert.equal(byUrl.body.result.isError, true);
+  assert.equal(JSON.parse(byUrl.body.result.content[0].text).error.code, 'ATTACHMENT_URLS_DISABLED', 'URL attachments are off without an allowlist');
   const cleared = await call({ draftId: draft.id, to: [], bcc: [], attachments: [], textBody: '', htmlBody: '' });
   const clearedDraft = JSON.parse(cleared.body.result.content[0].text).draft;
   assert.equal(clearedDraft.subject, 'Edited in the UI');

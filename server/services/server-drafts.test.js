@@ -11,7 +11,7 @@ import { createFakeImapServer } from './fake-imap.test-support.js';
 
 const credentialKey = Buffer.alloc(32, 9);
 
-function harness(t, { imap = {}, config = {}, provider = 'custom', email = 'owner@example.test' } = {}) {
+function harness(t, { imap = {}, config = {}, provider = 'custom', email = 'owner@example.test', attachmentFetcher = null } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-server-drafts-'));
   const fullConfig = {
     dataDir,
@@ -45,6 +45,7 @@ function harness(t, { imap = {}, config = {}, provider = 'custom', email = 'owne
       close() {},
     }),
     createMessageId: () => `<draft-${++counter}@example.test>`,
+    attachmentFetcher,
   });
   const account = repos.accounts.create({
     email, display_name: 'Owner', color: '#1a73e8', provider,
@@ -532,4 +533,190 @@ test('a draft saved while a Drafts sync runs keeps its id and is not duplicated'
   const drafts = repos.messages.listDrafts(account.id);
   assert.equal(drafts.length, 1);
   assert.equal(drafts[0].id, first.draft.id);
+});
+
+// A stand-in for the URL fetcher (its network rules are tested in
+// attachment-fetch.test.js). Records each URL it was asked for.
+function fakeFetcher(files = {}) {
+  const calls = [];
+  return {
+    calls,
+    enabled: true,
+    async fetchAttachment({ url, filename, contentType }) {
+      calls.push(url);
+      const file = files[url];
+      if (!file) {
+        const error = new Error('not reachable');
+        error.code = 'ATTACHMENT_URL_HTTP_ERROR';
+        error.status = 502;
+        error.expose = true;
+        throw error;
+      }
+      return {
+        filename: filename || file.filename,
+        contentType: contentType || file.contentType || 'application/pdf',
+        content: Buffer.from(file.body).toString('base64'),
+      };
+    },
+  };
+}
+
+test('a file named by URL is downloaded by the server and attached to a new draft', async (t) => {
+  const pdf = '%PDF-1.7 red hen quote';
+  const fetcher = fakeFetcher({ 'https://files.example.test/quotes/77.pdf': { filename: 'Quote 77.pdf', body: pdf } });
+  const { service, server, account } = harness(t, { attachmentFetcher: fetcher });
+
+  const saved = await service.saveDraft({
+    accountId: account.id,
+    to: ['buyer@example.test'],
+    subject: 'Your quote',
+    textBody: 'Quote attached.',
+    attachments: [{ url: 'https://files.example.test/quotes/77.pdf' }],
+  });
+
+  assert.deepEqual(fetcher.calls, ['https://files.example.test/quotes/77.pdf']);
+  assert.deepEqual(saved.draft.attachments.map((file) => [file.filename, file.contentType, file.size]), [
+    ['Quote 77.pdf', 'application/pdf', Buffer.byteLength(pdf)],
+  ]);
+  const [live] = server.messages('Drafts');
+  const parsed = await simpleParser(live.raw);
+  assert.equal(parsed.attachments.length, 1);
+  assert.equal(parsed.attachments[0].filename, 'Quote 77.pdf');
+  assert.equal(parsed.attachments[0].content.toString(), pdf);
+});
+
+test('addAttachments adds a file and keeps the draft\'s files, body and recipients', async (t) => {
+  const fetcher = fakeFetcher({ 'https://files.example.test/terms.pdf': { filename: 'terms.pdf', body: '%PDF-1.7 terms' } });
+  const { service, server, account } = harness(t, { attachmentFetcher: fetcher });
+  const first = await service.saveDraft({
+    accountId: account.id,
+    to: ['buyer@example.test'],
+    cc: ['sales@example.test'],
+    subject: 'Quote',
+    htmlBody: '<p>Edited <b>by Steve</b></p>',
+    attachments: [{ filename: 'quote.pdf', contentType: 'application/pdf', content: Buffer.from('%PDF-1.7 quote').toString('base64') }],
+  });
+
+  const second = await service.saveDraft({
+    addAttachments: [
+      { url: 'https://files.example.test/terms.pdf' },
+      { filename: 'note.txt', contentType: 'text/plain', content: Buffer.from('small note').toString('base64') },
+    ],
+  }, first.draft.id);
+
+  assert.equal(second.draft.id, first.draft.id);
+  assert.deepEqual(second.draft.attachments.map((file) => file.filename), ['quote.pdf', 'terms.pdf', 'note.txt']);
+  const live = server.messages('Drafts');
+  assert.equal(live.length, 1);
+  const parsed = await simpleParser(live[0].raw);
+  assert.deepEqual(
+    parsed.attachments.map((file) => [file.filename, file.content.toString()]),
+    [['quote.pdf', '%PDF-1.7 quote'], ['terms.pdf', '%PDF-1.7 terms'], ['note.txt', 'small note']],
+  );
+  assert.match(parsed.html, /Edited <b>by Steve<\/b>/);
+  assert.equal(parsed.to.text, 'buyer@example.test');
+  assert.equal(parsed.cc.text, 'sales@example.test');
+  assert.equal(parsed.subject, 'Quote');
+});
+
+test('addAttachments on a draft written in another client keeps its server-only file', async (t) => {
+  const fetcher = fakeFetcher({ 'https://files.example.test/q.pdf': { filename: 'q.pdf', body: '%PDF-1.7 q' } });
+  const { repos, service, server, account } = harness(t, { attachmentFetcher: fetcher });
+  const raw = [
+    'Message-ID: <gmail-draft@example.test>',
+    'From: owner@example.test',
+    'To: jim@example.test',
+    'Subject: Quote for Jim',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary="b"',
+    '',
+    '--b',
+    'Content-Type: text/plain',
+    '',
+    'Typed in Gmail',
+    '--b',
+    'Content-Type: text/plain; name="notes.txt"',
+    'Content-Disposition: attachment; filename="notes.txt"',
+    '',
+    'server-only bytes',
+    '--b--',
+    '',
+  ].join('\r\n');
+  const uid = server.seed('Drafts', raw, ['\\Draft']);
+  const thread = repos.threads.create({ account_id: account.id, subject: 'Quote for Jim', normalized_subject: 'quote for jim', latest_at: '2026-10-28T00:00:00.000Z' });
+  const imported = repos.messages.upsert({
+    account_id: account.id, thread_id: thread.id, mailbox: 'Drafts', uid,
+    rfc_message_id: '<gmail-draft@example.test>', in_reply_to: null, references_json: '[]',
+    subject: 'Quote for Jim', from_name: '', from_email: account.email,
+    to_json: JSON.stringify([{ name: '', email: 'jim@example.test' }]), cc_json: '[]', bcc_json: '[]', reply_to_json: null,
+    sent_at: '2026-10-28T00:00:00.000Z', received_at: '2026-10-28T00:00:00.000Z',
+    html_body: '', text_body: 'Typed in Gmail', snippet: 'Typed in Gmail',
+    attachments_json: JSON.stringify([{ index: 0, filename: 'notes.txt', contentType: 'text/plain', size: 17 }]),
+    labels_json: '[]', is_read: 1, is_starred: 0, is_archived: 0, is_trashed: 0, is_spam: 0,
+    snoozed_until: null, is_sent: 0, is_draft: 1,
+  });
+
+  await service.saveDraft({ addAttachments: [{ url: 'https://files.example.test/q.pdf' }] }, imported.id);
+
+  const live = server.messages('Drafts');
+  assert.equal(live.length, 1);
+  const parsed = await simpleParser(live[0].raw);
+  assert.deepEqual(
+    parsed.attachments.map((file) => [file.filename, file.content.toString()]),
+    [['notes.txt', 'server-only bytes'], ['q.pdf', '%PDF-1.7 q']],
+  );
+  assert.match(parsed.text, /Typed in Gmail/);
+});
+
+test('a URL that cannot be downloaded saves nothing; a bad draft id fails before any download', async (t) => {
+  const fetcher = fakeFetcher({});
+  const { service, server, account } = harness(t, { attachmentFetcher: fetcher });
+  const first = await service.saveDraft({ accountId: account.id, subject: 'Quote', textBody: 'v1' });
+
+  await assert.rejects(
+    service.saveDraft({ addAttachments: [{ url: 'https://files.example.test/missing.pdf' }] }, first.draft.id),
+    (error) => error.code === 'ATTACHMENT_URL_HTTP_ERROR',
+  );
+  assert.equal(server.appends.length, 1, 'only the first save reached the server');
+
+  fetcher.calls.length = 0;
+  await assert.rejects(
+    service.saveDraft({ addAttachments: [{ url: 'https://files.example.test/q.pdf' }] }, 'no-such-draft'),
+    (error) => error.code === 'NOT_FOUND',
+  );
+  await assert.rejects(
+    service.saveDraft({ addAttachments: [{ filename: 'empty.txt' }] }, first.draft.id),
+    (error) => error.code === 'VALIDATION_ERROR' && /needs content/.test(error.message),
+  );
+  assert.deepEqual(fetcher.calls, [], 'nothing is downloaded for a draft that does not exist');
+});
+
+test('URL attachments are refused with a clear error when the server has no allowlist', async (t) => {
+  const { service, server, account } = harness(t);
+  await assert.rejects(
+    service.saveDraft({ accountId: account.id, subject: 'Quote', attachments: [{ url: 'https://files.example.test/q.pdf' }] }),
+    (error) => error.code === 'ATTACHMENT_URLS_DISABLED' && /AMAIL_DRAFT_ATTACHMENT_URL_HOSTS/.test(error.message),
+  );
+  assert.equal(server.appends.length, 0);
+});
+
+test('too many files are refused before any URL is downloaded', async (t) => {
+  const fetcher = fakeFetcher({});
+  const { service, server, account } = harness(t, { attachmentFetcher: fetcher });
+  const first = await service.saveDraft({
+    accountId: account.id,
+    subject: 'Quote',
+    attachments: [{ filename: 'a.txt', content: Buffer.from('a').toString('base64') }],
+  });
+  const urls = Array.from({ length: 8 }, (_, i) => ({ url: `https://files.example.test/${i}.pdf` }));
+  await assert.rejects(
+    service.saveDraft({ addAttachments: urls }, first.draft.id),
+    (error) => error.code === 'VALIDATION_ERROR' && /at most 8 files/.test(error.message),
+  );
+  await assert.rejects(
+    service.saveDraft({ accountId: account.id, attachments: [...urls, { url: 'https://files.example.test/9.pdf' }] }),
+    (error) => error.code === 'VALIDATION_ERROR',
+  );
+  assert.deepEqual(fetcher.calls, []);
+  assert.equal(server.appends.length, 1);
 });

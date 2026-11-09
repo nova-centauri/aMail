@@ -108,6 +108,93 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
 The `drafts` table stays in the schema only so the migration can read it.
 Nothing writes to it any more.
 
+## Attaching files by URL (November 2026)
+
+Problem: `save_draft` took attachments only as inline base64. A 200 KB quote
+PDF is about 270,000 characters, too big to pass through an agent's tool call,
+so quote PDFs had to be attached to drafts by hand. A second gap: on an update,
+`attachments` replaced the whole list, so adding one file meant restating every
+file already on the draft, and forgetting one silently dropped it.
+
+What changed:
+
+1. **`{ url }` attachments.** Any item in `attachments` or `addAttachments`
+   may be `{ url, filename?, contentType? }` instead of `{ content }`. The
+   aMail server downloads the file (`server/services/attachment-fetch.js`)
+   and it then goes through the normal attachment path (8 files, 8 MiB).
+   Filename: the caller's, else the response's `Content-Disposition`, else the
+   last URL path segment.
+2. **`addAttachments`.** Appends files to the draft's current list. Files
+   already on the draft keep their bytes (from aMail's copy, or fetched from
+   the server copy for a draft written in Gmail or Apple Mail, as before), and
+   body, subject and recipients are kept because omitted fields always are.
+   `attachments` still means "the whole list" (`[]` removes all).
+3. **Order of work.** The draft, account and write policy are checked first,
+   then URLs are downloaded outside the per-account draft lock, then the save
+   runs as before. A failed download saves nothing.
+
+Network rules for the download (SSRF protection):
+
+- Off unless `AMAIL_DRAFT_ATTACHMENT_URL_HOSTS` lists hosts (comma-separated;
+  `*.example.com` matches subdomains, not `example.com`). IP literals are not
+  accepted as entries or as URL hosts.
+- https only, port 443 only, no `user:pass@`.
+- Every address the host resolves to must be public unicast: loopback,
+  RFC 1918, CGNAT, link-local (including 169.254.169.254 metadata), multicast,
+  reserved, documentation, ULA, NAT64 and 6to4 ranges are refused, IPv4-mapped
+  IPv6 included. The socket connects to the address that was checked, with no
+  second DNS lookup, so DNS rebinding cannot swap in an internal address.
+- At most 3 redirects; each hop must pass the same rules, so an allowed host
+  cannot bounce the fetch to an unlisted or internal one.
+- 8 MiB cap (declared length and while streaming), 20 s deadline
+  (`AMAIL_DRAFT_ATTACHMENT_FETCH_TIMEOUT_MS`).
+- An HTML response is refused as "a web page instead of a file" (usually a
+  sign-in page or an expired link). A file typed or named as a PDF must
+  contain `%PDF-` in its first KB.
+- `AMAIL_DRAFT_ATTACHMENT_URL_AUTH` (JSON, host to headers) adds headers such
+  as an API token, sent only to that exact host and never to a redirect
+  target on another host. The token stays on the aMail server; agents only
+  ever pass the URL.
+- Errors name the host, never the query string (signed URLs carry tokens) or
+  the remote body. The log line records host, size and type only.
+
+How an agent attaches a PDF:
+
+```json
+{ "draftId": "<id>",
+  "addAttachments": [{ "url": "https://quotes.example.com/q/1042.pdf", "filename": "Quote 1042.pdf" }] }
+```
+
+Error codes: `ATTACHMENT_URLS_DISABLED` (no allowlist),
+`ATTACHMENT_HOST_NOT_ALLOWED`, `ATTACHMENT_URL_BLOCKED` (scheme, port or
+credentials), `ATTACHMENT_URL_PRIVATE_ADDRESS`, `ATTACHMENT_URL_DNS_FAILED`,
+`ATTACHMENT_URL_HTTP_ERROR`, `ATTACHMENT_URL_NOT_A_FILE`,
+`ATTACHMENT_URL_TYPE_MISMATCH`, `ATTACHMENT_URL_EMPTY`, `ATTACHMENT_TOO_LARGE`,
+`ATTACHMENT_URL_TIMEOUT`, `ATTACHMENT_URL_TOO_MANY_REDIRECTS`,
+`ATTACHMENT_URL_FAILED`.
+
+Decisions:
+
+- D6. Server-side URL fetch, not an upload endpoint. Agent sessions often
+  cannot reach the aMail host directly (the private install sits behind a
+  proxy that refuses them), and an upload still needs the bytes to pass
+  through the agent. A URL is a few dozen characters.
+- D7. No MCC blob references. MCC's `blob_upload` also takes base64 (1 MiB
+  max) through a tool call, so it has the same size problem, and its blobs
+  have no fetch address aMail could use. If MCC gains a fetchable blob URL,
+  listing its host in the allowlist is enough.
+- D8. Allowlist off by default, including hosted mode. A fetch-any-URL
+  feature on a mail server is an SSRF tool; the operator opts in per host.
+- D9. `addAttachments` instead of changing what `attachments` means, so
+  existing callers (the composer sends the full list) behave as before.
+
+Known limit: an update builds on aMail's latest synced copy of the draft. If
+the draft was edited in another client in the last few minutes and aMail has
+not synced Drafts since, run `sync_mail` for that account first. Otherwise
+aMail's new version does not include those edits, and because the old UID no
+longer matches, the other client's version is left in place too (reported as
+`replaced: "kept"`), so Drafts ends up with two copies.
+
 ## Provider notes
 
 - **Gmail**: `[Gmail]/Drafts` carries `\Drafts`. An APPENDed message there is a

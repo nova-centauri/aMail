@@ -122,3 +122,19 @@ test('search reads default to a 10s worker deadline outside tests', () => {
   assert.equal(loadConfig({ AMAIL_SEARCH_READ_WORKER: 'true' }).searchReadWorker, true);
   assert.equal(loadConfig({ AMAIL_SEARCH_QUERY_DEADLINE_MS: '250' }).searchQueryDeadlineMs, 250);
 });
+
+test('draft attachment URLs are off by default and read their allowlist, auth and timeout', () => {
+  const defaults = loadConfig({});
+  assert.deepEqual(defaults.draftAttachmentUrlHosts, []);
+  assert.deepEqual(defaults.draftAttachmentUrlAuth, {});
+  assert.equal(defaults.draftAttachmentFetchTimeoutMs, 20_000);
+  const set = loadConfig({
+    AMAIL_DRAFT_ATTACHMENT_URL_HOSTS: 'workboard.example.test, *.files.example.test',
+    AMAIL_DRAFT_ATTACHMENT_URL_AUTH: '{"workboard.example.test":{"Authorization":"Bearer t"}}',
+    AMAIL_DRAFT_ATTACHMENT_FETCH_TIMEOUT_MS: '5000',
+  });
+  assert.deepEqual(set.draftAttachmentUrlHosts, ['workboard.example.test', '*.files.example.test']);
+  assert.deepEqual(set.draftAttachmentUrlAuth, { 'workboard.example.test': { authorization: 'Bearer t' } });
+  assert.equal(set.draftAttachmentFetchTimeoutMs, 5000);
+  assert.equal(loadConfig({ AMAIL_DRAFT_ATTACHMENT_URL_AUTH: '{oops' }).draftAttachmentUrlAuth, null);
+});
