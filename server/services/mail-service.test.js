@@ -227,6 +227,7 @@ function syncHarness({
     skips: [],
     checkpoints: 0,
     logs: [],
+    markedSynced: [],
   };
   state.messages = messages;
   state.sources = sources;
@@ -345,7 +346,7 @@ function syncHarness({
     accounts: {
       getRaw: (id) => [account, ...extraAccounts].find((item) => item.id === id) || null,
       list: () => [account, ...extraAccounts].map((item) => ({ id: item.id, syncEnabled: true })),
-      markSynced() {},
+      markSynced(id) { state.markedSynced.push({ id, at: Date.now() }); },
     },
     sync: {
       get: () => state.savedSync || previousSync,
@@ -879,6 +880,29 @@ test('concurrent and recent full syncs share one IMAP pass', async () => {
   assert.ok(state.checkpoints >= 1);
   await service.close();
   assert.equal(state.openSessions, 0);
+});
+
+test('an unchanged IMAP pass still advances lastSyncedAt; recent skip uses that pass', async () => {
+  const { service, state } = syncHarness({
+    ...mailboxOf([10]),
+    previousSync: { last_uid: 10, uid_validity: 41 },
+    syncMinIntervalMs: 60_000,
+  });
+
+  const first = await service.syncAccount('sync-account');
+  assert.equal(first.status, 'ok');
+  assert.equal(first.imported, 0);
+  assert.equal(state.savedMessages.length, 0);
+  assert.equal(state.markedSynced.length, 1);
+  assert.equal(state.markedSynced[0].id, 'sync-account');
+
+  const queued = service.enqueueSyncAccount('sync-account');
+  assert.equal(queued.state, 'recent');
+  assert.equal(queued.status, 'already_running');
+  assert.deepEqual(queued.job.result, { skipped: 'recent' });
+  assert.equal(state.markedSynced.length, 1);
+  assert.equal(state.connects, 1);
+  await service.close();
 });
 
 test('the server enforces a minimum sync interval unless force is set', async () => {
