@@ -126,7 +126,20 @@ export function prepareDraft(repos, input = {}, id = null) {
     }
   }
 
-  const incomingAttachments = input.attachments ?? existing?.attachments ?? [];
+  // `attachments` is the whole list (omit to keep what the draft has, [] to
+  // remove all). `addAttachments` appends to that list, so an agent can add a
+  // file without restating the ones already there. Files already on the
+  // draft are matched by filename and keep their bytes.
+  if (input.addAttachments != null && !Array.isArray(input.addAttachments)) {
+    throw new ValidationError('addAttachments must be an array.');
+  }
+  const baseAttachments = input.attachments ?? existing?.attachments ?? [];
+  const incomingAttachments = input.addAttachments?.length && Array.isArray(baseAttachments)
+    ? [...baseAttachments, ...input.addAttachments]
+    : baseAttachments;
+  if (input.addAttachments?.length && input.addAttachments.some((item) => !(item?.content || item?.data))) {
+    throw new ValidationError('Each file in addAttachments needs content (base64) or url.');
+  }
   return {
     legacy,
     server,

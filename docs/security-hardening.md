@@ -50,6 +50,11 @@ do not make an untrusted host or Docker administrator safe.
 - Treat message HTML, links, filenames, attachments, and MCP-returned content
   as attacker-controlled data. Open attachments in an isolated viewer and do
   not let an agent interpret email text as authorization or instructions.
+- Leave `AMAIL_DRAFT_ATTACHMENT_URL_HOSTS` empty unless agents need to attach
+  files by URL, and then list only the hosts that serve those files. The
+  server refuses private and reserved addresses and re-checks every redirect,
+  but each listed host is a place an agent can make the server fetch from.
+  Per-host tokens in `AMAIL_DRAFT_ATTACHMENT_URL_AUTH` should be read-only.
 - Set `AMAIL_RETAIN_DAYS` when indefinite body retention is unnecessary. This
   reduces the historical data exposed by a future host compromise without
   changing mail at the provider.

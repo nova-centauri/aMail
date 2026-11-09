@@ -22,6 +22,7 @@ import { NotFoundError, ServiceUnavailableError, ValidationError } from '../erro
 import { sanitizeComposeHtml } from '../utils/signature.js';
 import { stringify } from '../db.js';
 import { legacyDraftSummary, prepareDraft, providerDraft } from './drafts.js';
+import { createDraftAttachmentFetcher, resolveAttachmentReferences } from './attachment-fetch.js';
 import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
@@ -661,7 +662,17 @@ export function createMailService({
   compileMessage = compileRfc822Message,
   createMessageId = () => `<${randomUUID()}@amail.local>`,
   scheduleTimeout = defaultScheduleTimeout,
+  attachmentFetcher = null,
 }) {
+  if (config.draftAttachmentUrlAuth === null) {
+    logger.warn('AMAIL_DRAFT_ATTACHMENT_URL_AUTH is not valid JSON; no auth headers will be sent for attachment URLs');
+  }
+  const draftAttachmentFetcher = attachmentFetcher || createDraftAttachmentFetcher({
+    allowHosts: config.draftAttachmentUrlHosts || [],
+    authHeaders: config.draftAttachmentUrlAuth || {},
+    timeoutMs: config.draftAttachmentFetchTimeoutMs,
+    logger,
+  });
   const ingest = createSyncIngest({
     config,
     logger,
@@ -2847,6 +2858,12 @@ export function createMailService({
     }
   }
 
+  function withoutUrlAttachments(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+    const strip = (list) => (Array.isArray(list) ? list.filter((item) => !item?.url) : list);
+    return { ...input, attachments: strip(input.attachments), addAttachments: strip(input.addAttachments) };
+  }
+
   /** Bytes for attachments a server draft carries but aMail never stored. */
   async function draftAttachmentsWithBytes(plan) {
     if (!plan.server || plan.attachments.every((attachment) => attachment.content)) return plan.attachments;
@@ -2885,10 +2902,14 @@ export function createMailService({
    */
   async function saveDraft(input = {}, draftId = null) {
     // Plan once to learn the account; plan again inside the lock so a save
-    // that waited sees the UID the previous save left behind.
-    const firstPlan = prepareDraft(repos, input, draftId);
+    // that waited sees the UID the previous save left behind. The first plan
+    // skips `{ url }` attachments: they are downloaded only after the draft,
+    // account and write policy check out, and outside the lock so a slow
+    // download does not hold up other saves on the account.
+    const firstPlan = prepareDraft(repos, withoutUrlAttachments(input), draftId);
     assertImapWritesAllowed(firstPlan.accountId);
-    return withDraftLock(firstPlan.accountId, () => saveDraftLocked(input, draftId));
+    const resolved = await resolveAttachmentReferences(input, draftAttachmentFetcher);
+    return withDraftLock(firstPlan.accountId, () => saveDraftLocked(resolved, draftId));
   }
 
   async function saveDraftLocked(input, draftId) {

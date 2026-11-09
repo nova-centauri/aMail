@@ -451,9 +451,19 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     };
   }));
 
+  const draftAttachmentSchema = z.object({
+    filename: z.string().optional().describe('File name; required for a file already on the draft, optional with url (taken from the response)'),
+    contentType: z.string().optional(),
+    content: z.string().optional().describe('Base64 bytes for a small new file. Use url instead for anything over ~100 KB'),
+    url: z.string().optional().describe('https URL the aMail server downloads the file from instead of content. The host must be on the server allowlist (AMAIL_DRAFT_ATTACHMENT_URL_HOSTS)'),
+    index: z.number().int().nonnegative().optional(),
+    size: z.number().nonnegative().optional(),
+    contentId: z.string().optional(),
+  });
+
   server.registerTool('save_draft', {
     title: 'Save draft',
-    description: 'Save an unsent draft to the account\'s own Drafts folder on its mail server (IMAP APPEND, flagged \\Draft), so it appears in Gmail, Apple Mail and every other client of that account. Never sends mail. Supply accountId for a new draft, or draftId to update one; omitted fields are preserved on update and draft.id stays the same across saves. For a reply, pass replyToMessageId (RFC Message-ID) or threadId so the draft carries In-Reply-To/References and threads with the conversation. Each update replaces the previous server copy.',
+    description: 'Save an unsent draft to the account\'s own Drafts folder on its mail server (IMAP APPEND, flagged \\Draft), so it appears in Gmail, Apple Mail and every other client of that account. Never sends mail. Supply accountId for a new draft, or draftId to update one; omitted fields are preserved on update and draft.id stays the same across saves. For a reply, pass replyToMessageId (RFC Message-ID) or threadId so the draft carries In-Reply-To/References and threads with the conversation. Each update replaces the previous server copy. Files: give each new file as { url } (the server downloads it; best for PDFs and anything large) or { content } base64 (small files only). To add files to an existing draft without touching the ones already on it, use addAttachments; attachments replaces the whole list.',
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     inputSchema: {
       accountId: z.string().optional().describe('Required for a new draft; saved drafts keep their original account'),
@@ -466,14 +476,8 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       subject: z.string().optional(),
       textBody: z.string().optional(),
       htmlBody: z.string().optional(),
-      attachments: z.array(z.object({
-        filename: z.string(),
-        contentType: z.string().optional(),
-        content: z.string().optional().describe('Base64 bytes required for new attachments'),
-        index: z.number().int().nonnegative().optional(),
-        size: z.number().nonnegative().optional(),
-        contentId: z.string().optional(),
-      })).optional().describe('Up to 8 files, 8 MiB combined; omit to preserve existing attachments, [] to remove'),
+      attachments: z.array(draftAttachmentSchema).optional().describe('The complete file list: up to 8 files, 8 MiB combined. Omit to keep the draft\'s files, [] to remove them all. Files already on the draft are kept by listing their filename without content'),
+      addAttachments: z.array(draftAttachmentSchema).optional().describe('Files to add on top of the draft\'s current files (each needs url or content). Existing files, body and recipients are kept'),
     },
   }, async ({ draftId, ...input }) => runTool(async () => {
     if (!mailService?.saveDraft) throw new ServiceUnavailableError('Drafts need the mail service.', 'DRAFTS_UNAVAILABLE');
