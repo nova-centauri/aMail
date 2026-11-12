@@ -11,7 +11,7 @@ export function syncWorkerEnabled(config = {}) {
  * Parse RFC822 and write rows on a worker thread with its own SQLCipher
  * connection so the HTTP event loop can answer /api/health during a sync.
  */
-export function createSyncIngest({ config, logger, onStamp } = {}) {
+export function createSyncIngest({ config, logger, onStamp, onWrites } = {}) {
   const enabled = syncWorkerEnabled(config);
   let worker = null;
   let seq = 0;
@@ -43,6 +43,9 @@ export function createSyncIngest({ config, logger, onStamp } = {}) {
     worker.on('message', (msg) => {
       if (msg?.stamp && typeof onStamp === 'function') {
         try { onStamp(msg.stamp); } catch { /* listing stamp must not fail ingest */ }
+      }
+      if (Array.isArray(msg?.writes) && msg.writes.length && typeof onWrites === 'function') {
+        try { onWrites(msg.writes); } catch { /* event subscribers must not fail ingest */ }
       }
       const waiter = pending.get(msg?.id);
       if (!waiter) return;
@@ -90,6 +93,7 @@ export function createSyncIngest({ config, logger, onStamp } = {}) {
           id,
           source: job.source,
           account: { id: job.account.id },
+          trustedAuthservIds: Array.isArray(job.trustedAuthservIds) ? [...job.trustedAuthservIds] : [],
           mailbox: job.mailbox,
           role: job.role,
           allMailMirror: Boolean(job.allMailMirror),

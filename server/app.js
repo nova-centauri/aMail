@@ -15,7 +15,7 @@ import { browserOriginGuard, needsLargeJsonBody } from './middleware/request-sec
 import { createOAuthProvider } from './services/oauth-provider.js';
 import { registerOAuth } from './routes/oauth.js';
 
-export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = null, oauth = null, vault = null, deepSearch = null, eventLoopWatchdog = null }) {
+export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = null, oauth = null, vault = null, deepSearch = null, eventLoopWatchdog = null, webhooks = null }) {
   const oauthProvider = oauth || createOAuthProvider({ config, vault });
   const authenticator = auth || createAuthenticator({ config, vault, oauth: oauthProvider });
   const app = express();
@@ -91,8 +91,8 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   });
   app.locals.eventLoopWatchdog = watchdog;
   registerOAuth(app, { auth: authenticator, oauth: oauthProvider });
-  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth: authenticator, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog });
-  registerMcp(app, { config, repos, mailService, remoteContent, auth: authenticator, oauth: oauthProvider, deepSearch: searchJobs });
+  registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth: authenticator, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog, webhooks });
+  registerMcp(app, { config, repos, mailService, remoteContent, auth: authenticator, oauth: oauthProvider, deepSearch: searchJobs, webhooks });
   app.use('/api', notFound);
 
   if (fs.existsSync(config.staticDir)) {

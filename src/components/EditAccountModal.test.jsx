@@ -57,6 +57,15 @@ describe('EditAccountModal', () => {
     expect(props.onClose).toHaveBeenCalledOnce();
   });
 
+  it('saves trusted authentication servers as a list without touching the connection', async () => {
+    await showModal();
+    await userEvent.click(screen.getByText('Advanced connection settings'));
+    await userEvent.type(screen.getByLabelText('Trusted authentication servers'), ' mx.example.test, *.mail.example.test ');
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    expect(mutations()).toHaveLength(1);
+    expect(JSON.parse(mutations()[0][1].body)).toEqual({ trustedAuthservIds: ['mx.example.test', '*.mail.example.test'] });
+  });
+
   it('sends a replacement password alone so saved protocol usernames are retained', async () => {
     const props = await showModal();
     await userEvent.type(screen.getByLabelText('Replacement app-specific password'), 'new-app-password');

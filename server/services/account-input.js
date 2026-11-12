@@ -6,6 +6,7 @@ import {
 } from '../utils/mail.js';
 import { normalizeStoredSignature } from '../utils/signature.js';
 import { ValidationError } from '../errors.js';
+import { parseAuthservIdList, validateAuthservIdList } from './auth-results.js';
 
 export const booleanField = (value, fallback, fieldName) => {
   if (value === undefined) return fallback;
@@ -14,6 +15,15 @@ export const booleanField = (value, fallback, fieldName) => {
   if (value === 0 || value === '0' || String(value).toLowerCase() === 'false') return false;
   throw new ValidationError(`${fieldName} must be true or false.`);
 };
+
+function parseStoredList(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
 
 export function parseAvatar(dataUrl) {
   if (dataUrl === null) return { avatar_blob: null, avatar_mime: null };
@@ -119,6 +129,11 @@ export function serializeAccountInput(body, existing, config) {
     credential_ciphertext: credentials,
     signature: normalizeStoredSignature(body.signature ?? existing?.signature ?? ''),
     sync_enabled: Number(booleanField(body.syncEnabled, existing ? Boolean(existing.sync_enabled) : true, 'Sync enabled')),
+    // Receiving-server names whose Authentication-Results headers are believed
+    // for this account. Applies to mail imported after the change.
+    trusted_authserv_ids: JSON.stringify(body.trustedAuthservIds === undefined
+      ? parseAuthservIdList(parseStoredList(existing?.trusted_authserv_ids))
+      : validateAuthservIdList(body.trustedAuthservIds)),
   };
 }
 

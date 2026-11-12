@@ -10,6 +10,8 @@ import { createApp } from './app.js';
 import { createSearchEngine } from './services/search-engine.js';
 import { createSearchRead } from './services/search-read.js';
 import { backgroundReceiptPlan, INBOX_PROBE_START_DELAY_MS } from './mail/receipt-path.js';
+import { createWebhookService } from './services/webhooks.js';
+import { APP_VERSION } from './config.js';
 
 /**
  * Wire one aMail process. Both key modes share every service; they differ only
@@ -77,6 +79,10 @@ export function createHarness({ config, logger }) {
     const mailService = createMailService({ config: runtimeConfig, repos, logger, metering });
     const searchEngine = createSearchEngine({ config: runtimeConfig, repos, logger });
     const searchRead = createSearchRead({ config: runtimeConfig, logger });
+    // Subscribes to the mail service's lifecycle events; delivers in the background.
+    const webhooks = createWebhookService({
+      config: runtimeConfig, repos, events: mailService.events, logger, version: APP_VERSION,
+    });
     repos.setSearchIndexer((event) => searchEngine.noteWrite(event));
     repos.searchEngine = searchEngine;
     repos.searchRead = searchRead;
@@ -87,7 +93,9 @@ export function createHarness({ config, logger }) {
       mailService,
       searchEngine,
       searchRead,
+      webhooks,
       async close() {
+        await webhooks.close().catch(() => {});
         searchEngine.stop();
         await searchRead.close?.().catch(() => {});
         await mailService.close?.().catch(() => {});
@@ -109,6 +117,7 @@ export function createHarness({ config, logger }) {
       vault: null,
       async start() {
         runtime.searchEngine.start();
+        runtime.webhooks.start();
         startPolling(runtime.mailService);
       },
       async stop() {
@@ -129,6 +138,7 @@ export function createHarness({ config, logger }) {
     buildRuntime: (keys) => buildRuntime({ ...config, ...keys }),
     onUnlock(runtime) {
       runtime.searchEngine?.start();
+      runtime.webhooks?.start();
       startPolling(runtime.mailService);
       handoff?.start().catch((error) => logger.error({ err: error }, 'DEK handoff listener failed to start'));
     },

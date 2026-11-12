@@ -8,7 +8,7 @@ import { createDeepSearchService } from '../services/deep-search.js';
  * Auth accepts the existing aMail credential and OAuth access tokens minted by
  * the Claude custom-connector flow.
  */
-export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, oauth = null, deepSearch = null }) {
+export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, oauth = null, deepSearch = null, webhooks = null }) {
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const gate = accessGate(auth, { challenge: (request) => oauth?.challenge?.(request) });
   const handleMcp = async (request, response) => {
@@ -18,6 +18,7 @@ export function registerMcp(app, { config, repos, mailService, remoteContent, au
       mailService,
       remoteContent,
       deepSearch: searchJobs,
+      webhooks,
       logger: request.log,
     });
     let transport;

@@ -62,6 +62,8 @@ import { createPhaseTimer, debugTimingEnabled } from './debug-timing.js';
 import { compareModseq, planMailboxSync, uidPages } from './mailbox-sync-plan.js';
 import { createSyncIngest } from './sync-ingest.js';
 import { createSyncJobBoard, mcpEnqueueStatus, publicSyncJob } from './sync-jobs.js';
+import { authenticationColumns, resolveTrustedAuthservIds } from './auth-results.js';
+import { createMessageEvents } from './message-events.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
@@ -664,6 +666,7 @@ export function createMailService({
   createMessageId = () => `<${randomUUID()}@amail.local>`,
   scheduleTimeout = defaultScheduleTimeout,
   attachmentFetcher = null,
+  events = null,
 }) {
   if (config.draftAttachmentUrlAuth === null) {
     logger.warn('AMAIL_DRAFT_ATTACHMENT_URL_AUTH is not valid JSON; no auth headers will be sent for attachment URLs');
@@ -674,10 +677,18 @@ export function createMailService({
     timeoutMs: config.draftAttachmentFetchTimeoutMs,
     logger,
   });
+  // Lifecycle events (message.received / .sent / .analyzed). The harness passes
+  // one emitter per runtime; a mail service built on its own makes its own.
+  const messageEvents = events || createMessageEvents({ repos, config, logger });
   const ingest = createSyncIngest({
     config,
     logger,
     onStamp: (stamp) => repos.changes?.applyRemote?.(stamp),
+    // The worker has its own database connection, so rows it creates are
+    // announced here, on the thread the event subscribers live on.
+    onWrites: (writes) => {
+      for (const write of writes) repos.messageWrites?.publish?.(write);
+    },
   });
   const failedImapClients = new WeakSet();
   const newImapClient = (account, credentials, { pooled = false } = {}) => {
@@ -1059,8 +1070,16 @@ export function createMailService({
     }
     const thread = resolveThread({ accountId: account.id, subject, inReplyTo, references });
     const receivedAt = asIso(message.internalDate || parsed.date || envelope.date);
+    // What the receiving server concluded about the sender. Sent mail and
+    // drafts never passed through it, so they carry no verdict.
+    const authentication = isSent || isDraft ? {} : authenticationColumns({
+      headerLines: parsed.headerLines,
+      fromEmail: sender(parsedFrom).email,
+      trustedIds: resolveTrustedAuthservIds(account, config),
+    });
 
     return {
+      ...authentication,
       account_id: account.id,
       thread_id: thread.id,
       mailbox,
@@ -1232,6 +1251,7 @@ export function createMailService({
             const result = await ingest.ingest({
               source,
               account,
+              trustedAuthservIds: resolveTrustedAuthservIds(account, config),
               mailbox,
               role,
               allMailMirror,
@@ -2510,6 +2530,7 @@ export function createMailService({
     const ids = [...imapPool.keys()];
     await Promise.all(ids.map((id) => evictPoolEntry(id)));
     await ingest.close().catch(() => {});
+    if (!events) messageEvents.close();
   }
 
   function invalidateAccount(accountId) {
@@ -3224,6 +3245,7 @@ export function createMailService({
       snoozed_until: null,
       is_sent: 1,
     });
+    messageEvents.messageSent(saved);
     const sentCopy = await appendProviderSentCopy({ account, credentials, rawMessage, sentAt });
     const draftCleanup = input.draftId ? await retireSentDraft(input.draftId, { account, credentials }) : null;
     return { ...saved, delivery, sentCopy, ...(draftCleanup ? { draftCleanup } : {}) };
@@ -3609,6 +3631,7 @@ export function createMailService({
     // analyzed message (or toggling it back) never inflates the count.
     if (state.isAnalyzed === true && !existing.isAnalyzed && updated?.isAnalyzed) {
       metering?.recordAnalyzed?.(1);
+      messageEvents.messageAnalyzed(updated);
     }
     // A change for this message that failed earlier rides along, so the server
     // catches up with everything still owed for it in one round trip.
@@ -3702,6 +3725,7 @@ export function createMailService({
     hydrateMessageSource,
     searchAndMaterialize,
     invalidateAccount,
+    events: messageEvents,
     close,
   };
 }

@@ -358,6 +358,7 @@ export function createVault({ config, keyslots, buildRuntime, logger, onUnlock =
       repos: lazyProxy(() => requireRuntime().repos),
       mailService: lazyProxy(() => requireRuntime().mailService),
       remoteContent: lazyProxy(() => requireRuntime().remoteContent),
+      webhooks: lazyProxy(() => requireRuntime().webhooks),
     },
     current: () => runtime,
   };

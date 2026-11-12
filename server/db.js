@@ -22,6 +22,7 @@ import {
   createChangeVersionStore,
   stampFromRow,
 } from './services/change-version.js';
+import { AUTHENTICATION_COLUMNS, publicAuthentication } from './services/auth-results.js';
 
 const json = (value, fallback = []) => {
   if (value === null || value === undefined || value === '') return fallback;
@@ -70,6 +71,7 @@ const MESSAGE_METADATA_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_m
   labels_json, is_read, is_starred, is_archived, is_trashed, is_spam,
   snoozed_until, is_sent, analyzed_at, analyzed_by, smart_category,
   smart_category_reason, source_imported, remote_missing_at, claimed_by, claimed_until,
+  ${AUTHENTICATION_COLUMNS.join(', ')},
   created_at, updated_at`;
 
 /** Inbox list hydrate: no bodies, no attachment blobs. */
@@ -77,6 +79,7 @@ const LIST_ENVELOPE_COLUMNS = `id, account_id, thread_id, mailbox, uid, rfc_mess
   to_json, cc_json, bcc_json, reply_to_json, sent_at, received_at, snippet, labels_json,
   is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent, is_draft,
   analyzed_at, analyzed_by, smart_category, smart_category_reason, source_imported,
+  ${AUTHENTICATION_COLUMNS.join(', ')},
   created_at, updated_at`;
 
 function publicAccount(row) {
@@ -91,6 +94,9 @@ function publicAccount(row) {
     imap: { host: row.imap_host, port: row.imap_port, secure: Boolean(row.imap_secure) },
     smtp: { host: row.smtp_host, port: row.smtp_port, secure: Boolean(row.smtp_secure) },
     signature: row.signature || '',
+    // Receiving-server names whose Authentication-Results headers are believed
+    // for this account, on top of the global and provider defaults.
+    trustedAuthservIds: json(row.trusted_authserv_ids),
     syncEnabled: Boolean(row.sync_enabled),
     lastSyncedAt: row.last_synced_at,
     createdAt: row.created_at,
@@ -149,6 +155,11 @@ function publicMessage(row) {
     // whose time has passed is free for anyone to take.
     claimedBy: row.claimed_by || null,
     claimedUntil: row.claimed_by ? (row.claimed_until || null) : null,
+    // SPF/DKIM/DMARC as the receiving server reported them. Null for mail
+    // stored before aMail recorded these headers. See docs/webhooks.md.
+    authentication: publicAuthentication(row),
+    listId: row.list_id || null,
+    hasListUnsubscribe: Boolean(row.list_unsubscribe),
     category,
     categoryLabel: categoryLabel(category),
     categoryReason: row.smart_category_reason || 'No automated category signal matched.',
@@ -545,6 +556,20 @@ function initSchema(db) {
   // One agent per email: who is reviewing an unanalyzed message, and until when.
   if (!columnsAfterRebuild.has('claimed_by')) db.exec('ALTER TABLE messages ADD COLUMN claimed_by TEXT');
   if (!columnsAfterRebuild.has('claimed_until')) db.exec('ALTER TABLE messages ADD COLUMN claimed_until TEXT');
+  // Sender authentication as the receiving server reported it. All nullable:
+  // mail imported before these columns existed keeps NULL (never evaluated).
+  const authColumnTypes = {
+    auth_spf: 'TEXT', auth_dkim: 'TEXT', auth_dmarc: 'TEXT', auth_authserv_id: 'TEXT',
+    auth_trusted: 'INTEGER', auth_dkim_domains: 'TEXT', auth_from_aligned: 'INTEGER',
+    return_path: 'TEXT', list_id: 'TEXT', list_unsubscribe: 'INTEGER',
+  };
+  for (const column of AUTHENTICATION_COLUMNS) {
+    if (!columnsAfterRebuild.has(column)) db.exec(`ALTER TABLE messages ADD COLUMN ${column} ${authColumnTypes[column]}`);
+  }
+  const accountColumns = new Set(db.prepare('PRAGMA table_info(accounts)').all().map((column) => column.name));
+  if (!accountColumns.has('trusted_authserv_ids')) {
+    db.exec("ALTER TABLE accounts ADD COLUMN trusted_authserv_ids TEXT NOT NULL DEFAULT '[]'");
+  }
   const syncColumnsAfterRebuild = new Set(db.prepare('PRAGMA table_info(sync_state)').all().map((column) => column.name));
   if (!syncColumnsAfterRebuild.has('reconciled_at')) db.exec('ALTER TABLE sync_state ADD COLUMN reconciled_at TEXT');
 
@@ -625,7 +650,57 @@ function initSchema(db) {
 
   wakeLegacySnoozes(db);
   ensureRemoteOps(db);
+  ensureWebhooks(db);
   ensureMessagesFts(db);
+}
+
+/**
+ * Outbound webhook subscriptions and their delivery queue/log. A delivery row
+ * is one event for one subscription: `pending` rows are the retry queue (so it
+ * survives a restart), the rest are the pruned log. Additive, IF NOT EXISTS.
+ */
+function ensureWebhooks(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+      id TEXT PRIMARY KEY,
+      source TEXT NOT NULL DEFAULT 'api',
+      url TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      events_json TEXT NOT NULL DEFAULT '[]',
+      account_ids_json TEXT NOT NULL DEFAULT '[]',
+      secret_ciphertext TEXT NOT NULL DEFAULT '',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      disabled_reason TEXT,
+      disabled_at TEXT,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      dropped_count INTEGER NOT NULL DEFAULT 0,
+      last_success_at TEXT,
+      last_failure_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id TEXT PRIMARY KEY,
+      subscription_id TEXT NOT NULL REFERENCES webhook_subscriptions(id) ON DELETE CASCADE,
+      event_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed', 'dropped')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_attempt_at TEXT,
+      last_delivery_id TEXT,
+      response_status INTEGER,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_due
+      ON webhook_deliveries(subscription_id, next_attempt_at, id) WHERE status = 'pending';
+    CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription
+      ON webhook_deliveries(subscription_id, created_at DESC, id);
+  `);
 }
 
 /**
@@ -984,6 +1059,111 @@ export function createDatabase(config, { key = config.databaseKey || null, check
   return db;
 }
 
+/**
+ * Storage for outbound webhooks (services/webhooks.js owns the behaviour).
+ * Rows are returned raw; the service decides what is public.
+ */
+function createWebhookRepository(db) {
+  const queries = {
+    list: db.prepare('SELECT * FROM webhook_subscriptions ORDER BY created_at ASC, rowid ASC'),
+    get: db.prepare('SELECT * FROM webhook_subscriptions WHERE id = ?'),
+    count: db.prepare("SELECT COUNT(*) AS count FROM webhook_subscriptions WHERE source = 'api'"),
+    insert: db.prepare(`INSERT INTO webhook_subscriptions (
+      id, source, url, description, events_json, account_ids_json, secret_ciphertext, enabled, created_at, updated_at
+    ) VALUES (
+      @id, @source, @url, @description, @events_json, @account_ids_json, @secret_ciphertext, @enabled, @created_at, @updated_at
+    )`),
+    update: db.prepare(`UPDATE webhook_subscriptions SET
+      url = @url, description = @description, events_json = @events_json,
+      account_ids_json = @account_ids_json, secret_ciphertext = @secret_ciphertext,
+      enabled = @enabled, disabled_reason = @disabled_reason, disabled_at = @disabled_at,
+      consecutive_failures = @consecutive_failures, dropped_count = @dropped_count,
+      last_success_at = @last_success_at, last_failure_at = @last_failure_at, last_error = @last_error,
+      updated_at = @updated_at
+      WHERE id = @id`),
+    remove: db.prepare('DELETE FROM webhook_subscriptions WHERE id = ?'),
+    deliveryInsert: db.prepare(`INSERT INTO webhook_deliveries (
+      id, subscription_id, event_id, event_type, payload_json, status, attempts, next_attempt_at,
+      last_attempt_at, last_delivery_id, response_status, last_error, created_at, completed_at
+    ) VALUES (
+      @id, @subscription_id, @event_id, @event_type, @payload_json, @status, @attempts, @next_attempt_at,
+      @last_attempt_at, @last_delivery_id, @response_status, @last_error, @created_at, @completed_at
+    )`),
+    deliveryGet: db.prepare('SELECT * FROM webhook_deliveries WHERE id = ?'),
+    deliveryUpdate: db.prepare(`UPDATE webhook_deliveries SET
+      status = @status, attempts = @attempts, next_attempt_at = @next_attempt_at,
+      last_attempt_at = @last_attempt_at, last_delivery_id = @last_delivery_id,
+      response_status = @response_status, last_error = @last_error, completed_at = @completed_at
+      WHERE id = @id`),
+    pendingCount: db.prepare("SELECT COUNT(*) AS count FROM webhook_deliveries WHERE subscription_id = ? AND status = 'pending'"),
+    oldestPending: db.prepare(`SELECT id FROM webhook_deliveries
+      WHERE subscription_id = ? AND status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT ?`),
+    closePending: db.prepare(`UPDATE webhook_deliveries SET status = @status, next_attempt_at = NULL,
+      last_error = @error, completed_at = @at WHERE subscription_id = @subscriptionId AND status = 'pending'`),
+    closeOne: db.prepare(`UPDATE webhook_deliveries SET status = @status, next_attempt_at = NULL,
+      last_error = @error, completed_at = @at WHERE id = @id AND status = 'pending'`),
+    dueFor: db.prepare(`SELECT * FROM webhook_deliveries
+      WHERE subscription_id = @subscriptionId AND status = 'pending' AND next_attempt_at <= @now
+      ORDER BY next_attempt_at ASC, rowid ASC LIMIT 1`),
+    nextDueAt: db.prepare(`SELECT MIN(d.next_attempt_at) AS at FROM webhook_deliveries d
+      JOIN webhook_subscriptions s ON s.id = d.subscription_id
+      WHERE d.status = 'pending' AND s.enabled = 1`),
+    recent: db.prepare(`SELECT * FROM webhook_deliveries WHERE subscription_id = ?
+      ORDER BY created_at DESC, rowid DESC LIMIT ?`),
+    prune: db.prepare(`DELETE FROM webhook_deliveries
+      WHERE subscription_id = @subscriptionId AND status <> 'pending' AND id NOT IN (
+        SELECT id FROM webhook_deliveries WHERE subscription_id = @subscriptionId AND status <> 'pending'
+        ORDER BY created_at DESC, rowid DESC LIMIT @keep
+      )`),
+    pendingTotal: db.prepare("SELECT COUNT(*) AS count FROM webhook_deliveries WHERE status = 'pending'"),
+  };
+  return {
+    list: () => queries.list.all(),
+    get: (id) => queries.get.get(id) || null,
+    count: () => Number(queries.count.get()?.count) || 0,
+    insert(row) {
+      queries.insert.run(row);
+      return queries.get.get(row.id);
+    },
+    /** Merge `fields` over the stored row. Null when the subscription is gone. */
+    update(id, fields) {
+      const existing = queries.get.get(id);
+      if (!existing) return null;
+      queries.update.run({ ...existing, ...fields, id, updated_at: fields.updated_at || now() });
+      return queries.get.get(id);
+    },
+    remove: (id) => queries.remove.run(id).changes > 0,
+    deliveries: {
+      insert(row) {
+        queries.deliveryInsert.run({
+          attempts: 0, last_attempt_at: null, last_delivery_id: null, response_status: null,
+          last_error: null, completed_at: null, ...row,
+        });
+      },
+      get: (id) => queries.deliveryGet.get(id) || null,
+      update(id, fields) {
+        const existing = queries.deliveryGet.get(id);
+        if (!existing) return null;
+        queries.deliveryUpdate.run({ ...existing, ...fields, id });
+        return queries.deliveryGet.get(id);
+      },
+      pendingCount: (subscriptionId) => Number(queries.pendingCount.get(subscriptionId)?.count) || 0,
+      oldestPending: (subscriptionId, limit) => queries.oldestPending.all(subscriptionId, limit).map((row) => row.id),
+      /** Close one pending row as `dropped` or `failed`. */
+      close: (id, { status, error, at = now() }) => queries.closeOne.run({ id, status, error, at }).changes > 0,
+      /** Close every pending row of a subscription (it was disabled). */
+      closePending: (subscriptionId, { status, error, at = now() }) => queries.closePending
+        .run({ subscriptionId, status, error, at }).changes,
+      /** The next delivery one subscription is owed right now, if any. */
+      dueFor: (subscriptionId, at = now()) => queries.dueFor.get({ subscriptionId, now: at }) || null,
+      nextDueAt: () => queries.nextDueAt.get()?.at || null,
+      recent: (subscriptionId, limit = 50) => queries.recent.all(subscriptionId, limit),
+      prune: (subscriptionId, keep) => queries.prune.run({ subscriptionId, keep }).changes,
+      pendingTotal: () => Number(queries.pendingTotal.get()?.count) || 0,
+    },
+  };
+}
+
 export function createRepositories(db) {
   const messageListSql = (projection) => `SELECT ${projection} FROM messages m
       WHERE m.account_id = @accountId AND
@@ -1019,18 +1199,19 @@ export function createRepositories(db) {
     accountInsert: db.prepare(`INSERT INTO accounts (
       id, email, display_name, avatar_blob, avatar_mime, color, provider,
       imap_host, imap_port, imap_secure, smtp_host, smtp_port, smtp_secure,
-      credential_ciphertext, signature, sync_enabled, created_at, updated_at
+      credential_ciphertext, signature, sync_enabled, trusted_authserv_ids, created_at, updated_at
     ) VALUES (
       @id, @email, @display_name, @avatar_blob, @avatar_mime, @color, @provider,
       @imap_host, @imap_port, @imap_secure, @smtp_host, @smtp_port, @smtp_secure,
-      @credential_ciphertext, @signature, @sync_enabled, @created_at, @updated_at
+      @credential_ciphertext, @signature, @sync_enabled, @trusted_authserv_ids, @created_at, @updated_at
     )`),
     accountUpdate: db.prepare(`UPDATE accounts SET
       display_name = @display_name, avatar_blob = @avatar_blob, avatar_mime = @avatar_mime,
       color = @color, provider = @provider, imap_host = @imap_host, imap_port = @imap_port,
       imap_secure = @imap_secure, smtp_host = @smtp_host, smtp_port = @smtp_port,
       smtp_secure = @smtp_secure, credential_ciphertext = @credential_ciphertext,
-      signature = @signature, sync_enabled = @sync_enabled, updated_at = @updated_at
+      signature = @signature, sync_enabled = @sync_enabled,
+      trusted_authserv_ids = @trusted_authserv_ids, updated_at = @updated_at
       WHERE id = @id`),
     accountDelete: db.prepare('DELETE FROM accounts WHERE id = ?'),
     accountSynced: db.prepare('UPDATE accounts SET last_synced_at = ?, updated_at = ? WHERE id = ?'),
@@ -1168,14 +1349,14 @@ export function createRepositories(db) {
       sent_at, received_at, html_body, text_body, snippet, attachments_json, labels_json,
       is_read, is_starred, is_archived, is_trashed, is_spam, snoozed_until, is_sent, is_draft,
       smart_category, smart_category_reason, smart_category_rule, smart_category_version,
-      source_imported, created_at, updated_at
+      source_imported, ${AUTHENTICATION_COLUMNS.join(', ')}, created_at, updated_at
     ) VALUES (
       @id, @account_id, @thread_id, @mailbox, @uid, @rfc_message_id, @in_reply_to, @references_json,
       @subject, @from_name, @from_email, @to_json, @cc_json, @bcc_json, @reply_to_json,
       @sent_at, @received_at, @html_body, @text_body, @snippet, @attachments_json, @labels_json,
       @is_read, @is_starred, @is_archived, @is_trashed, @is_spam, @snoozed_until, @is_sent, @is_draft,
       @smart_category, @smart_category_reason, @smart_category_rule, @smart_category_version,
-      @source_imported, @created_at, @updated_at
+      @source_imported, ${AUTHENTICATION_COLUMNS.map((column) => `@${column}`).join(', ')}, @created_at, @updated_at
     )`),
     messageUpdate: db.prepare(`UPDATE messages SET
       thread_id = @thread_id, mailbox = @mailbox, uid = @uid, rfc_message_id = @rfc_message_id,
@@ -1190,8 +1371,13 @@ export function createRepositories(db) {
       smart_category_reason = @smart_category_reason, smart_category_rule = @smart_category_rule,
       smart_category_version = @smart_category_version,
       source_imported = COALESCE(@source_imported, source_imported), remote_missing_at = NULL,
+      ${AUTHENTICATION_COLUMNS.map((column) => `${column} = CASE WHEN @auth_set = 1 THEN @${column} ELSE ${column} END`).join(',\n      ')},
       updated_at = @updated_at
       WHERE id = @id`),
+    // An inbound copy of this Message-ID the account already holds (the same
+    // mail under another folder or label), so a second row is not new mail.
+    inboundCopyExists: db.prepare(`SELECT 1 FROM messages
+      WHERE account_id = ? AND rfc_message_id = ? AND is_sent = 0 AND COALESCE(is_draft, 0) = 0 LIMIT 1`),
     messageRelocate: db.prepare(`UPDATE messages SET mailbox = @mailbox, uid = @uid, updated_at = @updated_at WHERE id = @id`),
     messageDelete: db.prepare('DELETE FROM messages WHERE id = ?'),
     threadDelete: db.prepare('DELETE FROM threads WHERE id = ?'),
@@ -1398,10 +1584,58 @@ export function createRepositories(db) {
     }
   };
 
+  // Committed message-row writes that the lifecycle events care about
+  // (services/message-events.js): a row that did not exist before, or an
+  // envelope-only row whose full source just arrived. Listeners run after the
+  // outermost transaction commits, never inside it, and a rolled-back write is
+  // never announced. The sync worker thread forwards its own writes to the
+  // main thread, which re-publishes them here.
+  const messageWriteListeners = new Set();
+  const pendingMessageWrites = [];
+  const publishMessageWrite = (write) => {
+    for (const listener of messageWriteListeners) {
+      try {
+        listener(write);
+      } catch {
+        // A broken subscriber must not fail or roll back the write.
+      }
+    }
+  };
+  const flushMessageWrites = () => {
+    if (db.inTransaction || !pendingMessageWrites.length) return;
+    for (const write of pendingMessageWrites.splice(0)) publishMessageWrite(write);
+  };
+  /** Run a message write, then announce what it committed (or forget it on failure). */
+  const announcing = (write) => (...args) => {
+    const mark = pendingMessageWrites.length;
+    let result;
+    try {
+      result = write(...args);
+    } catch (error) {
+      pendingMessageWrites.length = Math.min(pendingMessageWrites.length, mark);
+      throw error;
+    }
+    flushMessageWrites();
+    return result;
+  };
+
+  // Callers that do not parse headers (sent copies, drafts, envelope-only
+  // search hits) leave the authentication columns alone.
+  const authParams = (input) => {
+    const params = { auth_set: input.auth_spf === undefined ? 0 : 1 };
+    for (const column of AUTHENTICATION_COLUMNS) params[column] = input[column] ?? null;
+    return params;
+  };
+
   const insertMessageRow = (row) => {
-    queries.messageInsert.run(row);
+    const inbound = !row.is_sent && !row.is_draft;
+    const copy = inbound && row.rfc_message_id
+      ? Boolean(queries.inboundCopyExists.get(row.account_id, row.rfc_message_id))
+      : false;
+    queries.messageInsert.run({ ...row, ...authParams(row) });
     finishMessageWrite([row.thread_id], row.id);
     changes.bump('message', row.updated_at);
+    pendingMessageWrites.push({ kind: 'created', id: row.id, copy });
     return publicMessage(queries.messageById.get(row.id));
   };
 
@@ -1418,7 +1652,12 @@ export function createRepositories(db) {
       row.is_trashed = existing.is_trashed;
       row.is_spam = existing.is_spam;
     }
-    queries.messageUpdate.run(row);
+    queries.messageUpdate.run({ ...row, ...authParams(row) });
+    if (Number(existing.source_imported ?? 1) === 0 && Number(row.source_imported) === 1) {
+      // An envelope-only search hit now has its source: this is the first
+      // time the message is fully available, so it counts as created.
+      pendingMessageWrites.push({ kind: 'created', id: existing.id, copy: false });
+    }
     const threads = existing.thread_id === row.thread_id
       ? [existing.thread_id]
       : [existing.thread_id, row.thread_id];
@@ -1430,24 +1669,43 @@ export function createRepositories(db) {
   return {
     runWriteBatch(fn) {
       let indexedIds = [];
-      const result = db.transaction(() => {
-        writeBatchDepth += 1;
-        try {
-          const batched = fn();
-          if (writeBatchDepth === 1) {
-            for (const threadId of pendingThreadIds) recomputeThread(threadId);
-            for (const id of pendingFtsIds) syncFts(id);
-            indexedIds = [...pendingFtsIds];
-            pendingThreadIds.clear();
-            pendingFtsIds.clear();
+      const mark = pendingMessageWrites.length;
+      let result;
+      try {
+        result = db.transaction(() => {
+          writeBatchDepth += 1;
+          try {
+            const batched = fn();
+            if (writeBatchDepth === 1) {
+              for (const threadId of pendingThreadIds) recomputeThread(threadId);
+              for (const id of pendingFtsIds) syncFts(id);
+              indexedIds = [...pendingFtsIds];
+              pendingThreadIds.clear();
+              pendingFtsIds.clear();
+            }
+            return batched;
+          } finally {
+            writeBatchDepth -= 1;
           }
-          return batched;
-        } finally {
-          writeBatchDepth -= 1;
-        }
-      })();
+        })();
+      } catch (error) {
+        pendingMessageWrites.length = Math.min(pendingMessageWrites.length, mark);
+        throw error;
+      }
       if (indexedIds.length) queueSearch({ messageIds: indexedIds });
+      flushMessageWrites();
       return result;
+    },
+    /** Committed new-message writes; see `announcing` above. */
+    messageWrites: {
+      subscribe(listener) {
+        if (typeof listener !== 'function') return () => {};
+        messageWriteListeners.add(listener);
+        return () => messageWriteListeners.delete(listener);
+      },
+      publish(write) {
+        if (write && typeof write === 'object' && typeof write.id === 'string') publishMessageWrite(write);
+      },
     },
     setSearchIndexer(fn) {
       queueSearch = typeof fn === 'function' ? fn : () => {};
@@ -1476,7 +1734,7 @@ export function createRepositories(db) {
       create(input) {
         const id = randomUUID();
         const timestamp = now();
-        queries.accountInsert.run({ id, created_at: timestamp, updated_at: timestamp, ...input });
+        queries.accountInsert.run({ id, created_at: timestamp, updated_at: timestamp, trusted_authserv_ids: '[]', ...input });
         changes.bump('account', timestamp);
         return publicAccount(queries.accountById.get(id));
       },
@@ -1663,7 +1921,7 @@ export function createRepositories(db) {
       forThread: (threadId) => queries.messagesByThread.all(threadId).map(publicMessage),
       findByRfcId: (accountId, messageId) => publicMessage(queries.messageByRfcId.get(accountId, messageId)),
       findByUid: (accountId, mailbox, uid) => publicMessage(queries.messageByUid.get(accountId, mailbox, uid)),
-      upsert: db.transaction((input) => {
+      upsert: announcing(db.transaction((input) => {
         const classification = classifyMessage(input);
         const classifiedInput = {
           ...input,
@@ -1725,7 +1983,7 @@ export function createRepositories(db) {
           );
           return publicMessage(occupant || byRfc);
         }
-      }),
+      })),
       setState(id, state) {
         const row = queries.messageById.get(id);
         if (!row) return null;
@@ -1756,7 +2014,7 @@ export function createRepositories(db) {
        * draft id the UI and agents hold stays the same. A row the sync already
        * imported for the new (mailbox, uid) is our own copy and gives way.
        */
-      replace: db.transaction((id, input) => {
+      replace: announcing(db.transaction((id, input) => {
         const existing = queries.messageById.get(id);
         if (!existing) return null;
         const uid = input.uid === null || input.uid === undefined ? null : Number(input.uid);
@@ -1786,7 +2044,7 @@ export function createRepositories(db) {
           updated_at: now(),
         };
         return updateMessageRow(existing, row);
-      }),
+      })),
       /** Drop one cached message (a sent or superseded draft). Empty threads go too. */
       remove: db.transaction((id) => {
         const existing = queries.messageById.get(id);
@@ -2098,6 +2356,7 @@ export function createRepositories(db) {
       markReconciled: (accountId, mailbox, at = now()) => queries.syncReconciled.run(at, accountId, mailbox).changes > 0,
     },
     changes,
+    webhooks: createWebhookRepository(db),
     retention: {
       // Clears stored bodies only. The contentless FTS index keeps tokens until
       // the next upsert, which is what lets pruned mail stay searchable.

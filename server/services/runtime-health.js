@@ -62,9 +62,21 @@ export function healthFeatureFlags(config = {}) {
   return features;
 }
 
-export function buildHealthExtras({ config, mailService, locked = false, watchdog = null } = {}) {
+/** In-memory webhook counters. Null while locked or when nothing provides them. */
+export function readWebhookStatus(webhooks, { locked = false } = {}) {
+  if (locked) return null;
+  try {
+    return typeof webhooks?.status === 'function' ? webhooks.status() : null;
+  } catch {
+    // Keyslot lazy proxies throw while the harness is locked.
+    return null;
+  }
+}
+
+export function buildHealthExtras({ config, mailService, locked = false, watchdog = null, webhooks = null } = {}) {
   const preferIdle = backgroundReceiptPlan(config).preferIdle;
   const sync = readRuntimeStatus(mailService, { locked });
+  const webhookStatus = readWebhookStatus(webhooks, { locked });
   const watchdogSnap = watchdog?.snapshot
     ? watchdog.snapshot({ oldestAgeMs: sync.oldestAgeMs })
     : null;
@@ -74,6 +86,7 @@ export function buildHealthExtras({ config, mailService, locked = false, watchdo
     memory: processMemorySnapshot(),
     database: databaseFileStats(config?.dbPath),
     sync,
+    ...(webhookStatus ? { webhooks: webhookStatus } : {}),
     ...(watchdogSnap ? { watchdog: watchdogSnap } : {}),
   };
 }

@@ -65,10 +65,25 @@ Two naming sets are emitted together so this server matches both the plugin’s 
 | `sync-status` | global sync `inFlight` flipped | `{ changedAt, state, inFlight? }` |
 | `sync.mailbox` | same as `sync-status` (plugin) | `{ changedAt, state?, inFlight? }` |
 | `account.updated` | `accounts.updated_at` max moved | `{ changedAt }` |
+| `message.received` | one genuinely new inbound message was imported | `{ changedAt, id, messageId, accountId, threadId, receivedAt }` |
 
 `state` on sync events is `started` / `done` for in-flight transitions. Cursor-only `sync_state.synced_at` progress does **not** emit and does **not** bump the listing/`changedAt` stamp the plugin uses to refetch. `changedAt` on these events is `max(messageAt, accountAt)` — the same value hashed into the `/api/messages` ETag — not the raw `repos.changes.stamp().changedAt` (which also tracks the IMAP cursor).
 
 Named refetch events are coalesced: the first burst in a quiet window goes out immediately, then at most one flush every **15s**. Writers push stamp changes; the hub does not poll SQL on a timer.
+
+### `message.received` (additive)
+
+`new-mail` / `message.new` fire on any message-row write (a flag change, a re-sync, a draft save) and say only that something moved. `message.received` is a separate named event that fires once per newly arrived message and says which one:
+
+```
+id: 41
+event: message.received
+data: {"changedAt":"2026-11-12T14:03:27.512Z","id":"0b0f4c1e-5d2a-4c7e-9a52-6f1d2b7f3c11","messageId":"5f2c6f0a-…","accountId":"9b9b0c3e-…","threadId":"e2a0a8f4-…","receivedAt":"2026-11-12T14:03:20.000Z"}
+```
+
+`id` in the data is the event id (the same one a webhook delivers as `X-AMail-Event-Id`); `messageId` is aMail's message id. No subject, sender or body. The rule for what counts as received (new row, inbound, not a second copy, inside the recency window so a first sync does not flood) is the webhook rule: see [webhooks.md](webhooks.md#what-counts-as-messagereceived).
+
+Nothing existing changed: the names above still carry exactly `{ changedAt }`, are still coalesced, and still fire as before. `message.received` is not coalesced (one frame per message), is replayed through `Last-Event-ID` like any other frame, and shares the 64-event ring buffer, so a burst larger than that sets `hello.gap` on reconnect. Clients that switch on event names ignore it: the Omarchy plugin treats it as an unknown name, which only keeps the connection alive. The stream is best-effort; for delivery that retries and survives restarts use a [webhook](webhooks.md).
 
 The plugin treats `message.new`, `message.state`, `message.sent`, `sync.mailbox`, and `account.added|removed|updated` as “refetch the inbox list”. Unknown names (including `change-version` / `new-mail` / `sync-status`) only keep the connection alive. Payloads do not include bodies.
 

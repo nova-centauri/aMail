@@ -155,6 +155,8 @@ export function createMailboxEventHub({
   coalesceMs = MAILBOX_EVENT_COALESCE_MS,
   now = () => Date.now(),
   schedule,
+  // The runtime's message lifecycle emitter (or a function returning it).
+  messageEvents = null,
 } = {}) {
   const listeners = new Set();
   const buffer = [];
@@ -163,6 +165,7 @@ export function createMailboxEventHub({
   let started = false;
   let unsubChanges = null;
   let unsubFlight = null;
+  let unsubReceived = null;
   let lastStamp = emptyStamp();
   let lastInFlight = false;
 
@@ -221,9 +224,28 @@ export function createMailboxEventHub({
     lastInFlight = Boolean(isInFlight);
   }
 
+  // One frame per newly received message, with its ids. Not coalesced: a
+  // client that wants "which message" must not lose one to a quiet window.
+  function onMessageReceived(event) {
+    publish('message.received', {
+      changedAt: contentTime(readStamp(repos)) || event.createdAt,
+      id: event.id,
+      messageId: event.data?.messageId || null,
+      accountId: event.data?.accountId || null,
+      threadId: event.data?.threadId || null,
+      receivedAt: event.data?.receivedAt || null,
+    });
+  }
+
   function start() {
     if (started) return;
     started = true;
+    try {
+      const source = typeof messageEvents === 'function' ? messageEvents() : messageEvents;
+      unsubReceived = source?.on?.('message.received', onMessageReceived) || null;
+    } catch {
+      unsubReceived = null;
+    }
     lastStamp = readStamp(repos);
     lastInFlight = currentInFlight();
     unsubChanges = repos?.changes?.subscribe?.(onWriterStamp) || null;
@@ -245,6 +267,8 @@ export function createMailboxEventHub({
     unsubChanges = null;
     unsubFlight?.();
     unsubFlight = null;
+    unsubReceived?.();
+    unsubReceived = null;
     coalescer.close();
   }
 

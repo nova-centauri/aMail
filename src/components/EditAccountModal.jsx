@@ -19,8 +19,11 @@ function formFromSettings(account, credentials) {
     smtpSecure: account.smtp?.secure !== false,
     imapUsername: credentials.imapUsername || credentials.username || account.email || '',
     smtpUsername: credentials.smtpUsername || credentials.username || account.email || '',
+    trustedAuthservIds: (account.trustedAuthservIds || []).join(', '),
   };
 }
+
+const authservIdList = (value) => String(value || '').split(',').map((item) => item.trim()).filter(Boolean);
 
 function settingsError(error, operation) {
   if (error?.status === 401 || error?.status === 403) return 'Unlock aMail, then try again.';
@@ -107,7 +110,7 @@ export function EditAccountModal({ account, onClose, onUpdated, onRemoved, remov
 
   const update = (key) => (event) => setForm((current) => ({ ...current, [key]: event.target.type === 'checkbox' ? event.target.checked : event.target.value }));
   const connectionChanged = Boolean(form && original && (form.password.trim() || connectionKeys.some((key) => form[key] !== original[key])));
-  const changed = Boolean(form && original && (connectionChanged || form.displayName !== original.displayName || form.syncEnabled !== original.syncEnabled));
+  const changed = Boolean(form && original && (connectionChanged || form.displayName !== original.displayName || form.syncEnabled !== original.syncEnabled || form.trustedAuthservIds !== original.trustedAuthservIds));
 
   const save = async (event) => {
     event.preventDefault();
@@ -115,6 +118,7 @@ export function EditAccountModal({ account, onClose, onUpdated, onRemoved, remov
     const payload = {};
     if (form.displayName !== original.displayName) payload.displayName = form.displayName.trim();
     if (form.syncEnabled !== original.syncEnabled) payload.syncEnabled = form.syncEnabled;
+    if (form.trustedAuthservIds !== original.trustedAuthservIds) payload.trustedAuthservIds = authservIdList(form.trustedAuthservIds);
     const credentials = {};
     if (form.password.trim()) credentials.password = form.password;
     for (const protocol of ['imap', 'smtp']) {
@@ -194,6 +198,7 @@ export function EditAccountModal({ account, onClose, onUpdated, onRemoved, remov
                       <label className="connection-security"><input type="checkbox" aria-label={`${protocol.toUpperCase()} implicit TLS`} checked={form[`${protocol}Secure`]} onChange={update(`${protocol}Secure`)} /><span>Implicit TLS</span><small>{form[`${protocol}Secure`] ? 'TLS from connection start' : 'Use STARTTLS'}</small></label>
                     </div>
                   ))}
+                  <label className="form-field"><span id="trusted-authserv-label">Trusted authentication servers</span><input aria-labelledby="trusted-authserv-label" value={form.trustedAuthservIds} onChange={update('trustedAuthservIds')} placeholder="mx.example.com" spellCheck="false" autoCapitalize="none" autoComplete="off" aria-describedby="trusted-authserv-help" /><small id="trusted-authserv-help">Comma-separated names of this account's receiving mail server as they appear in its Authentication-Results headers. SPF, DKIM and DMARC verdicts are marked trusted only when they come from one of these. Applies to mail received after saving.</small></label>
                 </details>
                 {onRemoved && <section className="account-remove-section"><h3>Remove account</h3><p>Disconnect this account and remove its local data from aMail.</p>{removalBlockedReason && <p id="account-removal-blocked">{removalBlockedReason}</p>}<button ref={removeButtonRef} type="button" className="danger-button" disabled={Boolean(removalBlockedReason)} aria-describedby={removalBlockedReason ? 'account-removal-blocked' : undefined} onClick={() => { setError(''); setConfirmRemoval(true); }}>Remove account…</button></section>}
               </fieldset>

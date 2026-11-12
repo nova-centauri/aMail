@@ -10,6 +10,9 @@ import {
 } from '../services/account-input.js';
 import { conversationListEtag, ifNoneMatchHits, listCacheToken, listConversations, listStoredDrafts, parseNumber, parsePageSize } from '../services/inbox.js';
 import { createMailboxEventHub } from '../services/mailbox-events.js';
+import { resolveTrustedAuthservIds } from '../services/auth-results.js';
+import { unavailableWebhookService } from '../services/webhooks.js';
+import { registerWebhookRoutes } from './webhooks.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
@@ -187,7 +190,8 @@ function attachDeepSearchStream(request, response, deepSearch, job) {
   });
 }
 
-export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null, eventLoopWatchdog = null }) {
+export function registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth = createAuthenticator({ config }), vault = null, deepSearch = null, mailboxEvents = null, eventLoopWatchdog = null, webhooks = null }) {
+  const webhookService = webhooks || unavailableWebhookService();
   // In keyslot mode `config` is a proxy whose key material throws while the
   // harness is locked, so health reads only static settings plus vault status.
   const keyStatus = () => (vault ? vault.status() : { keyMode: 'env', locked: false, initialized: true });
@@ -210,7 +214,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     });
     const status = keyStatus();
     timing.mark('keyStatus');
-    const extras = buildHealthExtras({ config, mailService, locked: status.locked, watchdog });
+    const extras = buildHealthExtras({ config, mailService, locked: status.locked, watchdog, webhooks: webhookService });
     timing.mark('extras');
     timing.log();
     const healthy = extras.watchdog?.healthy !== false;
@@ -375,6 +379,8 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   const eventsHub = mailboxEvents || createMailboxEventHub({
     repos,
     mailService,
+    // Resolved on subscribe, so a locked keyslot harness is never touched here.
+    messageEvents: () => mailService?.events || null,
     pollMs: config.eventsPollMs,
     heartbeatMs: config.eventsHeartbeatMs,
   });
@@ -433,7 +439,12 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const existing = repos.accounts.getRaw(request.params.id);
     if (!existing) throw new NotFoundError('Mail account not found.');
     response.set('Cache-Control', 'private, no-store');
-    response.json({ account: repos.accounts.get(existing.id), credentials: accountLoginSettings(existing, config) });
+    response.json({
+      account: repos.accounts.get(existing.id),
+      credentials: accountLoginSettings(existing, config),
+      // The account's own list plus AMAIL_TRUSTED_AUTHSERV_IDS and the provider default.
+      effectiveTrustedAuthservIds: resolveTrustedAuthservIds(existing, config),
+    });
   });
   router.get('/accounts/providers', (request, response) => {
     const discoveryInput = {
@@ -555,6 +566,7 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
   router.get('/events', (request, response) => {
     attachMailboxEventStream(request, response, eventsHub);
   });
+  registerWebhookRoutes(router, { webhooks: webhookService });
   router.get('/changes', (request, response) => {
     const since = String(request.query.since || '');
     const stamp = repos.changes.stamp();

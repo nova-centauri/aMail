@@ -2,6 +2,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { simpleParser } from 'mailparser';
 import { createDatabase, createRepositories, stringify } from '../db.js';
 import { sanitizeEmailHtml, textSnippet, toSafeHtmlFromText } from './message-html.js';
+import { authenticationColumns } from './auth-results.js';
 import {
   addressList,
   folderForMailbox,
@@ -57,7 +58,7 @@ function resolveThread(repos, { accountId, subject, inReplyTo, references }) {
   });
 }
 
-function buildPayload({ repos, account, mailbox, role, allMailMirror, message, parsed }) {
+function buildPayload({ repos, account, trustedAuthservIds = [], mailbox, role, allMailMirror, message, parsed }) {
   const envelope = message.envelope || {};
   const messageId = parsed.messageId || envelope.messageId || null;
   const references = normalizeMessageIds(parsed.references || envelope.references);
@@ -82,7 +83,15 @@ function buildPayload({ repos, account, mailbox, role, allMailMirror, message, p
     ? sanitizeEmailHtml(parsed.html)
     : sanitizeEmailHtml(toSafeHtmlFromText(parsed.text || ''));
   const plainText = parsed.text || textSnippet(parsed.html || '');
+  // Same rule as mail-service.js ingestImapMessage: the main thread resolves
+  // which authserv-ids this account trusts and sends them with the job.
+  const authentication = isSent || isDraft ? {} : authenticationColumns({
+    headerLines: parsed.headerLines,
+    fromEmail: sender(parsedFrom).email,
+    trustedIds: trustedAuthservIds,
+  });
   return {
+    ...authentication,
     account_id: account.id,
     thread_id: thread.id,
     mailbox,
@@ -128,6 +137,10 @@ const db = createDatabase({
   keyMode: workerData.keyMode || 'env',
 }, { checkpoint: false });
 const repos = createRepositories(db);
+// Rows this connection creates are reported back with each result so the
+// main thread can announce them (message.received).
+let createdWrites = [];
+repos.messageWrites.subscribe((write) => createdWrites.push(write));
 
 parentPort.on('message', async (msg) => {
   if (msg?.type === 'close') {
@@ -139,9 +152,11 @@ parentPort.on('message', async (msg) => {
   try {
     const source = Buffer.isBuffer(msg.source) ? msg.source : Buffer.from(msg.source);
     const parsed = await simpleParser(source);
+    createdWrites = [];
     const payload = buildPayload({
       repos,
       account: msg.account,
+      trustedAuthservIds: msg.trustedAuthservIds,
       mailbox: msg.mailbox,
       role: msg.role,
       allMailMirror: Boolean(msg.allMailMirror),
@@ -163,6 +178,7 @@ parentPort.on('message', async (msg) => {
       ok: true,
       imported,
       stamp: imported && typeof repos.changes?.stamp === 'function' ? repos.changes.stamp() : null,
+      writes: createdWrites.splice(0),
     });
   } catch (error) {
     parentPort.postMessage({ id: msg.id, ok: false, imported: false, error: String(error?.message || error) });

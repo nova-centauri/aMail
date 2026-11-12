@@ -4,8 +4,11 @@ import path from 'node:path';
 import { DEFAULT_LOG_LEVEL, normalizeLogLevel } from './logging.js';
 import { deriveSubkey } from './services/crypto.js';
 import { parseAuthHeaders, parseHostAllowlist } from './services/attachment-fetch.js';
+import { parseAuthservIdList } from './services/auth-results.js';
+import { parseWebhookAllowHosts, parseWebhookEventList } from './services/webhook-delivery.js';
 
 export const APP_NAME = 'aMail';
+export const APP_VERSION = '0.1.0';
 export const DATABASE_KEY_INFO = 'amail/database-key/v1';
 export const SESSION_COOKIE = 'amail_session';
 /** Cookie name used by GigaMail-era deployments; still accepted for auth. */
@@ -198,6 +201,30 @@ export function loadConfig(env = process.env) {
       min: 1_000,
       max: 120_000,
     }),
+    // Receiving-server names (authserv-ids) whose Authentication-Results
+    // headers are believed for every account, on top of each account's own
+    // list and the provider defaults. See docs/webhooks.md.
+    trustedAuthservIds: parseAuthservIdList(readEnv(env, 'TRUSTED_AUTHSERV_IDS')),
+    // message.received is announced only for mail received this recently, so
+    // a first sync or a re-import never floods webhook and SSE subscribers.
+    eventRecencyMs: integer(readEnv(env, 'EVENT_RECENCY_HOURS'), 24, { min: 1, max: 24 * 365 }) * 60 * 60 * 1000,
+    // Outbound webhooks. Subscriptions live in the database (REST/MCP); these
+    // three define one static subscription for deployments with no UI step.
+    // Nothing is sent, queued or resolved while no subscription exists.
+    webhookUrl: String(readEnv(env, 'WEBHOOK_URL') || '').trim() || null,
+    webhookSecret: readEnv(env, 'WEBHOOK_SECRET') || null,
+    webhookEvents: parseWebhookEventList(readEnv(env, 'WEBHOOK_EVENTS')),
+    // Exact hosts (names or IP literals) a webhook may target even though they
+    // are private, loopback or plain http. Empty: public https only.
+    webhookAllowHosts: parseWebhookAllowHosts(readEnv(env, 'WEBHOOK_ALLOW_HOSTS')),
+    webhookTimeoutMs: integer(readEnv(env, 'WEBHOOK_TIMEOUT_MS'), 10_000, { min: 1_000, max: 60_000 }),
+    // Consecutive events that ran out of retries before a subscription is
+    // switched off. 0 never switches one off.
+    webhookMaxConsecutiveFailures: integer(readEnv(env, 'WEBHOOK_MAX_CONSECUTIVE_FAILURES'), 20, { min: 0, max: 10_000 }),
+    // Undelivered events kept per subscription; the oldest is dropped beyond it.
+    webhookMaxQueue: integer(readEnv(env, 'WEBHOOK_MAX_QUEUE'), 1_000, { min: 1, max: 100_000 }),
+    // Finished deliveries kept per subscription for GET /api/webhooks/:id.
+    webhookDeliveryLogSize: integer(readEnv(env, 'WEBHOOK_DELIVERY_LOG_SIZE'), 100, { min: 1, max: 5_000 }),
     // `error` is the hosted profile: failures only, no per-request entries.
     logLevel: normalizeLogLevel(env.LOG_LEVEL, keyslotMode ? 'error' : DEFAULT_LOG_LEVEL),
     // Hosted-only usage metering. Unset means no-op: nothing is buffered or

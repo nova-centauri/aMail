@@ -13,6 +13,8 @@ aMail is the open-source continuation of GigaMail and upgrades existing GigaMail
 - **Unified inbox** for any number of IMAP/SMTP accounts: Gmail, iCloud, Outlook, Mail-in-a-Box, or any custom server. Threading from `Message-ID`/`References` with a safe subject fallback.
 - **One endpoint for agents.** A Streamable HTTP [MCP](https://modelcontextprotocol.io) server at `/mcp` plus a REST API at `/api`. Claude Custom Connectors use OAuth; Cursor and other header-based clients can use the existing access token. Agents can list, search, read, reply, triage, and manage accounts.
 - **Analyzed flags.** `analyzedAt`/`analyzedBy` per message, `unanalyzedCount` per conversation, `is:analyzed`/`is:unanalyzed` search operators, a "Not yet analyzed" queue in the sidebar, and `message_action: analyzed` for agents. Local-only; never written back to IMAP.
+- **Webhooks.** Subscribe a URL to `message.received`, `message.sent` and `message.analyzed`. aMail POSTs a small HMAC-signed JSON event (ids, sender, subject; never bodies), retries with backoff across restarts, and refuses private and metadata addresses. Manage over REST or MCP, or set one in `.env`. A first sync does not flood subscribers. See [docs/webhooks.md](docs/webhooks.md).
+- **Sender authentication.** Each message carries the SPF, DKIM and DMARC verdicts its receiving server recorded, in `authentication { spf, dkim, dmarc, trusted, fromAligned, … }`, on REST and MCP reads and in the review queue. Verdicts are marked `trusted` only when they come from a server you name for the account (Gmail's is built in), because a sender can forge the header.
 - **Explainable smart views.** Deterministic, on-device classification into Primary, GitHub CI, Logs, Status updates, and Ops errors, each with a human-readable reason. Routine infrastructure digests from sources you configure stay out of the default inbox unless they report a failure.
 - **Flagged people.** Turn any set of addresses into a sidebar folder. Edit in Settings, or let an agent manage the list with `list_flags`/`set_flags`.
 - **First-run wizard.** Connect inboxes, get agent config snippets, and learn the analyzed flow in four steps.
@@ -83,7 +85,10 @@ aMail publishes RFC 9728/RFC 8414 discovery metadata, requires authorization-cod
 | `migrate_local_drafts` | List (default `dryRun: true`) or move drafts that older aMail versions kept only inside aMail to each account's server Drafts. |
 | `message_action` | `read`/`unread`, `star`/`unstar`, `archive`, `trash`, `spam`, `snooze`, **`analyzed`/`unanalyzed`** (with `by: "<agent name>"`) |
 | `list_flags`, `set_flags` | Read or replace the flagged-people list |
-| `sync_mail`, `test_account`, `add_account`, `update_account`, `delete_account` | Account lifecycle; credentials are accepted but never echoed |
+| `sync_mail`, `test_account`, `add_account`, `update_account`, `delete_account` | Account lifecycle; credentials are accepted but never echoed. `trustedAuthservIds` on add/update names the receiving servers whose `Authentication-Results` are believed |
+| `list_webhooks`, `get_webhook`, `create_webhook`, `update_webhook`, `delete_webhook`, `test_webhook` | Outbound webhooks ([docs/webhooks.md](docs/webhooks.md)). The signing secret is returned once by `create_webhook` (or a rotation) and never again |
+
+`get_message`, `get_thread`, `list_unanalyzed_messages` and `claim_messages` include `authentication: { spf, dkim, dmarc, authservId, trusted, fromAligned, dkimDomains, returnPath }` on each message (`null` for mail imported before aMail recorded it). Rely on the verdicts only when `trusted` is `true`.
 
 `get_attachment` returns `{ attachment: { messageId, index, filename, contentType, size, sha256, encoding: "base64", contentBase64 } }`. Filename and content type are display labels only, limited to 256 and 128 characters. IMAP retrieval checks the cached RFC Message-ID, fetched UID, available mailbox UIDVALIDITY, and the exact indexed attachment metadata. It refuses an unverified match; older mail without a cached RFC Message-ID may therefore be unavailable. The original message must also fit the smaller of the configured sync source limit and 12 MiB, even when the selected attachment is under 8 MiB. No content is truncated.
 
@@ -101,7 +106,7 @@ Drafts deleted, sent, or replaced from another client disappear from aMail on th
 
 The review queue filters unanalyzed messages in the database before applying its page limit, independently of the conversation UI's list/search window. Its count covers cached `messages`, not drafts or provider mail that has never been imported. Sync may import only a recent window or skip unavailable/oversized messages; an empty queue is not proof that every historical provider message has been imported.
 
-Conversation listing and common state operations also exist over REST (`GET /api/messages?q=is%3Aunanalyzed`, `POST /api/messages/:id/analyzed`, `GET/PUT /api/flags`).
+Conversation listing and common state operations also exist over REST (`GET /api/messages?q=is%3Aunanalyzed`, `POST /api/messages/:id/analyzed`, `GET/PUT /api/flags`), as do webhooks (`GET/POST /api/webhooks`, `GET/PATCH/DELETE /api/webhooks/:id`, `POST /api/webhooks/:id/test`). `GET /api/events` is a Server-Sent Events stream of mailbox changes ([docs/api-events.md](docs/api-events.md)).
 
 ## Configuration
 
@@ -123,6 +128,11 @@ All settings are environment variables; see [`.env.example`](.env.example) for t
 | `AMAIL_TYPESENSE_URL`, `AMAIL_TYPESENSE_API_KEY` | Typesense listen URL and API key. Compose sets both; the service is not published on the host |
 | `TYPESENSE_API_KEY`, `TYPESENSE_MEMORY_LIMIT` | Key and memory cap for the Compose Typesense container (default `768m`) |
 | `REMOTE_CONTENT_PROXY_URL` | Set by `deploy/launch.sh` to route remote images via Tor/Privoxy |
+| `AMAIL_WEBHOOK_URL`, `AMAIL_WEBHOOK_SECRET`, `AMAIL_WEBHOOK_EVENTS` | One webhook subscription defined in the environment (events default to `message.received`). Others are created over REST/MCP |
+| `AMAIL_WEBHOOK_ALLOW_HOSTS` | Exact hosts a webhook may target although they are private or plain http (a receiver on your LAN). Empty: public https only |
+| `AMAIL_WEBHOOK_TIMEOUT_MS`, `AMAIL_WEBHOOK_MAX_CONSECUTIVE_FAILURES`, `AMAIL_WEBHOOK_MAX_QUEUE`, `AMAIL_WEBHOOK_DELIVERY_LOG_SIZE` | Webhook delivery limits (10 s, 20, 1000, 100) |
+| `AMAIL_EVENT_RECENCY_HOURS` | How recently mail must have been received to raise `message.received` (default 24), so a first sync or re-import is silent |
+| `AMAIL_TRUSTED_AUTHSERV_IDS` | Receiving-server names whose `Authentication-Results` headers are trusted for every account |
 | `AMAIL_METERING_URL`, `AMAIL_METERING_TOKEN`, `AMAIL_TENANT_ID` | Hosted only: POST analyzed-mark counts to a metering endpoint. Inert when unset |
 | `AMAIL_KEY_MODE` | `env` (default) or `keyslot`; see [Keyslot mode](#keyslot-mode-hosted-tenants) |
 | `AMAIL_PROVISION_SECRET`, `AMAIL_ESCROW_KEY`, `AMAIL_HANDOFF_SOCKET`, `AMAIL_HANDOFF_SECRET` | Keyslot mode only: provisioning, opt-in escrow, and deploy-time key handoff |

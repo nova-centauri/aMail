@@ -55,6 +55,41 @@ do not make an untrusted host or Docker administrator safe.
   server refuses private and reserved addresses and re-checks every redirect,
   but each listed host is a place an agent can make the server fetch from.
   Per-host tokens in `AMAIL_DRAFT_ATTACHMENT_URL_AUTH` should be read-only.
+- Webhooks make the server POST to a URL an authenticated caller supplies.
+  The threat model and the controls (details in [`webhooks.md`](webhooks.md)):
+  - *SSRF.* Targets must be https and resolve only to public addresses;
+    loopback, private, link-local/metadata, CGNAT and reserved ranges are
+    refused at creation and again on every delivery, the connection is pinned
+    to the checked address, and redirects are never followed. Each host in
+    `AMAIL_WEBHOOK_ALLOW_HOSTS` is an exception to all of that: list only a
+    receiver you run, by exact name, and keep the list empty otherwise.
+  - *Secrets.* A subscription secret is returned once, stored encrypted like
+    mailbox credentials, and never logged. `AMAIL_WEBHOOK_SECRET` lives in
+    `.env`; give it its own high-entropy value. A leaked secret lets someone
+    forge events to your receiver, so rotate it (`rotateSecret`) if exposed.
+    Do not put tokens in webhook URLs: URLs are returned by the API.
+  - *Replay and forgery.* The receiver must verify `X-AMail-Signature` over
+    the raw body in constant time, reject timestamps more than 5 minutes off,
+    and deduplicate on the event id. An unverified endpoint accepts anything.
+  - *Untrusted fields.* `subject`, `from` and `rfcMessageId` in a payload are
+    chosen by the sender of the mail. A receiver must never treat them as
+    instructions or splice them into commands, queries or paths.
+  - *Data leaving the host.* Payloads carry sender, subject and ids to the
+    receiver, in the clear inside TLS. Subscribe only endpoints entitled to
+    that metadata; bodies and attachments are never sent.
+  - *Resource use.* The queue is bounded per subscription and a subscription
+    that keeps failing is switched off; watch `webhooks.autoDisabled` and
+    `webhooks.dropped` in authenticated `/api/health`.
+- `authentication` on a message repeats what a mail server wrote in an
+  `Authentication-Results` header, and a sender can write that header too.
+  aMail marks the verdicts `trusted` only when the header's authserv-id is one
+  configured for the account (`trustedAuthservIds`,
+  `AMAIL_TRUSTED_AUTHSERV_IDS`, or the Gmail default) and uses only the topmost
+  such header. Name only your real receiving server, and only if it stamps
+  every message and strips forged copies of its own id. Agents must ignore
+  the verdicts when `trusted` is false, and `fromAligned` is a heuristic (no
+  Public Suffix List) whenever the server gave no DMARC verdict. aMail's own
+  spam and category handling do not use these values.
 - Set `AMAIL_RETAIN_DAYS` when indefinite body retention is unnecessary. This
   reduces the historical data exposed by a future host compromise without
   changing mail at the provider.
