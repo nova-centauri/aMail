@@ -5,6 +5,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Baked into /app/RELEASE_SHA. Do not rely on image ENV: the empty
+        # AMAIL_RELEASE_SHA interpolation below would override it at runtime.
+        RELEASE_SHA: ${AMAIL_RELEASE_SHA:-${GITHUB_SHA:-}}
     image: ${COMPOSE_PROJECT_NAME:-amail}:local
     restart: unless-stopped
     init: true

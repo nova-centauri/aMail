@@ -57,12 +57,33 @@ export function resolveDbPath(dataDir, { exists = fs.existsSync } = {}) {
   return modern;
 }
 
-export function loadConfig(env = process.env) {
+const RELEASE_SHA_RE = /^[0-9a-f]{40}$/;
+const BAKED_RELEASE_SHA_PATH = '/app/RELEASE_SHA';
+
+function parseReleaseSha(value) {
+  const sha = String(value || '').trim().toLowerCase();
+  return RELEASE_SHA_RE.test(sha) ? sha : null;
+}
+
+function readBakedReleaseSha(filePath) {
+  if (!filePath) return null;
+  try {
+    return parseReleaseSha(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function loadConfig(env = process.env, options = {}) {
   const dataDir = path.resolve(readEnv(env, 'DATA_DIR') || path.join(process.cwd(), 'data'));
   const encryptionKey = readEnv(env, 'ENCRYPTION_KEY');
   const credentialKey = deriveKey(encryptionKey);
   const remoteTokenKey = deriveKey(readEnv(env, 'REMOTE_TOKEN_KEY') || encryptionKey);
-  const releaseSha = String(readEnv(env, 'RELEASE_SHA') || '');
+  // Runtime AMAIL_RELEASE_SHA wins when it is a full commit. Compose always
+  // forwards ${AMAIL_RELEASE_SHA:-}, which is empty when unset and would
+  // override an image ENV — so the image also bakes /app/RELEASE_SHA.
+  const releaseSha = parseReleaseSha(readEnv(env, 'RELEASE_SHA'))
+    || readBakedReleaseSha(options.bakedReleaseShaPath ?? BAKED_RELEASE_SHA_PATH);
   // Whole-database encryption is opt-in for self-hosted installs because an
   // existing plaintext file is migrated in place on the first keyed boot.
   const encryptDatabase = boolean(readEnv(env, 'ENCRYPT_DATABASE'));
@@ -91,7 +112,7 @@ export function loadConfig(env = process.env) {
     dataDir,
     dbPath: resolveDbPath(dataDir),
     staticDir: path.resolve(readEnv(env, 'STATIC_DIR') || path.join(process.cwd(), 'dist')),
-    releaseSha: /^[0-9a-f]{40}$/i.test(releaseSha) ? releaseSha.toLowerCase() : null,
+    releaseSha,
     credentialKey: keyslotMode ? null : credentialKey,
     remoteTokenKey: keyslotMode ? null : remoteTokenKey,
     encryptDatabase: keyslotMode ? true : encryptDatabase,

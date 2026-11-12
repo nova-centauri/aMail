@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { loadConfig, parseOpsSources, readEnv, resolveDbPath } from '../config.js';
@@ -17,9 +19,28 @@ test('IMAP message download cap has a safe default and bounded configuration ran
 
 test('release SHA is exposed only when it is a full commit identifier', () => {
   const release = 'ABCDEF0123456789ABCDEF0123456789ABCDEF01';
-  assert.equal(loadConfig({}).releaseSha, null);
-  assert.equal(loadConfig({ AMAIL_RELEASE_SHA: 'abc123' }).releaseSha, null);
-  assert.equal(loadConfig({ AMAIL_RELEASE_SHA: release }).releaseSha, release.toLowerCase());
+  const missing = path.join(os.tmpdir(), 'amail-no-release-sha');
+  assert.equal(loadConfig({}, { bakedReleaseShaPath: missing }).releaseSha, null);
+  assert.equal(loadConfig({ AMAIL_RELEASE_SHA: 'abc123' }, { bakedReleaseShaPath: missing }).releaseSha, null);
+  assert.equal(loadConfig({ AMAIL_RELEASE_SHA: release }, { bakedReleaseShaPath: missing }).releaseSha, release.toLowerCase());
+});
+
+test('a baked image SHA is used when the runtime env is missing or invalid', () => {
+  const baked = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+  const envSha = 'cccccccccccccccccccccccccccccccccccccccc';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-release-sha-'));
+  const file = path.join(dir, 'RELEASE_SHA');
+  try {
+    fs.writeFileSync(file, `${baked}\n`);
+    assert.equal(loadConfig({}, { bakedReleaseShaPath: file }).releaseSha, baked);
+    assert.equal(loadConfig({ AMAIL_RELEASE_SHA: '' }, { bakedReleaseShaPath: file }).releaseSha, baked);
+    assert.equal(loadConfig({ AMAIL_RELEASE_SHA: '8515035' }, { bakedReleaseShaPath: file }).releaseSha, baked);
+    assert.equal(loadConfig({ AMAIL_RELEASE_SHA: envSha }, { bakedReleaseShaPath: file }).releaseSha, envSha);
+    fs.writeFileSync(file, '8515035\n');
+    assert.equal(loadConfig({}, { bakedReleaseShaPath: file }).releaseSha, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('GigaMail-era GIGAMAIL_* variables keep working as a fallback', () => {
