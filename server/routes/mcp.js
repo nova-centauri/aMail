@@ -2,15 +2,22 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { accessGate } from '../middleware/auth.js';
 import { createAmailMcpServer } from '../mcp/server.js';
 import { createDeepSearchService } from '../services/deep-search.js';
+import { createAttachmentReader } from '../services/attachment-reader.js';
+import { fetchVerifiedAttachment } from '../mcp/attachments.js';
 
 /**
  * Mount a stateless Streamable HTTP MCP endpoint at /mcp.
  * Auth accepts the existing aMail credential and OAuth access tokens minted by
  * the Claude custom-connector flow.
  */
-export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, oauth = null, deepSearch = null, webhooks = null }) {
+export function registerMcp(app, { config, repos, mailService, remoteContent, auth = config, oauth = null, deepSearch = null, webhooks = null, attachmentReader = null }) {
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const gate = accessGate(auth, { challenge: (request) => oauth?.challenge?.(request) });
+  // One reader per app, not per request: each MCP POST builds a new server,
+  // and paging through a long attachment should reuse the parsed text.
+  const reader = attachmentReader || createAttachmentReader({
+    fetchBytes: (messageId, index) => fetchVerifiedAttachment({ repos, mailService }, messageId, index),
+  });
   const handleMcp = async (request, response) => {
     const server = createAmailMcpServer({
       config,
@@ -19,6 +26,7 @@ export function registerMcp(app, { config, repos, mailService, remoteContent, au
       remoteContent,
       deepSearch: searchJobs,
       webhooks,
+      attachmentReader: reader,
       logger: request.log,
     });
     let transport;

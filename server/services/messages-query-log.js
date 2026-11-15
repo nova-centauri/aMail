@@ -72,11 +72,17 @@ export function sanitizeMcpToolArgs(name, args = {}) {
       };
     case 'get_thread':
     case 'get_message':
+      return { tool, idChars: String(input.id || '').length };
     case 'get_attachment':
+    case 'read_attachment':
+    case 'view_attachment':
+    case 'get_attachment_link':
       return {
         tool,
         idChars: String(input.id || '').length,
-        ...(tool === 'get_attachment' ? { index: Number.isInteger(input.index) ? input.index : null } : {}),
+        index: Number.isInteger(input.index) ? input.index : null,
+        ...(Number.isInteger(input.page) ? { page: input.page } : {}),
+        ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
       };
     case 'get_deep_search':
     case 'cancel_deep_search':
