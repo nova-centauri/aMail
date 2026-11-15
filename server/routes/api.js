@@ -348,15 +348,25 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
       });
     }
     if (!repos.messages.getRaw(payload.m)) throw new NotFoundError('Message for this attachment token no longer exists.');
-    const result = await mailService.fetchAttachment(payload.m, payload.i);
+    // d: 1 marks a link an agent asked for (get_attachment_link). Re-verify
+    // the exact part like the MCP tools do, and always serve it as a download.
+    const agentLink = payload.d === 1;
+    let result;
+    try {
+      result = await mailService.fetchAttachment(payload.m, payload.i, agentLink ? { strict: true } : undefined);
+    } catch (error) {
+      if (!agentLink) throw error;
+      throw new AppError('Could not retrieve this attachment.', { status: 503, code: 'ATTACHMENT_UNAVAILABLE', expose: true });
+    }
     const contentType = safeAttachmentType(result.contentType);
     const filename = asciiFilename(result.filename);
-    const inline = INLINE_IMAGE_TYPES.has(contentType);
+    const inline = !agentLink && INLINE_IMAGE_TYPES.has(contentType);
     response.set('Content-Type', contentType);
     response.set('Content-Length', String(result.body.length));
     response.set('Cache-Control', 'private, no-store');
     response.set('X-Content-Type-Options', 'nosniff');
     response.set('Cross-Origin-Resource-Policy', 'same-origin');
+    response.set('Referrer-Policy', 'no-referrer');
     response.set(
       'Content-Disposition',
       `${inline ? 'inline' : 'attachment'}; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
