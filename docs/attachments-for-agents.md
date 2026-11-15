@@ -125,10 +125,16 @@ What changed:
   fetch headers, BODYSTRUCTURE and the first plain and HTML body parts (up to
   1 MiB each, `BODY.PEEK`, mailbox opened read-only). The file list keeps each
   file's IMAP part number, real type and a decoded-size estimate. These rows
-  read like any other message and join the not-yet-analyzed queue.
+  read like any other message and join the not-yet-analyzed queue. If the
+  server lists a body part but does not deliver it, the row stays incomplete
+  (out of the queue) so opening it or the repair tool tries again. These
+  imports count against the per-account sync budget like any other.
 - **Files download by part.** For a row without its full source, the
   attachment tools fetch BODYSTRUCTURE, check the UID, Message-ID, part number
-  and filename against the cached row, and download that one part. Nothing
+  and filename against the cached row, and download that one part. A file is
+  refused early only when its encoded size proves it is over the limit
+  (quoted-printable can be three times its decoded size); otherwise the
+  decoded download enforces the limit exactly. Nothing
   else in the message is downloaded. Rows a search saves now list each file's
   real type, part and estimated size instead of 0 bytes.
 - **Readable size is 25 MiB.** `read_attachment`, `view_attachment` and

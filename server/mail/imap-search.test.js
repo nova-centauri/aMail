@@ -3,6 +3,7 @@ import test from 'node:test';
 import { parseMailboxQuery } from './search-query.js';
 import {
   bodyStructureAttachments,
+  minDecodedSize,
   bodyStructureFilenames,
   bodyStructureTextParts,
   canUseGmraw,
@@ -127,4 +128,12 @@ test('BODYSTRUCTURE attachments carry their part numbers and decoded size estima
   assert.deepEqual(bodyStructureTextParts(structure), { text: { part: '1.1', size: 120 }, html: { part: '1.2', size: 900 } });
   // A single-part message is part 1 even when the server omits the number.
   assert.deepEqual(bodyStructureTextParts({ type: 'text/plain', size: 10 }), { text: { part: '1', size: 10 } });
+});
+
+test('minDecodedSize is a lower bound for each transfer encoding', () => {
+  assert.equal(minDecodedSize(1000, 'base64'), 720);
+  assert.equal(minDecodedSize(900, 'quoted-printable'), 300);
+  assert.equal(minDecodedSize(500, '7bit'), 500);
+  assert.equal(minDecodedSize(null, 'base64'), 0);
+  assert.equal(minDecodedSize(-1, 'base64'), 0);
 });

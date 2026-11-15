@@ -514,6 +514,69 @@ test('IMAP sync imports oversized messages in parts without downloading their fu
   await service.close();
 });
 
+function largeNewsletter(uid, { textPart = true } = {}) {
+  return {
+    uid,
+    size: 50_000,
+    internalDate: new Date('2026-11-14T18:54:38Z'),
+    envelope: { messageId: `<newsletter-${uid}@school.example.test>`, subject: `Newsletter ${uid}` },
+    headers: Buffer.from([
+      'From: School Office <office@school.example.test>',
+      `Subject: Newsletter ${uid}`,
+      `Message-ID: <newsletter-${uid}@school.example.test>`,
+      'Content-Type: multipart/mixed; boundary="b1"',
+      '',
+    ].join('\r\n')),
+    bodyStructure: {
+      type: 'multipart/mixed',
+      childNodes: [
+        ...(textPart ? [{ part: '1', type: 'text/plain', parameters: { charset: 'utf-8' }, size: 40 }] : []),
+        {
+          part: textPart ? '2' : '1', type: 'application/pdf', encoding: 'base64', size: 40_000,
+          disposition: 'attachment', dispositionParameters: { filename: 'newsletter.pdf' },
+        },
+      ],
+    },
+  };
+}
+
+test('a large message whose body part does not download stays incomplete so it is tried again', async () => {
+  const { service, state } = syncHarness({
+    maxMessageBytes: 1_000,
+    messages: [largeNewsletter(1)],
+    sources: new Map(),
+    // No entry for 1:1, so the server returns no content for the text part.
+    parts: new Map(),
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.mailboxes[0].importedPartial, 1);
+  const [row] = state.savedMessages;
+  assert.equal(row.rfc_message_id, '<newsletter-1@school.example.test>');
+  assert.equal(row.source_imported, 0, 'kept out of the analysis queue and eligible for repair');
+  assert.equal(JSON.parse(row.attachments_json)[0].part, '2');
+  await service.close();
+});
+
+test('large messages imported in parts count against the per-account message budget', async () => {
+  const { service, state } = syncHarness({
+    maxMessageBytes: 1_000,
+    syncMaxMessagesPerAccount: 1,
+    messages: [largeNewsletter(1, { textPart: false }), largeNewsletter(2, { textPart: false })],
+    sources: new Map(),
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.mailboxes[0].importedPartial, 1);
+  assert.deepEqual(state.savedMessages.map((row) => row.uid), [1]);
+  // Progress stops at the last message this pass took, so the next pass
+  // imports UID 2 instead of skipping it.
+  assert.equal(state.savedSync.last_uid, 1);
+  await service.close();
+});
+
 test('a message the database rejects is skipped and reported instead of pinning the mailbox', async () => {
   const source = (id, body) => Buffer.from([
     'From: Sender <sender@example.test>',
@@ -2187,6 +2250,30 @@ test('a part download refuses another message at the same UID and files over the
     (error) => error.code === 'ATTACHMENT_IDENTITY_UNVERIFIED',
   );
   assert.equal(harness.state.downloads.length, 0, 'nothing is downloaded for a message that does not match');
+  await harness.service.close();
+});
+
+test('a quoted-printable file larger encoded than the limit still downloads when it fits decoded', async () => {
+  const invoice = historicalInvoice();
+  // Quoted-printable can take three bytes per decoded byte, so its encoded
+  // size says little about the file a reader gets.
+  invoice.bodyStructure.childNodes[1].encoding = 'quoted-printable';
+  invoice.bodyStructure.childNodes[1].size = 150;
+  const decoded = Buffer.alloc(50, 1);
+  const harness = searchHarness({ messages: [invoice], parts: new Map([['99:2', decoded]]) });
+  const row = await materializeInvoice(harness);
+
+  const fetched = await harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 64 });
+  assert.deepEqual(fetched.body, decoded);
+
+  // Surely too large even at the best case: refused before any download.
+  invoice.bodyStructure.childNodes[1].size = 300;
+  harness.state.downloads.length = 0;
+  await assert.rejects(
+    harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 64 }),
+    (error) => error.details?.reason === 'ATTACHMENT_TOO_LARGE',
+  );
+  assert.equal(harness.state.downloads.length, 0);
   await harness.service.close();
 });
 

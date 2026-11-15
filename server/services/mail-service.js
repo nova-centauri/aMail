@@ -49,6 +49,7 @@ import {
   IMAP_SEARCH_MAILBOX_CAP,
   IMAP_SEARCH_UID_CAP,
   bodyStructureAttachments,
+  minDecodedSize,
   bodyStructureFilenames,
   bodyStructureTextParts,
   canUseGmraw,
@@ -1235,6 +1236,7 @@ export function createMailService({
       }
     }
     const bodies = {};
+    let bodyMissing = false;
     const textParts = bodyStructureTextParts(meta.bodyStructure);
     for (const key of ['text', 'html']) {
       const found = textParts[key];
@@ -1242,7 +1244,9 @@ export function createMailService({
       try {
         const downloaded = await downloadPart(client, uid, found.part, PARTIAL_TEXT_MAX_BYTES);
         if (downloaded) bodies[key] = downloaded.body.toString('utf8');
+        else bodyMissing = true;
       } catch (error) {
+        bodyMissing = true;
         logger.warn({ accountId: account.id, mailbox, uid, part: key, ...attachmentFailureDiagnostic(error, 'download_text') }, 'Could not download a body part of a large message');
       }
     }
@@ -1264,7 +1268,7 @@ export function createMailService({
       attachments: [],
     };
     // false: a Gmail All Mail copy of mail aMail already holds elsewhere.
-    return importPayload({
+    const payload = importPayload({
       account,
       mailbox,
       role,
@@ -1272,7 +1276,13 @@ export function createMailService({
       message: meta,
       parsed,
       attachmentsJson: stringify(partialAttachmentMetadata(meta.bodyStructure)),
-    }) || false;
+    });
+    if (!payload) return false;
+    // A body part the server advertised but did not deliver keeps the row
+    // incomplete: it stays out of the analysis queue, and opening it or
+    // repair_incomplete_messages tries again instead of keeping it empty.
+    if (bodyMissing) payload.source_imported = 0;
+    return payload;
   }
 
   /**
@@ -1794,30 +1804,30 @@ export function createMailService({
           }
           candidates.push(candidate);
         }
-        const wanted = [];
-        const oversized = [];
-        for (const candidate of candidates) {
-          if (candidate.size !== null && candidate.size > maxMessageBytes) oversized.push(candidate.uid);
-          else wanted.push(candidate);
-        }
-        let fetchList = wanted;
+        candidates.sort((a, b) => a.uid - b.uid);
+        // The budget covers every message this pass imports, whole or in
+        // parts, so a mailbox of large mail cannot run past it.
+        let selected = candidates;
         if (messageBudget) {
           const take = Math.max(0, Number(messageBudget.left) || 0);
-          if (take < wanted.length) fetchList = wanted.slice(0, take);
-          messageBudget.left = take - fetchList.length;
+          if (take < candidates.length) selected = candidates.slice(0, take);
+          messageBudget.left = take - selected.length;
         }
-        // A capped page records progress only up to its last fetched UID, so
-        // leave larger messages past that point for the pass that reaches them.
-        const progressCutoff = fetchList.length < wanted.length ? (fetchList.at(-1)?.uid || 0) : Infinity;
-        oversizedUids.push(...oversized.filter((uid) => uid <= progressCutoff));
+        const fetchList = [];
+        for (const candidate of selected) {
+          if (candidate.size !== null && candidate.size > maxMessageBytes) oversizedUids.push(candidate.uid);
+          else fetchList.push(candidate);
+        }
         for (let index = 0; index < fetchList.length; index += SYNC_SOURCE_CHUNK) {
           await fetchSources(fetchList.slice(index, index + SYNC_SOURCE_CHUNK));
         }
         await importOversized();
         await flushWrites();
-        const cappedPage = fetchList.length < wanted.length || (messageBudget && messageBudget.left <= 0);
+        // A capped page records progress only up to its last selected UID, so
+        // the next pass picks up where this one stopped.
+        const cappedPage = selected.length < candidates.length || (messageBudget && messageBudget.left <= 0);
         if (!scanDrafts) {
-          lastUid = Math.max(lastUid, cappedPage ? (fetchList.at(-1)?.uid || lastUid) : page.endUid);
+          lastUid = Math.max(lastUid, cappedPage ? (selected.at(-1)?.uid || lastUid) : page.endUid);
         } else if (scanned.length) lastUid = Math.max(lastUid, scanned.at(-1).uid);
         saveProgress();
         await yieldEventLoop();
@@ -2774,7 +2784,9 @@ export function createMailService({
     if ((expectedPart && expectedPart !== node.part) || (strict && meta?.filename && meta.filename !== node.filename)) {
       throw attachmentIdentityError();
     }
-    if (strict && node.estimatedSize > byteLimit) throw tooLarge();
+    // Refuse early only when the file is surely too large; the decoded
+    // download below enforces the exact limit.
+    if (strict && minDecodedSize(node.encodedSize, node.encoding) > byteLimit) throw tooLarge();
     const downloaded = await downloadPart(client, message.uid, node.part, strict ? byteLimit : MAX_AGENT_ATTACHMENT_BYTES);
     if (!downloaded) throw new NotFoundError('Attachment not found in the original message.');
     if (downloaded.truncated) throw tooLarge();
@@ -2808,7 +2820,6 @@ export function createMailService({
       : [];
     if (strict && strictMatches.length !== 1) throw new NotFoundError('Attachment not found.');
     const strictMeta = strictMatches[0];
-    if (strict && Number(strictMeta.size) > byteLimit) throw tooLarge();
     let rawAttachments = [];
     try {
       rawAttachments = JSON.parse(repos.messages.getRaw?.(messageId)?.attachments_json || '[]');
@@ -2819,6 +2830,12 @@ export function createMailService({
     const rawMatches = rawAttachments.filter((item, index) => (Number.isInteger(item?.index) ? item.index : index) === resolvedIndex);
     const rawMeta = strict ? (rawMatches.length === 1 ? rawMatches[0] : null)
       : rawMatches[0] || rawAttachments[resolvedIndex];
+    // A row imported in parts lists an estimated size; check its lower bound
+    // here and the exact size once the part is downloaded.
+    const knownSize = typeof rawMeta?.part === 'string'
+      ? minDecodedSize(rawMeta.encodedSize, rawMeta.encoding)
+      : Number(strictMeta?.size);
+    if (strict && knownSize > byteLimit) throw tooLarge();
     if (strict && typeof rawMeta?.content === 'string' && rawMeta.content.length > Math.ceil(byteLimit / 3) * 4) throw tooLarge();
     const stored = attachmentContentBuffer(rawMeta);
     if (stored) {
@@ -3619,7 +3636,7 @@ export function createMailService({
       // A UID can be reused after UIDVALIDITY changes; never fill this row
       // with another message's content.
       if (message.messageId && payload.rfc_message_id && payload.rfc_message_id !== message.messageId) return message;
-      payload.source_imported = 1;
+      payload.source_imported ??= 1;
       return repos.messages.upsert(payload) || message;
     } catch (error) {
       logger.warn({ messageId: id, err: cleanupError(error) }, 'Could not hydrate message source from IMAP');

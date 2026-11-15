@@ -232,10 +232,25 @@ export function bodyStructureAttachments(node) {
     });
 }
 
+/** A typical decoded size, for display. Quoted-printable can shrink a lot. */
 export function estimateDecodedSize(encodedSize, encoding) {
   if (!Number.isSafeInteger(encodedSize) || encodedSize < 0) return 0;
   if (encoding === 'base64') return Math.floor(encodedSize * (76 / 78) * 0.75);
   return encodedSize;
+}
+
+/**
+ * The smallest the decoded part can be, for refusing a file early only when
+ * it is surely over a limit. Base64 allows for lines as short as 48
+ * characters; quoted-printable for every byte written as =XX.
+ */
+export function minDecodedSize(encodedSize, encoding) {
+  const size = Number(encodedSize);
+  if (!Number.isSafeInteger(size) || size < 0) return 0;
+  const name = String(encoding || '').toLowerCase();
+  if (name === 'base64') return Math.floor(size * 0.72);
+  if (name === 'quoted-printable') return Math.floor(size / 3);
+  return size;
 }
 
 /** The first text/plain and text/html body parts that are not attachments. */
