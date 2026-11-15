@@ -14,6 +14,7 @@ import { resolveTrustedAuthservIds } from '../services/auth-results.js';
 import { unavailableWebhookService } from '../services/webhooks.js';
 import { registerWebhookRoutes } from './webhooks.js';
 import { createDeepSearchService, jobSnapshot } from '../services/deep-search.js';
+import { MAX_READABLE_ATTACHMENT_BYTES, safeAttachmentFetchError } from '../mcp/attachments.js';
 import { resolveSearchBackend } from '../services/search-engine.js';
 import { HIDDEN_DEFAULT_CATEGORIES, configuredOpsSources } from '../services/smart-filter.js';
 import { loadPersonFlags, publicPersonFlag, savePersonFlags } from '../services/person-flags.js';
@@ -353,10 +354,15 @@ export function registerApi(app, { config, repos, mailService, remoteContent, pa
     const agentLink = payload.d === 1;
     let result;
     try {
-      result = await mailService.fetchAttachment(payload.m, payload.i, agentLink ? { strict: true } : undefined);
+      result = await mailService.fetchAttachment(
+        payload.m,
+        payload.i,
+        agentLink ? { strict: true, maxBytes: MAX_READABLE_ATTACHMENT_BYTES } : undefined,
+      );
     } catch (error) {
       if (!agentLink) throw error;
-      throw new AppError('Could not retrieve this attachment.', { status: 503, code: 'ATTACHMENT_UNAVAILABLE', expose: true });
+      // Fixed codes and sentences only, as the MCP attachment tools give.
+      throw safeAttachmentFetchError(error, MAX_READABLE_ATTACHMENT_BYTES);
     }
     const contentType = safeAttachmentType(result.contentType);
     const filename = asciiFilename(result.filename);

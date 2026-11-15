@@ -48,7 +48,9 @@ import {
   IMAP_ENVELOPE_FETCH_CAP,
   IMAP_SEARCH_MAILBOX_CAP,
   IMAP_SEARCH_UID_CAP,
+  bodyStructureAttachments,
   bodyStructureFilenames,
+  bodyStructureTextParts,
   canUseGmraw,
   imapSearchIsSelective,
   mailboxesForDeepSearch,
@@ -67,6 +69,12 @@ import { createMessageEvents } from './message-events.js';
 
 const DEFAULT_SYNC_MAX_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// Largest single attachment an agent may read, view or download through a
+// part download. Gmail caps a whole message at 25 MB, so this covers any
+// attachment a mailbox can hold without loading the rest of the message.
+export const MAX_AGENT_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+// Body text kept for a message too large to import whole.
+const PARTIAL_TEXT_MAX_BYTES = 1024 * 1024;
 const MAX_STRICT_ATTACHMENT_SOURCE_BYTES = 12 * 1024 * 1024;
 const ATTACHMENT_FAILURE_CODES = new Set([
   'AUTHENTICATIONFAILED', 'AUTHORIZATIONFAILED', 'UNAVAILABLE', 'NONEXISTENT', 'NOPERM', 'INUSE',
@@ -1043,6 +1051,15 @@ export function createMailService({
     if (!message.source) return null;
     const parsed = await simpleParser(message.source);
     assertAccountGeneration(account.id, generation);
+    return importPayload({ account, mailbox, role, allMailMirror, message, parsed });
+  }
+
+  /**
+   * Row for a parsed message. parsed is mailparser's shape. attachmentsJson
+   * overrides the attachment list (a partial import lists BODYSTRUCTURE
+   * parts, since the files themselves were never downloaded).
+   */
+  function importPayload({ account, mailbox, role, allMailMirror = false, message, parsed, attachmentsJson = null }) {
     const envelope = message.envelope || {};
     const messageId = parsed.messageId || envelope.messageId || null;
     const references = normalizeMessageIds(parsed.references || envelope.references);
@@ -1099,7 +1116,7 @@ export function createMailService({
       html_body: sanitized.html,
       text_body: plainText,
       snippet: textSnippet(plainText || parsed.html),
-      attachments_json: stringify(attachmentMetadata(parsed.attachments)),
+      attachments_json: attachmentsJson ?? stringify(attachmentMetadata(parsed.attachments)),
       labels_json: stringify(labels),
       is_read: flags.has('\\Seen') ? 1 : 0,
       is_starred: flags.has('\\Flagged') ? 1 : 0,
@@ -1135,7 +1152,6 @@ export function createMailService({
     const thread = existingUid
       ? repos.threads.get(existingUid.threadId)
       : resolveThread({ accountId: account.id, subject, inReplyTo, references });
-    const filenames = bodyStructureFilenames(message.bodyStructure);
     const receivedAt = asIso(message.internalDate || envelope.date);
     return {
       account_id: account.id,
@@ -1157,9 +1173,10 @@ export function createMailService({
       html_body: '',
       text_body: '',
       snippet: textSnippet(subject),
-      attachments_json: stringify(filenames.map((filename, index) => ({
-        index, filename, contentType: 'application/octet-stream', size: 0, contentId: null,
-      }))),
+      // Real types, part numbers and size estimates from BODYSTRUCTURE, so the
+      // list is right before the message is opened and each file downloads
+      // by its part.
+      attachments_json: stringify(partialAttachmentMetadata(message.bodyStructure)),
       labels_json: stringify(labels),
       is_read: flags.has('\\Seen') ? 1 : 0,
       is_starred: flags.has('\\Flagged') ? 1 : 0,
@@ -1173,6 +1190,118 @@ export function createMailService({
     };
   }
 
+  /** Attachment rows for a message known only by its BODYSTRUCTURE. */
+  function partialAttachmentMetadata(bodyStructure) {
+    return bodyStructureAttachments(bodyStructure).map((item, index) => ({
+      index,
+      filename: item.filename,
+      contentType: item.contentType,
+      size: item.estimatedSize,
+      contentId: item.contentId,
+      // Where the file lives on the server, for a download of that part alone.
+      part: item.part,
+      encoding: item.encoding,
+      encodedSize: item.encodedSize,
+    }));
+  }
+
+  /**
+   * Import a message too large to download whole: its headers, the first
+   * plain and HTML body parts (up to 1 MiB each) and the attachment list
+   * from BODYSTRUCTURE, with each file's part number. The row reads like any
+   * other message, and fetchAttachment downloads one part on demand. Uses
+   * BODY.PEEK only; the caller holds the mailbox lock. Never call it while a
+   * FETCH on the same client is still streaming. Returns null when the
+   * server did not return the message, false for a mirror duplicate.
+   */
+  async function partialImportPayload({ account, client, mailbox, role, allMailMirror = false, uid, generation }) {
+    const meta = await client.fetchOne(uid, {
+      uid: true,
+      envelope: true,
+      flags: true,
+      labels: true,
+      internalDate: true,
+      size: true,
+      bodyStructure: true,
+      headers: true,
+    }, { uid: true });
+    if (!meta?.envelope || !meta.bodyStructure || Number(meta.uid) !== Number(uid)) return null;
+    let headers = {};
+    if (Buffer.isBuffer(meta.headers) && meta.headers.length) {
+      try {
+        headers = await simpleParser(Buffer.concat([meta.headers, Buffer.from('\r\n\r\n')]));
+      } catch {
+        headers = {};
+      }
+    }
+    const bodies = {};
+    const textParts = bodyStructureTextParts(meta.bodyStructure);
+    for (const key of ['text', 'html']) {
+      const found = textParts[key];
+      if (!found) continue;
+      try {
+        const downloaded = await downloadPart(client, uid, found.part, PARTIAL_TEXT_MAX_BYTES);
+        if (downloaded) bodies[key] = downloaded.body.toString('utf8');
+      } catch (error) {
+        logger.warn({ accountId: account.id, mailbox, uid, part: key, ...attachmentFailureDiagnostic(error, 'download_text') }, 'Could not download a body part of a large message');
+      }
+    }
+    assertAccountGeneration(account.id, generation);
+    const parsed = {
+      messageId: headers.messageId,
+      references: headers.references,
+      inReplyTo: headers.inReplyTo,
+      subject: headers.subject,
+      from: headers.from,
+      to: headers.to,
+      cc: headers.cc,
+      bcc: headers.bcc,
+      replyTo: headers.replyTo,
+      date: headers.date,
+      headerLines: headers.headerLines || [],
+      text: bodies.text || '',
+      html: bodies.html || '',
+      attachments: [],
+    };
+    // false: a Gmail All Mail copy of mail aMail already holds elsewhere.
+    return importPayload({
+      account,
+      mailbox,
+      role,
+      allMailMirror,
+      message: meta,
+      parsed,
+      attachmentsJson: stringify(partialAttachmentMetadata(meta.bodyStructure)),
+    }) || false;
+  }
+
+  /**
+   * Download one decoded body part. Returns { body, truncated }: imapflow
+   * stops quietly at maxBytes, so ask for one byte more to tell a file that
+   * is exactly the limit from one that was cut.
+   */
+  async function downloadPart(client, uid, part, maxBytes) {
+    const result = await client.download(uid, part, { uid: true, maxBytes: maxBytes + 1 });
+    const content = result?.content;
+    if (!content) return null;
+    const chunks = [];
+    let total = 0;
+    let truncated = false;
+    for await (const chunk of content) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (total + buffer.length > maxBytes) {
+        chunks.push(buffer.subarray(0, maxBytes - total));
+        total = maxBytes;
+        truncated = true;
+        content.destroy?.();
+        break;
+      }
+      chunks.push(buffer);
+      total += buffer.length;
+    }
+    return { body: Buffer.concat(chunks, total), truncated };
+  }
+
   async function syncMailbox({ account, client, descriptor, limit, generation, mode = 'incremental', statusPreview = null, messageBudget = null }) {
     const { mailbox, role, allMailMirror = false } = descriptor;
     const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
@@ -1183,6 +1312,8 @@ export function createMailService({
     let skippedTooLarge = 0;
     let skippedUnavailable = 0;
     let skippedFailed = 0;
+    let importedPartial = 0;
+    const oversizedUids = [];
     const previousSync = repos.sync.get(account.id, mailbox);
     let lastUid = previousSync?.last_uid || 0;
     let uidValidity = null;
@@ -1334,7 +1465,8 @@ export function createMailService({
         if (!Buffer.isBuffer(source)) {
           skippedUnavailable += 1;
         } else if (source.length > maxMessageBytes) {
-          skippedTooLarge += 1;
+          // Imported in parts once this FETCH has released the connection.
+          oversizedUids.push(uid);
         } else {
           await ingestSource(message, source);
         }
@@ -1344,6 +1476,35 @@ export function createMailService({
       }
       // Expunged between the size scan and this FETCH.
       skippedUnavailable += chunk.length - seen.size;
+    };
+
+    // Messages over the source cap were once skipped outright, so a large
+    // newsletter or a quote with a big PDF never appeared at all. Import
+    // their headers, text and attachment list instead; files download one
+    // part at a time when someone opens them.
+    const importOversized = async () => {
+      const uids = oversizedUids.splice(0, oversizedUids.length);
+      for (const uid of uids) {
+        assertAccountGeneration(account.id, generation);
+        try {
+          const payload = await partialImportPayload({ account, client, mailbox, role, allMailMirror, uid, generation });
+          if (payload) {
+            importedPartial += 1;
+            pendingWrites.push(payload);
+            if (pendingWrites.length >= SYNC_WRITE_CHUNK) await flushWrites();
+          } else if (payload === null) {
+            skippedTooLarge += 1;
+          }
+        } catch (error) {
+          assertAccountGeneration(account.id, generation);
+          skippedTooLarge += 1;
+          logger.warn(
+            { accountId: account.id, mailbox, uid, ...attachmentFailureDiagnostic(error, 'partial_import') },
+            'Large IMAP message could not be imported in parts; skipping it',
+          );
+        }
+        await yieldEventLoop();
+      }
     };
 
     const timing = createPhaseTimer({
@@ -1634,8 +1795,9 @@ export function createMailService({
           candidates.push(candidate);
         }
         const wanted = [];
+        const oversized = [];
         for (const candidate of candidates) {
-          if (candidate.size !== null && candidate.size > maxMessageBytes) skippedTooLarge += 1;
+          if (candidate.size !== null && candidate.size > maxMessageBytes) oversized.push(candidate.uid);
           else wanted.push(candidate);
         }
         let fetchList = wanted;
@@ -1644,9 +1806,14 @@ export function createMailService({
           if (take < wanted.length) fetchList = wanted.slice(0, take);
           messageBudget.left = take - fetchList.length;
         }
+        // A capped page records progress only up to its last fetched UID, so
+        // leave larger messages past that point for the pass that reaches them.
+        const progressCutoff = fetchList.length < wanted.length ? (fetchList.at(-1)?.uid || 0) : Infinity;
+        oversizedUids.push(...oversized.filter((uid) => uid <= progressCutoff));
         for (let index = 0; index < fetchList.length; index += SYNC_SOURCE_CHUNK) {
           await fetchSources(fetchList.slice(index, index + SYNC_SOURCE_CHUNK));
         }
+        await importOversized();
         await flushWrites();
         const cappedPage = fetchList.length < wanted.length || (messageBudget && messageBudget.left <= 0);
         if (!scanDrafts) {
@@ -1678,6 +1845,9 @@ export function createMailService({
           'IMAP messages skipped without importing source content',
         );
       }
+      if (importedPartial) {
+        logger.info({ accountId: account.id, mailbox, importedPartial, maxMessageBytes }, 'Large IMAP messages imported without their full source');
+      }
       saveProgress();
       repos.accounts.markSynced(account.id);
       return {
@@ -1685,6 +1855,7 @@ export function createMailService({
         role,
         status: skipped ? 'partial' : 'ok',
         imported,
+        importedPartial,
         skipped,
         skipReasons,
         lastUid,
@@ -2580,7 +2751,46 @@ export function createMailService({
     return fetchAttachmentOnce(messageId, index, options);
   }
 
-  async function fetchAttachmentOnce(messageId, index, { strict = false } = {}) {
+  /**
+   * One attachment by its BODYSTRUCTURE part. The part is chosen by the same
+   * order the row was built from and checked against the stored part number
+   * and filename, so a UID that now holds another message, or a shifted part
+   * list, fails instead of returning the wrong file. Size is checked from the
+   * structure before any download and again on the decoded bytes.
+   */
+  async function fetchAttachmentPart({ client, message, resolvedIndex, meta, rawMeta, strict, byteLimit, tooLarge }) {
+    const structure = await client.fetchOne(message.uid, { uid: true, envelope: true, bodyStructure: true }, { uid: true });
+    if (!structure?.bodyStructure) {
+      throw new NotFoundError('This message is no longer in its mailbox on the server.');
+    }
+    if (strict && (Number(structure.uid) !== message.uid
+      || String(structure.envelope?.messageId || '').trim() !== String(message.messageId || '').trim())) {
+      throw attachmentIdentityError();
+    }
+    const parts = bodyStructureAttachments(structure.bodyStructure);
+    const node = parts[resolvedIndex];
+    if (!node) throw new NotFoundError('Attachment not found in the original message.');
+    const expectedPart = typeof rawMeta?.part === 'string' ? rawMeta.part : null;
+    if ((expectedPart && expectedPart !== node.part) || (strict && meta?.filename && meta.filename !== node.filename)) {
+      throw attachmentIdentityError();
+    }
+    if (strict && node.estimatedSize > byteLimit) throw tooLarge();
+    const downloaded = await downloadPart(client, message.uid, node.part, strict ? byteLimit : MAX_AGENT_ATTACHMENT_BYTES);
+    if (!downloaded) throw new NotFoundError('Attachment not found in the original message.');
+    if (downloaded.truncated) throw tooLarge();
+    return {
+      filename: node.filename || meta?.filename || 'attachment',
+      contentType: node.contentType || meta?.contentType || 'application/octet-stream',
+      body: downloaded.body,
+      contentId: node.contentId || meta?.contentId || null,
+    };
+  }
+
+  async function fetchAttachmentOnce(messageId, index, { strict = false, maxBytes = MAX_STRICT_ATTACHMENT_BYTES } = {}) {
+    const byteLimit = Number.isSafeInteger(maxBytes) && maxBytes > 0
+      ? Math.min(maxBytes, MAX_AGENT_ATTACHMENT_BYTES)
+      : MAX_STRICT_ATTACHMENT_BYTES;
+    const tooLarge = () => new ValidationError(`Attachment exceeds the ${Math.round(byteLimit / (1024 * 1024))} MiB limit.`, { reason: 'ATTACHMENT_TOO_LARGE' });
     const resolvedIndex = Number(index);
     if (!Number.isInteger(resolvedIndex) || resolvedIndex < 0) {
       throw new ValidationError('Attachment index is invalid.');
@@ -2598,9 +2808,7 @@ export function createMailService({
       : [];
     if (strict && strictMatches.length !== 1) throw new NotFoundError('Attachment not found.');
     const strictMeta = strictMatches[0];
-    if (strict && Number(strictMeta.size) > MAX_STRICT_ATTACHMENT_BYTES) {
-      throw new ValidationError('Attachment exceeds the 8 MiB limit.');
-    }
+    if (strict && Number(strictMeta.size) > byteLimit) throw tooLarge();
     let rawAttachments = [];
     try {
       rawAttachments = JSON.parse(repos.messages.getRaw?.(messageId)?.attachments_json || '[]');
@@ -2611,12 +2819,10 @@ export function createMailService({
     const rawMatches = rawAttachments.filter((item, index) => (Number.isInteger(item?.index) ? item.index : index) === resolvedIndex);
     const rawMeta = strict ? (rawMatches.length === 1 ? rawMatches[0] : null)
       : rawMatches[0] || rawAttachments[resolvedIndex];
-    if (strict && typeof rawMeta?.content === 'string' && rawMeta.content.length > Math.ceil(MAX_STRICT_ATTACHMENT_BYTES / 3) * 4) {
-      throw new ValidationError('Attachment exceeds the 8 MiB limit.');
-    }
+    if (strict && typeof rawMeta?.content === 'string' && rawMeta.content.length > Math.ceil(byteLimit / 3) * 4) throw tooLarge();
     const stored = attachmentContentBuffer(rawMeta);
     if (stored) {
-      if (strict && stored.length > MAX_STRICT_ATTACHMENT_BYTES) throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+      if (strict && stored.length > byteLimit) throw tooLarge();
       if (strict && !strictParsedAttachment([{ ...rawMeta, size: stored.length, content: stored }], 0, strictMeta)) {
         throw attachmentIdentityError();
       }
@@ -2661,6 +2867,18 @@ export function createMailService({
         || (previousUidValidity != null && String(previousUidValidity) !== String(client.mailbox?.uidValidity)))) {
         throw attachmentIdentityError();
       }
+      // A message imported without its full source (too large, or only seen
+      // by a search) lists files from BODYSTRUCTURE. Download that one part
+      // instead of a source that would be refused or would not parse into the
+      // same attachment list.
+      if (message.sourceImported === false || typeof rawMeta?.part === 'string') {
+        operation = 'fetch_structure';
+        const value = await fetchAttachmentPart({
+          client, message, resolvedIndex, meta, rawMeta, strict, byteLimit, tooLarge,
+        });
+        if (!strict) rememberAttachment(cacheKey, value);
+        return value;
+      }
       operation = 'fetch_source';
       const sourceMessage = await client.fetchOne(message.uid, {
         uid: true,
@@ -2681,7 +2899,7 @@ export function createMailService({
       if (!Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
         throw new NotFoundError('Attachment not found in the original message.');
       }
-      if (strict && body.length > MAX_STRICT_ATTACHMENT_BYTES) throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+      if (strict && body.length > byteLimit) throw tooLarge();
       const value = {
         filename: picked.filename || meta.filename || 'attachment',
         contentType: picked.contentType || meta.contentType || 'application/octet-stream',
@@ -3381,15 +3599,26 @@ export function createMailService({
         source: { start: 0, maxLength: maxMessageBytes + 1 },
       }, { uid: true });
       const source = sourceMessage?.source;
-      if (!Buffer.isBuffer(source) || source.length > maxMessageBytes) return message;
-      const payload = await ingestImapMessage({
-        account,
-        mailbox: message.mailbox || 'INBOX',
-        role: message.isDraft ? 'drafts' : folderForMailbox(message.mailbox),
-        generation,
-        message: { ...sourceMessage, source },
-      });
+      const mailbox = message.mailbox || 'INBOX';
+      const role = message.isDraft ? 'drafts' : folderForMailbox(message.mailbox);
+      let payload = null;
+      if (Buffer.isBuffer(source) && source.length > maxMessageBytes) {
+        // Too large to keep whole: import the text and attachment list, and
+        // let fetchAttachment download each file by its part.
+        payload = await partialImportPayload({ account, client, mailbox, role, uid: message.uid, generation });
+      } else if (Buffer.isBuffer(source)) {
+        payload = await ingestImapMessage({
+          account,
+          mailbox,
+          role,
+          generation,
+          message: { ...sourceMessage, source },
+        });
+      }
       if (!payload) return message;
+      // A UID can be reused after UIDVALIDITY changes; never fill this row
+      // with another message's content.
+      if (message.messageId && payload.rfc_message_id && payload.rfc_message_id !== message.messageId) return message;
       payload.source_imported = 1;
       return repos.messages.upsert(payload) || message;
     } catch (error) {
@@ -3399,6 +3628,164 @@ export function createMailService({
       lock?.release();
       await client.logout().catch(() => {});
     }
+  }
+
+  /**
+   * Find and re-import messages aMail holds only partly. Two kinds:
+   *
+   * - Rows a search built from envelopes alone (source_imported = 0): no
+   *   body, files listed by name at 0 bytes. Re-imported in full when they fit
+   *   the sync size cap, and otherwise as a partial import (text and file
+   *   list, files downloaded one part at a time).
+   * - Messages sync passed over because they were larger than the cap
+   *   (includeSkipped, one account): found with IMAP SEARCH LARGER, inside
+   *   the last sinceDays days, and imported in parts.
+   *
+   * dryRun only counts. Every IMAP step is read-only (EXAMINE, BODY.PEEK).
+   * Re-imported messages join the not-yet-analyzed queue like new mail.
+   */
+  async function repairIncompleteMessages({
+    accountId = null,
+    dryRun = true,
+    limit = 10,
+    offset = 0,
+    withAttachmentsOnly = true,
+    includeSkipped = false,
+    sinceDays = 30,
+  } = {}) {
+    if (accountId && !repos.accounts.getRaw(accountId)) throw new NotFoundError('Account not found.');
+    if (includeSkipped && !accountId) throw new ValidationError('includeSkipped needs an accountId.');
+    const take = Math.min(Math.max(Number(limit) || 0, 1), 25);
+    const before = repos.messages.incompleteSummary?.({ accountId }) || [];
+    const result = {
+      dryRun: Boolean(dryRun),
+      incomplete: before,
+      totalIncomplete: before.reduce((sum, row) => sum + row.messages, 0),
+      totalWithAttachments: before.reduce((sum, row) => sum + row.withAttachments, 0),
+    };
+    if (includeSkipped) {
+      result.skippedLarge = await repairSkippedLargeMessages(accountId, {
+        sinceDays: Math.min(Math.max(Number(sinceDays) || 30, 1), 365),
+        importLimit: dryRun ? 0 : take,
+      });
+    }
+    if (dryRun) return result;
+    const ids = repos.messages.incompleteIds({
+      accountId, withAttachments: withAttachmentsOnly !== false, limit: take, offset: Math.max(Number(offset) || 0, 0),
+    });
+    const repaired = [];
+    const failed = [];
+    for (const id of ids) {
+      const message = await hydrateMessageSource(id);
+      if (message?.sourceImported === false) {
+        failed.push(id);
+        continue;
+      }
+      let raw = [];
+      try {
+        raw = JSON.parse(repos.messages.getRaw?.(id)?.attachments_json || '[]');
+      } catch {
+        raw = [];
+      }
+      const partial = Array.isArray(raw) && raw.some((item) => typeof item?.part === 'string');
+      repaired.push({ id, import: partial ? 'partial' : 'full' });
+    }
+    const after = repos.messages.incompleteSummary?.({ accountId }) || [];
+    return {
+      ...result,
+      repaired,
+      failed,
+      remaining: after.reduce((sum, row) => sum + row.messages, 0),
+      // Failures stay incomplete; pass this offset to step past them.
+      nextOffset: failed.length ? Math.max(Number(offset) || 0, 0) + failed.length : Math.max(Number(offset) || 0, 0),
+    };
+  }
+
+  async function repairSkippedLargeMessages(accountId, { sinceDays, importLimit }) {
+    const { account, credentials } = accountAndCredentials(accountId);
+    const generation = accountGeneration(account.id);
+    const maxMessageBytes = Number.isSafeInteger(config.syncMaxMessageBytes)
+      ? config.syncMaxMessageBytes
+      : DEFAULT_SYNC_MAX_MESSAGE_BYTES;
+    const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000);
+    const out = { sinceDays, maxMessageBytes, found: 0, imported: 0, alreadyCopied: 0, failed: 0, remaining: 0, mailboxes: [] };
+    let budget = importLimit;
+    let attempted = 0;
+    const client = newImapClient(account, credentials);
+    try {
+      await client.connect();
+      const descriptors = discoverSyncMailboxes(await client.list())
+        .filter((item) => item.role !== 'trash' && item.role !== 'spam');
+      for (const descriptor of descriptors) {
+        assertAccountGeneration(account.id, generation);
+        const syncState = repos.sync.get(account.id, descriptor.mailbox);
+        const lastUid = Number(syncState?.last_uid || 0);
+        if (!lastUid) continue;
+        let lock;
+        const row = { mailbox: descriptor.mailbox, found: 0, imported: 0 };
+        try {
+          lock = await client.getMailboxLock(descriptor.mailbox, { readOnly: true });
+          if (syncState?.uid_validity != null && String(syncState.uid_validity) !== String(client.mailbox?.uidValidity)) {
+            row.uidValidityChanged = true;
+            out.mailboxes.push(row);
+            continue;
+          }
+          const uids = await client.search({ since, larger: maxMessageBytes }, { uid: true });
+          // Only UIDs sync already moved past; newer ones are imported by sync.
+          let missing = (Array.isArray(uids) ? uids : [])
+            .map(Number)
+            .filter((uid) => Number.isInteger(uid) && uid > 0 && uid <= lastUid)
+            .filter((uid) => !repos.messages.findByUid(account.id, descriptor.mailbox, uid))
+            .sort((left, right) => right - left);
+          if (descriptor.allMailMirror && missing.length) {
+            // Gmail's All Mail holds a copy of every inbox and sent message;
+            // a copy aMail already has under another mailbox is not missing.
+            const copied = new Set();
+            for await (const item of client.fetch(missing.join(','), { uid: true, envelope: true }, { uid: true })) {
+              const messageId = item.envelope?.messageId;
+              if (messageId && repos.messages.findByRfcId(account.id, messageId)) copied.add(Number(item.uid));
+            }
+            out.alreadyCopied += copied.size;
+            missing = missing.filter((uid) => !copied.has(uid));
+          }
+          row.found = missing.length;
+          out.found += missing.length;
+          for (const uid of missing) {
+            if (budget <= 0) break;
+            budget -= 1;
+            attempted += 1;
+            try {
+              const payload = await partialImportPayload({
+                account, client, mailbox: descriptor.mailbox, role: descriptor.role, allMailMirror: descriptor.allMailMirror, uid, generation,
+              });
+              if (payload === false) {
+                out.alreadyCopied += 1;
+              } else if (payload && repos.messages.upsert(payload)) {
+                row.imported += 1;
+                out.imported += 1;
+              } else {
+                out.failed += 1;
+              }
+            } catch (error) {
+              assertAccountGeneration(account.id, generation);
+              out.failed += 1;
+              logger.warn(
+                { accountId: account.id, mailbox: descriptor.mailbox, uid, ...attachmentFailureDiagnostic(error, 'repair_partial_import') },
+                'Large message could not be imported in parts during repair',
+              );
+            }
+          }
+        } finally {
+          lock?.release();
+        }
+        out.mailboxes.push(row);
+      }
+    } finally {
+      await client.logout().catch(() => {});
+    }
+    // Not tried yet; a failed UID is still missing and is tried again next call.
+    out.remaining = Math.max(0, out.found - attempted);
+    return out;
   }
 
   function storeSearchPayloads(pending, threadIds, accountId) {
@@ -3723,6 +4110,7 @@ export function createMailService({
     retryRemoteOps,
     fetchAttachment,
     hydrateMessageSource,
+    repairIncompleteMessages,
     searchAndMaterialize,
     invalidateAccount,
     events: messageEvents,

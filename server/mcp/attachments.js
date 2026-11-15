@@ -21,7 +21,10 @@ import { DEFAULT_RENDER_MAX_DIMENSION, MAX_RENDER_MAX_DIMENSION } from '../servi
  * never sync, mark read/analyzed, or change a mailbox.
  */
 
+// get_attachment returns base64 inside the tool result, so it keeps a small
+// cap. Reading, viewing and links never put the bytes in a result.
 export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+export const MAX_READABLE_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 export const DEFAULT_LINK_MINUTES = 5;
 export const MAX_LINK_MINUTES = 10;
 
@@ -38,8 +41,12 @@ export const messageIdSchema = z.string().min(1).max(128)
   .refine((id) => Boolean(id.trim()), 'Message id must not be blank');
 export const attachmentIndexSchema = z.number().int().min(0).max(10000);
 
+function limitLabel(maxBytes) {
+  return `${Math.round(maxBytes / (1024 * 1024))} MiB`;
+}
+
 /** The one attachment with this index on a cached message, or a NotFoundError. */
-export function attachmentMetadata(repos, id, index, { missingMessage = 'Message not found.' } = {}) {
+export function attachmentMetadata(repos, id, index, { missingMessage = 'Message not found.', maxBytes = MAX_ATTACHMENT_BYTES } = {}) {
   const message = repos.messages.get(id);
   if (!message) throw new NotFoundError(missingMessage);
   const matches = Array.isArray(message.attachments)
@@ -47,31 +54,54 @@ export function attachmentMetadata(repos, id, index, { missingMessage = 'Message
     : [];
   if (matches.length !== 1) throw new NotFoundError('Attachment not found.');
   const metadata = matches[0];
-  if (Number(metadata.size) > MAX_ATTACHMENT_BYTES) {
-    throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+  if (Number(metadata.size) > maxBytes) {
+    throw new ValidationError(`Attachment exceeds the ${limitLabel(maxBytes)} limit.`);
   }
   return metadata;
 }
 
+// What an agent may learn about a failed fetch: a fixed code and a fixed
+// sentence chosen here. Nothing from the mail server or the parser.
+const SAFE_FETCH_FAILURES = {
+  ATTACHMENT_IMAP_UID_MISSING: 'aMail does not know where this message is on the mail server yet. Sync the mailbox, then try again.',
+  ATTACHMENT_SOURCE_UNAVAILABLE: 'The mail server did not return this message.',
+  ATTACHMENT_IDENTITY_UNVERIFIED: 'The server copy no longer matches this message, so the file was not returned. Sync the mailbox and open the message again.',
+  ATTACHMENT_IMAP_FAILED: 'The mail server could not be reached for this attachment. Try again later.',
+};
+
+export function safeAttachmentFetchError(error, maxBytes = MAX_ATTACHMENT_BYTES) {
+  if (error instanceof ValidationError && /exceeds the .* limit/.test(String(error.message))) {
+    return new ValidationError(`Attachment exceeds the ${limitLabel(maxBytes)} limit.`);
+  }
+  if (error instanceof NotFoundError) {
+    return new ServiceUnavailableError('This attachment is no longer on the mail server.', 'ATTACHMENT_NOT_ON_SERVER');
+  }
+  if (error instanceof ServiceUnavailableError && Object.hasOwn(SAFE_FETCH_FAILURES, error.code)) {
+    return new ServiceUnavailableError(SAFE_FETCH_FAILURES[error.code], error.code);
+  }
+  return new ServiceUnavailableError('Could not retrieve this attachment.', 'ATTACHMENT_UNAVAILABLE');
+}
+
 /**
  * Strict fetch shared by every MCP attachment tool: exact index match, size
- * checked before and after the IMAP fetch, and no upstream detail in errors.
+ * checked before and after the IMAP fetch, and only fixed codes and
+ * sentences in errors.
  */
-export async function fetchVerifiedAttachment({ repos, mailService }, id, index, options) {
-  attachmentMetadata(repos, id, index, options);
+export async function fetchVerifiedAttachment({ repos, mailService }, id, index, options = {}) {
+  const maxBytes = Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : MAX_ATTACHMENT_BYTES;
+  attachmentMetadata(repos, id, index, { ...options, maxBytes });
   let fetched;
   try {
-    fetched = await mailService.fetchAttachment(id, index, { strict: true });
-  } catch {
-    // Even exposed service errors must not carry upstream/parser details.
-    throw new ServiceUnavailableError('Could not retrieve this attachment.', 'ATTACHMENT_UNAVAILABLE');
+    fetched = await mailService.fetchAttachment(id, index, { strict: true, maxBytes });
+  } catch (error) {
+    throw safeAttachmentFetchError(error, maxBytes);
   }
   const body = fetched?.body;
   if (!Buffer.isBuffer(body)) {
     throw new ServiceUnavailableError('Could not retrieve this attachment.', 'ATTACHMENT_UNAVAILABLE');
   }
-  if (body.length > MAX_ATTACHMENT_BYTES) {
-    throw new ValidationError('Attachment exceeds the 8 MiB limit.');
+  if (body.length > maxBytes) {
+    throw new ValidationError(`Attachment exceeds the ${limitLabel(maxBytes)} limit.`);
   }
   return {
     body,
@@ -118,7 +148,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
       'Continue with offset = nextOffset until it is null, or jump with page (PDF page, slide or sheet number).',
       'incomplete: true means part of the file was never extracted (size or page limit); see note, and download the original with get_attachment_link if you need all of it.',
       'Scanned PDFs report noTextLayer: use view_attachment to see those pages. Pictures: use view_attachment. Other types: use get_attachment_link.',
-      'Read-only: does not sync, mark read/analyzed, or change mail. Maximum 8 MiB per file.',
+      'Read-only: does not sync, mark read/analyzed, or change mail. Maximum 25 MiB per file; files in messages too large to import whole are downloaded on their own.',
       UNTRUSTED_NOTE,
     ].join(' '),
     inputSchema: {
@@ -130,7 +160,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ id, index, offset, page, maxChars }) => runTool(async () => {
-    attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE });
+    attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE, maxBytes: MAX_READABLE_ATTACHMENT_BYTES });
     return attachmentReader.readText({ messageId: id, index, offset, page, maxChars });
   }));
 
@@ -151,7 +181,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async ({ id, index, page, maxDimension }) => {
     try {
-      attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE });
+      attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE, maxBytes: MAX_READABLE_ATTACHMENT_BYTES });
       const { summary, image } = await attachmentReader.renderPicture({ messageId: id, index, page, maxDimension });
       return textResult({ attachment: summary }, [{ type: 'image', data: image.data.toString('base64'), mimeType: image.mimeType }]);
     } catch (error) {
@@ -165,7 +195,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
       `Get an https link that downloads one attachment's original bytes, valid for ${DEFAULT_LINK_MINUTES} minutes by default (at most ${MAX_LINK_MINUTES}).`,
       'For agents that can fetch URLs or run commands (curl, a code sandbox, a file tool) and want the actual file.',
       'Anyone holding the link can download that one file until it expires, so pass it only to the tool that downloads it: never put it in chat, a message, a draft, notes or logs.',
-      'Does not sync, mark read/analyzed, or change mail. Maximum 8 MiB per file.',
+      'Does not sync, mark read/analyzed, or change mail. Maximum 25 MiB per file.',
       UNTRUSTED_NOTE,
     ].join(' '),
     inputSchema: {
@@ -175,7 +205,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   }, async ({ id, index, minutes = DEFAULT_LINK_MINUTES }) => runTool(async () => {
-    const metadata = attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE });
+    const metadata = attachmentMetadata(repos, id, index, { missingMessage: AGENT_MISSING_MESSAGE, maxBytes: MAX_READABLE_ATTACHMENT_BYTES });
     const link = issueAttachmentLink(config, { messageId: id, index, minutes });
     return {
       attachment: {

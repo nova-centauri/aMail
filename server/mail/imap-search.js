@@ -186,19 +186,73 @@ export function newestUids(uids, cap = IMAP_SEARCH_UID_CAP) {
     .slice(0, cap);
 }
 
-export function bodyStructureFilenames(node, out = []) {
+function bodyStructureLeaves(node, out = [], path = '') {
   if (!node) return out;
   const children = node.childNodes || node.childParts || [];
   if (Array.isArray(children) && children.length) {
-    for (const child of children) bodyStructureFilenames(child, out);
+    children.forEach((child, index) => bodyStructureLeaves(child, out, path ? `${path}.${index + 1}` : String(index + 1)));
     return out;
   }
-  const filename = node.dispositionParameters?.filename
-    || node.parameters?.name
-    || node.filename
-    || '';
+  // A single-part message has no part number of its own; IMAP calls its body 1.
+  out.push({ node, part: String(node.part || path || '1') });
+  return out;
+}
+
+function leafFilename(node) {
+  return String(node.dispositionParameters?.filename || node.parameters?.name || node.filename || '');
+}
+
+function leafIsAttachment(node) {
+  const filename = leafFilename(node);
   const disposition = String(node.disposition || '').toLowerCase();
-  if (filename && disposition !== 'inline') out.push(String(filename));
-  else if (disposition === 'attachment') out.push(String(filename || 'attachment'));
+  return Boolean(filename && disposition !== 'inline') || disposition === 'attachment';
+}
+
+/**
+ * Attachments named by an IMAP BODYSTRUCTURE, in the same order as
+ * bodyStructureFilenames, with the part number that downloads each one.
+ * size is the encoded size the server reports; estimatedSize is the decoded
+ * size it implies (base64 carries 3 bytes in 4, plus line breaks).
+ */
+export function bodyStructureAttachments(node) {
+  return bodyStructureLeaves(node)
+    .filter(({ node: leaf }) => leafIsAttachment(leaf))
+    .map(({ node: leaf, part }) => {
+      const encodedSize = Number.isSafeInteger(Number(leaf.size)) && Number(leaf.size) >= 0 ? Number(leaf.size) : null;
+      const encoding = String(leaf.encoding || '').toLowerCase() || null;
+      return {
+        filename: leafFilename(leaf) || 'attachment',
+        part,
+        contentType: String(leaf.type || 'application/octet-stream').toLowerCase(),
+        encoding,
+        encodedSize,
+        estimatedSize: estimateDecodedSize(encodedSize, encoding),
+        contentId: leaf.id || null,
+      };
+    });
+}
+
+export function estimateDecodedSize(encodedSize, encoding) {
+  if (!Number.isSafeInteger(encodedSize) || encodedSize < 0) return 0;
+  if (encoding === 'base64') return Math.floor(encodedSize * (76 / 78) * 0.75);
+  return encodedSize;
+}
+
+/** The first text/plain and text/html body parts that are not attachments. */
+export function bodyStructureTextParts(node) {
+  const found = {};
+  for (const { node: leaf, part } of bodyStructureLeaves(node)) {
+    if (leafIsAttachment(leaf)) continue;
+    const type = String(leaf.type || '').toLowerCase();
+    if (type === 'text/plain' && !found.text) found.text = { part, size: Number(leaf.size) || 0 };
+    if (type === 'text/html' && !found.html) found.html = { part, size: Number(leaf.size) || 0 };
+  }
+  return found;
+}
+
+export function bodyStructureFilenames(node, out = []) {
+  for (const item of bodyStructureAttachments(node)) {
+    out.push(item.filename);
+  }
   return out;
 }
