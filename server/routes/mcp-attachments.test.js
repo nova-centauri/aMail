@@ -10,7 +10,8 @@ import { createDatabase, createRepositories } from '../db.js';
 import { errorHandler } from '../middleware/errors.js';
 import { registerApi } from './api.js';
 import { registerMcp } from './mcp.js';
-import { issueAttachmentLink } from '../mcp/attachments.js';
+import { issueAttachmentLink, safeAttachmentFetchError } from '../mcp/attachments.js';
+import { NotFoundError, ServiceUnavailableError, ValidationError } from '../errors.js';
 import { makeDocx, makePdf } from '../services/attachment-fixtures.test-support.js';
 
 const TOKEN = 'synthetic-attachment-reader-token';
@@ -126,8 +127,8 @@ test('agents can read, view and download attachments without changing mail', asy
   const docx = payload(await mcpCall(origin, 'read_attachment', { id: message.id, index: 1 })).attachment;
   assert.equal(docx.text, 'PO 5521\nShip overnight');
   assert.deepEqual(fetches.map(([id, index, options]) => [id, index, options]), [
-    [message.id, 0, { strict: true }],
-    [message.id, 1, { strict: true }],
+    [message.id, 0, { strict: true, maxBytes: 25 * 1024 * 1024 }],
+    [message.id, 1, { strict: true, maxBytes: 25 * 1024 * 1024 }],
   ], 'paging reuses the first fetch');
 
   const missing = payload(await mcpCall(origin, 'read_attachment', { id: thread.id, index: 0 }));
@@ -169,7 +170,7 @@ test('agents can read, view and download attachments without changing mail', asy
   assert.equal(download.headers.get('referrer-policy'), 'no-referrer');
   assert.equal(download.headers.get('cache-control'), 'private, no-store');
   assert.deepEqual(Buffer.from(await download.arrayBuffer()), files[0].body);
-  assert.deepEqual(fetches.at(-1), [message.id, 0, { strict: true }], 'agent links re-verify the exact part');
+  assert.deepEqual(fetches.at(-1), [message.id, 0, { strict: true, maxBytes: 25 * 1024 * 1024 }], 'agent links re-verify the exact part');
 
   const tampered = new URL(link.url);
   tampered.searchParams.set('token', `${tampered.searchParams.get('token').slice(0, -2)}AA`);
@@ -192,4 +193,48 @@ test('download links are refused without a public origin or a token key', () => 
   assert.equal(link.expiresAt, '1970-01-01T00:05:00.000Z');
   assert.equal(link.url.includes('m'), true);
   assert.equal(new URL(link.url).searchParams.get('token').includes('"m"'), false, 'the token is opaque');
+});
+
+test('attachment fetch failures reach agents as fixed codes and sentences only', () => {
+  const upstream = new ServiceUnavailableError('IMAP said: secret body text', 'ATTACHMENT_IDENTITY_UNVERIFIED');
+  const identity = safeAttachmentFetchError(upstream);
+  assert.equal(identity.code, 'ATTACHMENT_IDENTITY_UNVERIFIED');
+  assert.doesNotMatch(identity.message, /secret/);
+  assert.equal(safeAttachmentFetchError(new NotFoundError('Attachment not found in the original message.')).code, 'ATTACHMENT_NOT_ON_SERVER');
+  const tooLarge = safeAttachmentFetchError(new ValidationError('Attachment exceeds the 8 MiB limit.'), 25 * 1024 * 1024);
+  assert.equal(tooLarge.message, 'Attachment exceeds the 25 MiB limit.');
+  const unknown = safeAttachmentFetchError(new ServiceUnavailableError('parser detail', 'SOMETHING_ELSE'));
+  assert.equal(unknown.code, 'ATTACHMENT_UNAVAILABLE');
+  assert.equal(safeAttachmentFetchError(new Error('raw socket detail')).code, 'ATTACHMENT_UNAVAILABLE');
+});
+
+test('incomplete-message queries count and list rows a search saved from headers alone', (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-incomplete-'));
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
+  const repos = createRepositories(createDatabase({ dataDir, dbPath: path.join(dataDir, 'mail.sqlite'), credentialKey: Buffer.alloc(32, 7) }));
+  const account = repos.accounts.create({
+    email: 'owner@example.test', display_name: 'Owner', avatar_blob: null, avatar_mime: null, color: '#1a73e8',
+    provider: 'custom', imap_host: 'imap.example.test', imap_port: 993, imap_secure: 1, smtp_host: 'smtp.example.test',
+    smtp_port: 465, smtp_secure: 1, credential_ciphertext: 'test-only', signature: '', sync_enabled: 1,
+  });
+  const thread = repos.threads.create({ account_id: account.id, subject: 'News', normalized_subject: 'news', latest_at: '2026-11-14T00:00:00.000Z' });
+  const row = (uid, sourceImported, attachments) => repos.messages.upsert({
+    account_id: account.id, thread_id: thread.id, mailbox: 'INBOX', uid, rfc_message_id: `<m-${uid}@example.test>`,
+    in_reply_to: null, references_json: '[]', subject: 'News', from_name: '', from_email: 'office@example.test',
+    to_json: '[]', cc_json: '[]', bcc_json: '[]', reply_to_json: null,
+    sent_at: `2026-11-1${uid}T00:00:00.000Z`, received_at: `2026-11-1${uid}T00:00:00.000Z`,
+    html_body: '', text_body: '', snippet: 'News', attachments_json: JSON.stringify(attachments),
+    labels_json: '[]', is_read: 0, is_starred: 0, is_archived: 0, is_trashed: 0, is_spam: 0, snoozed_until: null,
+    is_sent: 0, source_imported: sourceImported,
+  });
+  const pdf = [{ index: 0, filename: 'news.pdf', contentType: 'application/octet-stream', size: 0, contentId: null }];
+  const placeholderWithFile = row(4, 0, pdf);
+  row(3, 0, []);
+  row(2, 1, pdf);
+
+  assert.deepEqual(repos.messages.incompleteSummary(), [{ accountId: account.id, messages: 2, withAttachments: 1 }]);
+  assert.deepEqual(repos.messages.incompleteSummary({ accountId: 'other' }), []);
+  assert.deepEqual(repos.messages.incompleteIds({ accountId: account.id }), [placeholderWithFile.id]);
+  assert.equal(repos.messages.incompleteIds({ withAttachments: false }).length, 2);
+  assert.deepEqual(repos.messages.incompleteIds({ withAttachments: false, offset: 1, limit: 5 }).length, 1);
 });

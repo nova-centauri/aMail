@@ -1259,6 +1259,17 @@ export function createRepositories(db) {
     messageReleaseAllClaims: db.prepare(`UPDATE messages SET claimed_by = NULL, claimed_until = NULL
       WHERE claimed_by = @claimant`),
     messageByUid: db.prepare('SELECT * FROM messages WHERE account_id = ? AND mailbox = ? AND uid = ?'),
+    // Rows a search materialized from envelopes alone (no body, attachment
+    // names only). repair_incomplete_messages counts and re-imports them.
+    incompleteSummary: db.prepare(`SELECT account_id,
+        COUNT(*) AS messages,
+        SUM(CASE WHEN COALESCE(attachments_json, '[]') <> '[]' THEN 1 ELSE 0 END) AS with_attachments
+      FROM messages WHERE source_imported = 0 AND (@accountId IS NULL OR account_id = @accountId)
+      GROUP BY account_id ORDER BY account_id`),
+    incompleteIds: db.prepare(`SELECT id FROM messages
+      WHERE source_imported = 0 AND (@accountId IS NULL OR account_id = @accountId)
+        AND (@withAttachments = 0 OR COALESCE(attachments_json, '[]') <> '[]')
+      ORDER BY COALESCE(received_at, sent_at, created_at) DESC, id LIMIT @limit OFFSET @offset`),
     messageByRfcId: db.prepare('SELECT * FROM messages WHERE account_id = ? AND rfc_message_id = ? ORDER BY sent_at DESC LIMIT 1'),
     messagesByThread: db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY COALESCE(sent_at, received_at, created_at) ASC'),
     messageList: db.prepare(messageListSql('m.*')),
@@ -1921,6 +1932,14 @@ export function createRepositories(db) {
       forThread: (threadId) => queries.messagesByThread.all(threadId).map(publicMessage),
       findByRfcId: (accountId, messageId) => publicMessage(queries.messageByRfcId.get(accountId, messageId)),
       findByUid: (accountId, mailbox, uid) => publicMessage(queries.messageByUid.get(accountId, mailbox, uid)),
+      incompleteSummary: ({ accountId = null } = {}) => queries.incompleteSummary.all({ accountId }).map((row) => ({
+        accountId: row.account_id,
+        messages: Number(row.messages) || 0,
+        withAttachments: Number(row.with_attachments) || 0,
+      })),
+      incompleteIds: ({ accountId = null, withAttachments = true, limit = 10, offset = 0 } = {}) => queries.incompleteIds.all({
+        accountId, withAttachments: withAttachments ? 1 : 0, limit, offset,
+      }).map((row) => row.id),
       upsert: announcing(db.transaction((input) => {
         const classification = classifyMessage(input);
         const classifiedInput = {

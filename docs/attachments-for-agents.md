@@ -1,6 +1,6 @@
 # Attachments for agents
 
-Status: implemented on branch `claude/project-thread-yr9x84` (November 2026).
+Status: live since PR 55 (November 2026); the large-message follow-up is at the end.
 Owner request that started it: agents had poor access to attachments; open up
 agentic access so an agent can download a file like a PDF and read it.
 
@@ -97,3 +97,60 @@ Tradeoffs to know:
 - Needs `AMAIL_ORIGIN` (already required for the Claude connector) so the link
   points at the public address. In keyslot mode links work only while the
   vault is unlocked.
+
+## Large messages and 0-byte attachments (follow-up)
+
+Found on the private install: a school newsletter with a large Canva PDF
+showed its file at 0 bytes and every attachment tool said "attachment
+unavailable", in three copies (INBOX, All Mail, Important). An earlier one
+from the same sender was missing from aMail altogether.
+
+Why:
+
+1. **Sync skipped every message larger than `AMAIL_SYNC_MAX_MESSAGE_BYTES`
+   (10 MiB by default) without saving anything**, only counting it as
+   `IMAP_MESSAGE_TOO_LARGE`. The earlier newsletter's UID is simply absent.
+2. A search (deep search or `in:anywhere`) later saved the newer one as an
+   envelope-only row: no body, and files named from BODYSTRUCTURE with
+   `size: 0` and `application/octet-stream`.
+3. Opening it tried to download the full source, which was over the cap, so it
+   quietly stayed empty. The strict attachment fetch then refused it twice
+   over: the source was over its 12 MiB cap, and the stored 0-byte metadata
+   could never match the real file. Every failure surfaced as the same
+   `ATTACHMENT_UNAVAILABLE`.
+
+What changed:
+
+- **Large mail is imported in parts.** Sync, opening a message and repair
+  fetch headers, BODYSTRUCTURE and the first plain and HTML body parts (up to
+  1 MiB each, `BODY.PEEK`, mailbox opened read-only). The file list keeps each
+  file's IMAP part number, real type and a decoded-size estimate. These rows
+  read like any other message and join the not-yet-analyzed queue. If the
+  server lists a body part but does not deliver it, the row stays incomplete
+  (out of the queue) so opening it or the repair tool tries again. These
+  imports count against the per-account sync budget like any other.
+- **Files download by part.** For a row without its full source, the
+  attachment tools fetch BODYSTRUCTURE, check the UID, Message-ID, part number
+  and filename against the cached row, and download that one part. A file is
+  refused early only when its encoded size proves it is over the limit
+  (quoted-printable can be three times its decoded size); otherwise the
+  decoded download enforces the limit exactly. Nothing
+  else in the message is downloaded. Rows a search saves now list each file's
+  real type, part and estimated size instead of 0 bytes.
+- **Readable size is 25 MiB.** `read_attachment`, `view_attachment` and
+  `get_attachment_link` take files up to 25 MiB (Gmail's whole-message cap).
+  `get_attachment`, which returns base64 inside the tool result, stays at 8 MiB.
+- **Errors say what happened** with fixed codes and sentences only:
+  `ATTACHMENT_TOO_LARGE` (as a validation error), `ATTACHMENT_NOT_ON_SERVER`,
+  `ATTACHMENT_IDENTITY_UNVERIFIED`, `ATTACHMENT_IMAP_UID_MISSING`,
+  `ATTACHMENT_SOURCE_UNAVAILABLE`, `ATTACHMENT_IMAP_FAILED`, else
+  `ATTACHMENT_UNAVAILABLE`. Nothing from the server or parser is passed on.
+- **`repair_incomplete_messages`** counts envelope-only rows per account
+  (`dryRun`, the default) and re-imports up to 25 per call, newest first. With
+  `includeSkipped` and an `accountId` it also runs `SEARCH SINCE <sinceDays>
+  LARGER <cap>` in each synced mailbox (not Trash or Spam) and imports the
+  UIDs sync already moved past without saving. On a Gmail All Mail mirror,
+  copies aMail already holds under another mailbox are not counted.
+
+Not changed: copies of one Gmail message saved from several label folders by a
+search (INBOX, All Mail, Important) stay separate rows.

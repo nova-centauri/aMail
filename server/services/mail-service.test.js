@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { EventEmitter } from 'node:events';
+import { Readable } from 'node:stream';
 import {
   buildImapOptions,
   buildSmtpOptions,
@@ -197,7 +198,7 @@ function syncHarness({
   imapPoolIdleMs, syncMinIntervalMs, connectFailure = false, fetchHangs = false, syncPassBudgetMs, syncAccountTimeoutMs,
   threadsBySubject = new Map(), folders = null, messagesByMailbox = null,
   extraAccounts = [], hangHosts = null, scheduleTimeout, syncMailboxTimeoutMs, syncMaxMessagesPerAccount,
-  highestModseq = undefined, knownRows = [],
+  highestModseq = undefined, knownRows = [], parts = new Map(),
 }) {
   const account = {
     id: 'sync-account',
@@ -331,8 +332,28 @@ function syncHarness({
     async fetchOne(uid, query, options) {
       this.assertIdle('FETCH');
       state.fetchOneCalls.push({ uid, query, options });
+      if (query.bodyStructure) {
+        const message = state.messages.find((item) => item.uid === uid);
+        if (!message?.bodyStructure) return null;
+        return {
+          uid,
+          envelope: message.envelope,
+          bodyStructure: message.bodyStructure,
+          headers: message.headers,
+          internalDate: message.internalDate,
+          size: message.size,
+          flags: new Set(message.flags || []),
+        };
+      }
       const source = sources.get(uid);
       return source === undefined ? null : { uid, source };
+    }
+    async download(uid, part, options) {
+      this.assertIdle('FETCH');
+      (state.downloads ||= []).push({ uid, part, options });
+      const body = parts.get(`${uid}:${part}`);
+      if (body === undefined) return {};
+      return { meta: {}, content: Readable.from([body.subarray(0, options?.maxBytes ?? body.length)]) };
     }
     async logout() {
       if (this.closed) return;
@@ -397,7 +418,7 @@ function syncHarness({
   return { service, state };
 }
 
-test('IMAP sync skips oversized sources without unrestricted body downloads', async () => {
+test('IMAP sync imports oversized messages in parts without downloading their full source', async () => {
   const smallSource = Buffer.from([
     'From: Sender <sender@example.test>',
     'To: Sync Account <sync@example.test>',
@@ -413,29 +434,68 @@ test('IMAP sync skips oversized sources without unrestricted body downloads', as
     Buffer.from('TOP SECRET OVERSIZED CONTENT'),
     Buffer.alloc(maxMessageBytes + 1),
   ]).subarray(0, maxMessageBytes + 1);
+  const newsletterHeaders = Buffer.from([
+    'From: School Office <office@school.example.test>',
+    'To: Sync Account <sync@example.test>',
+    'Subject: Weekly Newsletter',
+    'Message-ID: <newsletter@school.example.test>',
+    'Date: Sat, 14 Nov 2026 18:54:38 +0000',
+    'Content-Type: multipart/mixed; boundary="b1"',
+    '',
+  ].join('\r\n'));
   const { service, state } = syncHarness({
     maxMessageBytes,
     messages: [
-      { uid: 1, size: maxMessageBytes + 100, internalDate: new Date('2026-07-18T12:00:00Z') },
+      {
+        uid: 1,
+        size: maxMessageBytes + 100,
+        internalDate: new Date('2026-07-18T12:00:00Z'),
+        envelope: { messageId: '<newsletter@school.example.test>', subject: 'Weekly Newsletter', date: new Date('2026-11-14T18:54:38Z') },
+        headers: newsletterHeaders,
+        bodyStructure: {
+          type: 'multipart/mixed',
+          childNodes: [
+            { part: '1', type: 'text/plain', parameters: { charset: 'utf-8' }, size: 40 },
+            {
+              part: '2', type: 'application/pdf', encoding: 'base64', size: 15_600_000,
+              disposition: 'attachment', dispositionParameters: { filename: 'newsletter.pdf' },
+            },
+          ],
+        },
+      },
       { uid: 2, size: smallSource.length, internalDate: new Date('2026-07-18T12:01:00Z') },
       { uid: 3, internalDate: new Date('2026-07-18T12:02:00Z') },
     ],
     sources: new Map([[2, smallSource], [3, unknownOversize]]),
+    parts: new Map([['1:1', Buffer.from('See this week\'s newsletter attached.')]]),
   });
 
   const result = await service.syncAccount('sync-account');
 
   assert.equal(result.status, 'partial');
-  assert.equal(result.imported, 1);
-  assert.equal(result.skipped, 2);
+  assert.equal(result.imported, 2);
+  assert.equal(result.mailboxes[0].importedPartial, 1);
+  assert.equal(result.skipped, 1);
   assert.deepEqual(result.mailboxes[0].skipReasons, [{
     code: 'IMAP_MESSAGE_TOO_LARGE',
-    count: 2,
+    count: 1,
     maxBytes: maxMessageBytes,
   }]);
   assert.equal(result.mailboxes[0].lastUid, 3);
-  assert.equal(state.savedMessages.length, 1);
-  assert.equal(state.savedMessages[0].rfc_message_id, '<small@example.test>');
+  assert.deepEqual(state.savedMessages.map((row) => row.rfc_message_id).sort(), [
+    '<newsletter@school.example.test>',
+    '<small@example.test>',
+  ]);
+  const newsletter = state.savedMessages.find((row) => row.rfc_message_id === '<newsletter@school.example.test>');
+  assert.equal(newsletter.source_imported, 1);
+  assert.equal(newsletter.subject, 'Weekly Newsletter');
+  assert.equal(newsletter.from_email, 'office@school.example.test');
+  assert.match(newsletter.text_body, /newsletter attached/);
+  const [attachment] = JSON.parse(newsletter.attachments_json);
+  assert.equal(attachment.filename, 'newsletter.pdf');
+  assert.equal(attachment.contentType, 'application/pdf');
+  assert.equal(attachment.part, '2');
+  assert.ok(attachment.size > 11_000_000 && attachment.size < 11_700_000, 'decoded size is estimated from the base64 size');
 
   // One size-only scan, then one capped source FETCH for everything that is
   // not already known to be too large. Never a command per message.
@@ -445,9 +505,75 @@ test('IMAP sync skips oversized sources without unrestricted body downloads', as
   assert.equal(state.fetchCalls[0].query.source, undefined);
   assert.equal(state.fetchCalls[1].range, '2,3');
   assert.deepEqual(state.fetchCalls[1].query.source, { start: 0, maxLength: maxMessageBytes + 1 });
-  assert.equal(state.fetchOneCalls.length, 0);
+  // Large messages: structure and headers only, then the text part alone.
+  assert.deepEqual(state.fetchOneCalls.map((call) => call.uid).sort(), [1, 3]);
+  assert.ok(state.fetchOneCalls.every((call) => call.query.source === undefined && call.query.bodyStructure === true));
+  assert.deepEqual(state.downloads.map(({ uid, part }) => `${uid}:${part}`), ['1:1']);
   assert.equal(state.savedSync.last_uid, 3);
   assert.doesNotMatch(JSON.stringify(state.logs), /TOP SECRET OVERSIZED CONTENT/);
+  await service.close();
+});
+
+function largeNewsletter(uid, { textPart = true } = {}) {
+  return {
+    uid,
+    size: 50_000,
+    internalDate: new Date('2026-11-14T18:54:38Z'),
+    envelope: { messageId: `<newsletter-${uid}@school.example.test>`, subject: `Newsletter ${uid}` },
+    headers: Buffer.from([
+      'From: School Office <office@school.example.test>',
+      `Subject: Newsletter ${uid}`,
+      `Message-ID: <newsletter-${uid}@school.example.test>`,
+      'Content-Type: multipart/mixed; boundary="b1"',
+      '',
+    ].join('\r\n')),
+    bodyStructure: {
+      type: 'multipart/mixed',
+      childNodes: [
+        ...(textPart ? [{ part: '1', type: 'text/plain', parameters: { charset: 'utf-8' }, size: 40 }] : []),
+        {
+          part: textPart ? '2' : '1', type: 'application/pdf', encoding: 'base64', size: 40_000,
+          disposition: 'attachment', dispositionParameters: { filename: 'newsletter.pdf' },
+        },
+      ],
+    },
+  };
+}
+
+test('a large message whose body part does not download stays incomplete so it is tried again', async () => {
+  const { service, state } = syncHarness({
+    maxMessageBytes: 1_000,
+    messages: [largeNewsletter(1)],
+    sources: new Map(),
+    // No entry for 1:1, so the server returns no content for the text part.
+    parts: new Map(),
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.mailboxes[0].importedPartial, 1);
+  const [row] = state.savedMessages;
+  assert.equal(row.rfc_message_id, '<newsletter-1@school.example.test>');
+  assert.equal(row.source_imported, 0, 'kept out of the analysis queue and eligible for repair');
+  assert.equal(JSON.parse(row.attachments_json)[0].part, '2');
+  await service.close();
+});
+
+test('large messages imported in parts count against the per-account message budget', async () => {
+  const { service, state } = syncHarness({
+    maxMessageBytes: 1_000,
+    syncMaxMessagesPerAccount: 1,
+    messages: [largeNewsletter(1, { textPart: false }), largeNewsletter(2, { textPart: false })],
+    sources: new Map(),
+  });
+
+  const result = await service.syncAccount('sync-account');
+
+  assert.equal(result.mailboxes[0].importedPartial, 1);
+  assert.deepEqual(state.savedMessages.map((row) => row.uid), [1]);
+  // Progress stops at the last message this pass took, so the next pass
+  // imports UID 2 instead of skipping it.
+  assert.equal(state.savedSync.last_uid, 1);
   await service.close();
 });
 
@@ -1865,6 +1991,9 @@ function searchHarness({
   sources = new Map(),
   searchDelayMs = 0,
   gate = null,
+  parts = new Map(),
+  syncState = null,
+  syncMaxMessageBytes = config.syncMaxMessageBytes,
 } = {}) {
   const account = {
     id: 'search-account',
@@ -1887,6 +2016,7 @@ function searchHarness({
     fetchOneCalls: [],
     savedMessages: [],
     searchStarts: 0,
+    downloads: [],
   };
   class FakeImapClient extends EventEmitter {
     constructor() {
@@ -1927,6 +2057,12 @@ function searchHarness({
       if (!message && source === undefined) return null;
       return { uid, ...message, source };
     }
+    async download(uid, part, options) {
+      state.downloads.push({ uid, part, options });
+      const body = parts.get(`${uid}:${part}`);
+      if (body === undefined) return {};
+      return { meta: {}, content: Readable.from([body.subarray(0, options?.maxBytes ?? body.length)]) };
+    }
     async logout() { this.emit('close'); }
     close() { void this.logout(); }
   }
@@ -1934,6 +2070,9 @@ function searchHarness({
     accounts: {
       getRaw: (id) => id === account.id ? account : null,
       list: () => [{ id: account.id, syncEnabled: false }],
+    },
+    sync: {
+      get: (accountId, mailbox) => (syncState ? syncState(accountId, mailbox) : null),
     },
     threads: {
       get: (id) => id ? { id, accountId: account.id } : null,
@@ -1948,6 +2087,19 @@ function searchHarness({
         row.account_id === accountId && row.mailbox === mailbox && row.uid === uid
       )) || null,
       get: (id) => state.savedMessages.find((row) => row.id === id) || null,
+      getRaw: (id) => state.savedMessages.find((row) => row.id === id) || null,
+      incompleteSummary: () => {
+        const rows = state.savedMessages.filter((row) => row.source_imported === 0);
+        return rows.length ? [{
+          accountId: account.id,
+          messages: rows.length,
+          withAttachments: rows.filter((row) => row.attachments_json !== '[]').length,
+        }] : [];
+      },
+      incompleteIds: ({ limit, offset }) => state.savedMessages
+        .filter((row) => row.source_imported === 0)
+        .slice(offset, offset + limit)
+        .map((row) => row.id),
       upsert(value) {
         const existing = state.savedMessages.find((row) => row.account_id === value.account_id && row.mailbox === value.mailbox && row.uid === value.uid);
         if (existing) {
@@ -1956,6 +2108,8 @@ function searchHarness({
           existing.sourceImported = value.source_imported !== 0;
           existing.htmlBody = value.html_body || '';
           existing.textBody = value.text_body || '';
+          existing.messageId = value.rfc_message_id;
+          existing.attachments = JSON.parse(value.attachments_json || '[]');
           return existing;
         }
         const saved = {
@@ -1968,6 +2122,8 @@ function searchHarness({
           mailbox: value.mailbox,
           uid: value.uid,
           accountId: value.account_id,
+          messageId: value.rfc_message_id,
+          attachments: JSON.parse(value.attachments_json || '[]'),
         };
         state.savedMessages.push(saved);
         return saved;
@@ -1976,7 +2132,7 @@ function searchHarness({
     runWriteBatch(fn) { return fn(); },
   };
   const service = createMailService({
-    config: { ...config, imapPoolIdleMs: 60_000 },
+    config: { ...config, imapPoolIdleMs: 60_000, syncMaxMessageBytes },
     repos,
     logger: { info() {}, warn() {} },
     ImapClient: FakeImapClient,
@@ -2042,6 +2198,184 @@ test('IMAP SEARCH materializes envelope rows and hydrates full source on open', 
   assert.equal(hydrated.source_imported ?? (hydrated.sourceImported === false ? 0 : 1), 1);
   assert.match(hydrated.text_body || hydrated.textBody, /historical invoice body/);
   await service.close();
+});
+
+async function materializeInvoice(harness) {
+  await harness.service.searchAndMaterialize({
+    accounts: [{ id: harness.account.id, syncEnabled: false }],
+    parsed: parseMailboxQuery('invoice'),
+    folder: 'inbox',
+  });
+  const row = harness.state.savedMessages[0];
+  assert.equal(row.source_imported, 0);
+  assert.deepEqual(JSON.parse(row.attachments_json).map((item) => [item.filename, item.contentType, item.part]), [
+    ['invoice.pdf', 'application/pdf', '2'],
+  ]);
+  return row;
+}
+
+test('a file on a search-only row downloads its own part, checked against the message', async () => {
+  const pdf = Buffer.from('%PDF-1.7 the newsletter itself');
+  const harness = searchHarness({ messages: [historicalInvoice()], parts: new Map([['99:2', pdf]]) });
+  const row = await materializeInvoice(harness);
+  const fetchedBefore = harness.state.fetchOneCalls.length;
+
+  const fetched = await harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 25 * 1024 * 1024 });
+
+  assert.deepEqual(fetched.body, pdf);
+  assert.equal(fetched.filename, 'invoice.pdf');
+  assert.equal(fetched.contentType, 'application/pdf');
+  assert.deepEqual(harness.state.downloads.map(({ uid, part }) => `${uid}:${part}`), ['99:2']);
+  const calls = harness.state.fetchOneCalls.slice(fetchedBefore);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].query.bodyStructure, true);
+  assert.equal(calls[0].query.source, undefined, 'never the whole message');
+  await harness.service.close();
+});
+
+test('a part download refuses another message at the same UID and files over the limit', async () => {
+  const messages = [historicalInvoice()];
+  const harness = searchHarness({ messages, parts: new Map([['99:2', Buffer.alloc(64, 1)]]) });
+  const row = await materializeInvoice(harness);
+
+  await assert.rejects(
+    harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 32 }),
+    (error) => error.details?.reason === 'ATTACHMENT_TOO_LARGE' && /exceeds/.test(error.message),
+  );
+
+  harness.state.downloads.length = 0;
+  messages[0].envelope.messageId = '<someone-else@example.test>';
+  await assert.rejects(
+    harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 1024 }),
+    (error) => error.code === 'ATTACHMENT_IDENTITY_UNVERIFIED',
+  );
+  assert.equal(harness.state.downloads.length, 0, 'nothing is downloaded for a message that does not match');
+  await harness.service.close();
+});
+
+test('a quoted-printable file larger encoded than the limit still downloads when it fits decoded', async () => {
+  const invoice = historicalInvoice();
+  // Quoted-printable can take three bytes per decoded byte, so its encoded
+  // size says little about the file a reader gets.
+  invoice.bodyStructure.childNodes[1].encoding = 'quoted-printable';
+  invoice.bodyStructure.childNodes[1].size = 150;
+  const decoded = Buffer.alloc(50, 1);
+  const harness = searchHarness({ messages: [invoice], parts: new Map([['99:2', decoded]]) });
+  const row = await materializeInvoice(harness);
+
+  const fetched = await harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 64 });
+  assert.deepEqual(fetched.body, decoded);
+
+  // Surely too large even at the best case: refused before any download.
+  invoice.bodyStructure.childNodes[1].size = 300;
+  harness.state.downloads.length = 0;
+  await assert.rejects(
+    harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 64 }),
+    (error) => error.details?.reason === 'ATTACHMENT_TOO_LARGE',
+  );
+  assert.equal(harness.state.downloads.length, 0);
+  await harness.service.close();
+});
+
+test('opening a search-only row too large to import whole keeps its text and file list', async () => {
+  const invoice = historicalInvoice();
+  invoice.headers = Buffer.from([
+    'From: Vendor <accounts@vendor.test>',
+    'To: Search Account <sync@example.test>',
+    'Subject: Old invoice',
+    'Message-ID: <old-invoice@example.test>',
+    'Date: Tue, 01 Jan 2019 00:00:00 +0000',
+    'Content-Type: multipart/mixed; boundary="b1"',
+    '',
+  ].join('\r\n'));
+  invoice.bodyStructure.childNodes[1].size = 2_000_000;
+  invoice.bodyStructure.childNodes[1].encoding = 'base64';
+  const pdf = Buffer.from('%PDF-1.7 big invoice');
+  const harness = searchHarness({
+    messages: [invoice],
+    sources: new Map([[99, Buffer.alloc(4096, 65)]]),
+    parts: new Map([['99:1', Buffer.from('Invoice attached, due Friday.')], ['99:2', pdf]]),
+    syncMaxMessageBytes: 1024,
+  });
+  const row = await materializeInvoice(harness);
+
+  const hydrated = await harness.service.hydrateMessageSource(row.id);
+
+  assert.equal(hydrated.sourceImported, true);
+  assert.equal(hydrated.from_email, 'accounts@vendor.test');
+  assert.match(hydrated.textBody, /due Friday/);
+  const [meta] = JSON.parse(hydrated.attachments_json);
+  assert.deepEqual(
+    { filename: meta.filename, contentType: meta.contentType, part: meta.part },
+    { filename: 'invoice.pdf', contentType: 'application/pdf', part: '2' },
+  );
+  assert.ok(meta.size > 1_400_000, 'size estimated from the server structure, not 0');
+  assert.deepEqual(harness.state.downloads.map(({ uid, part }) => `${uid}:${part}`), ['99:1'], 'the PDF waits until it is opened');
+
+  const fetched = await harness.service.fetchAttachment(row.id, 0, { strict: true, maxBytes: 25 * 1024 * 1024 });
+  assert.deepEqual(fetched.body, pdf);
+  await harness.service.close();
+});
+
+test('repair counts incomplete rows on a dry run and re-imports them when asked', async () => {
+  const source = Buffer.from([
+    'From: Vendor <accounts@vendor.test>',
+    'To: Search Account <sync@example.test>',
+    'Subject: Old invoice',
+    'Message-ID: <old-invoice@example.test>',
+    'Date: Tue, 01 Jan 2019 00:00:00 +0000',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Pay the historical invoice body.',
+  ].join('\r\n'));
+  const skipped = {
+    uid: 120,
+    envelope: { messageId: '<skipped-newsletter@example.test>', subject: 'Big newsletter', date: new Date('2026-10-23T18:18:00Z') },
+    headers: Buffer.from('From: Office <office@school.example.test>\r\nSubject: Big newsletter\r\nMessage-ID: <skipped-newsletter@example.test>\r\n'),
+    internalDate: new Date('2026-10-23T18:18:00Z'),
+    bodyStructure: {
+      childNodes: [
+        { part: '1', type: 'text/plain' },
+        { part: '2', type: 'application/pdf', encoding: 'base64', size: 14_000_000, disposition: 'attachment', dispositionParameters: { filename: 'newsletter.pdf' } },
+      ],
+    },
+  };
+  const messages = [historicalInvoice()];
+  const harness = searchHarness({
+    messages,
+    sources: new Map([[99, source]]),
+    parts: new Map([['120:1', Buffer.from('This week at school.')]]),
+    syncState: (accountId, mailbox) => (mailbox === 'INBOX' ? { last_uid: 200, uid_validity: null } : null),
+  });
+  const row = await materializeInvoice(harness);
+  messages.push(skipped);
+  const callsBefore = harness.state.fetchOneCalls.length;
+
+  const dry = await harness.service.repairIncompleteMessages({ accountId: harness.account.id });
+  assert.equal(dry.dryRun, true);
+  assert.equal(dry.totalIncomplete, 1);
+  assert.equal(dry.totalWithAttachments, 1);
+  assert.equal(harness.state.fetchOneCalls.length, callsBefore, 'a dry run without includeSkipped never touches the server');
+
+  const scan = await harness.service.repairIncompleteMessages({ accountId: harness.account.id, includeSkipped: true });
+  assert.equal(scan.skippedLarge.found, 1, 'uid 120 is missing; uid 99 is already cached');
+  assert.equal(scan.skippedLarge.imported, 0);
+  assert.equal(harness.state.savedMessages.length, 1);
+
+  const run = await harness.service.repairIncompleteMessages({
+    accountId: harness.account.id, dryRun: false, includeSkipped: true, limit: 5,
+  });
+  assert.deepEqual(run.repaired, [{ id: row.id, import: 'full' }]);
+  assert.deepEqual(run.failed, []);
+  assert.equal(run.remaining, 0);
+  assert.equal(run.skippedLarge.imported, 1);
+  const newsletter = harness.state.savedMessages.find((item) => item.rfc_message_id === '<skipped-newsletter@example.test>');
+  assert.ok(newsletter);
+  assert.match(newsletter.text_body, /This week at school/);
+  assert.equal(JSON.parse(newsletter.attachments_json)[0].part, '2');
+  assert.ok(harness.state.searchQueries.some((query) => query.larger === config.syncMaxMessageBytes && query.since instanceof Date));
+  await assert.rejects(harness.service.repairIncompleteMessages({ includeSkipped: true }), /needs an accountId/);
+  await harness.service.close();
 });
 
 test('Gmail leftover-text search uses gmraw and skips already cached UIDs', async () => {

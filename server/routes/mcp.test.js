@@ -707,7 +707,7 @@ test('get_attachment authenticates and returns bounded exact bytes for one verif
     messageId: message.id, index: 4, filename: 'sample.bin', contentType: 'application/octet-stream',
     size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'), encoding: 'base64', contentBase64: bytes.toString('base64'),
   } });
-  assert.deepEqual(fetches, [[message.id, 4, { strict: true }]]);
+  assert.deepEqual(fetches, [[message.id, 4, { strict: true, maxBytes: 8 * 1024 * 1024 }]]);
   assert.deepEqual(Buffer.from(payload(result).attachment.contentBase64, 'base64'), bytes);
 
   fetched = { filename: '\u0000\r\n\u202e' + 'x'.repeat(400), contentType: 'y'.repeat(200), body: Buffer.alloc(0) };

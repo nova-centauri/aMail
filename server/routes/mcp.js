@@ -3,7 +3,7 @@ import { accessGate } from '../middleware/auth.js';
 import { createAmailMcpServer } from '../mcp/server.js';
 import { createDeepSearchService } from '../services/deep-search.js';
 import { createAttachmentReader } from '../services/attachment-reader.js';
-import { fetchVerifiedAttachment } from '../mcp/attachments.js';
+import { fetchVerifiedAttachment, MAX_READABLE_ATTACHMENT_BYTES } from '../mcp/attachments.js';
 
 /**
  * Mount a stateless Streamable HTTP MCP endpoint at /mcp.
@@ -16,7 +16,7 @@ export function registerMcp(app, { config, repos, mailService, remoteContent, au
   // One reader per app, not per request: each MCP POST builds a new server,
   // and paging through a long attachment should reuse the parsed text.
   const reader = attachmentReader || createAttachmentReader({
-    fetchBytes: (messageId, index) => fetchVerifiedAttachment({ repos, mailService }, messageId, index),
+    fetchBytes: (messageId, index) => fetchVerifiedAttachment({ repos, mailService }, messageId, index, { maxBytes: MAX_READABLE_ATTACHMENT_BYTES }),
   });
   const handleMcp = async (request, response) => {
     const server = createAmailMcpServer({

@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseMailboxQuery } from './search-query.js';
 import {
+  bodyStructureAttachments,
+  minDecodedSize,
   bodyStructureFilenames,
+  bodyStructureTextParts,
   canUseGmraw,
   imapSearchIsSelective,
   mailboxesForDeepSearch,
@@ -93,4 +96,44 @@ test('deep search covers inbox plus archive, sent, and custom folders', () => {
   assert.deepEqual(mailboxesForDeepSearch(descriptors, 'all').map((item) => item.mailbox), ['[Gmail]/All Mail']);
   assert.deepEqual(mailboxesForDeepSearch(descriptors, 'sent').map((item) => item.mailbox), ['Sent']);
   assert.equal(mailboxesForDeepSearch(descriptors, 'inbox').some((item) => item.mailbox === 'Trash'), false);
+});
+
+test('BODYSTRUCTURE attachments carry their part numbers and decoded size estimates', () => {
+  const structure = {
+    type: 'multipart/mixed',
+    childNodes: [
+      {
+        type: 'multipart/alternative',
+        childNodes: [
+          { part: '1.1', type: 'text/plain', size: 120 },
+          { part: '1.2', type: 'text/html', size: 900 },
+        ],
+      },
+      { part: '2', type: 'image/png', disposition: 'inline', id: '<logo@x>', size: 300, encoding: 'base64' },
+      {
+        part: '3', type: 'application/pdf', encoding: 'base64', size: 15_600_000,
+        disposition: 'attachment', dispositionParameters: { filename: 'Fall Newsletter.pdf' },
+      },
+      { part: '4', type: 'text/csv', parameters: { name: 'roster.csv' }, size: 50, encoding: '7bit' },
+    ],
+  };
+  const attachments = bodyStructureAttachments(structure);
+  assert.deepEqual(attachments.map((item) => [item.filename, item.part, item.contentType]), [
+    ['Fall Newsletter.pdf', '3', 'application/pdf'],
+    ['roster.csv', '4', 'text/csv'],
+  ]);
+  assert.equal(attachments[1].estimatedSize, 50);
+  assert.ok(Math.abs(attachments[0].estimatedSize - 11_400_000) < 10_000);
+  assert.deepEqual(bodyStructureFilenames(structure), ['Fall Newsletter.pdf', 'roster.csv'], 'same order as the attachment list');
+  assert.deepEqual(bodyStructureTextParts(structure), { text: { part: '1.1', size: 120 }, html: { part: '1.2', size: 900 } });
+  // A single-part message is part 1 even when the server omits the number.
+  assert.deepEqual(bodyStructureTextParts({ type: 'text/plain', size: 10 }), { text: { part: '1', size: 10 } });
+});
+
+test('minDecodedSize is a lower bound for each transfer encoding', () => {
+  assert.equal(minDecodedSize(1000, 'base64'), 720);
+  assert.equal(minDecodedSize(900, 'quoted-printable'), 300);
+  assert.equal(minDecodedSize(500, '7bit'), 500);
+  assert.equal(minDecodedSize(null, 'base64'), 0);
+  assert.equal(minDecodedSize(-1, 'base64'), 0);
 });
