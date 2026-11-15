@@ -101,6 +101,17 @@ test('concurrent readers share one fetch and one parse; jobs run at most maxConc
   assert.equal(peak, 2);
 });
 
+test('an extraction that stopped early is reported as incomplete', async () => {
+  const reader = createAttachmentReader({
+    fetchBytes: async () => ({ body: Buffer.from('x'), filename: 'big.csv', contentType: 'text/csv' }),
+    runJob: async () => ({ kind: 'text', text: 'a,b', incomplete: true, note: 'Only the first part was read.' }),
+  });
+  const result = (await reader.readText({ messageId: 'm', index: 0 })).attachment;
+  assert.equal(result.incomplete, true);
+  assert.equal(result.truncated, false);
+  assert.equal(result.note, 'Only the first part was read.');
+});
+
 test('fetch and parse failures are not cached', async () => {
   let fail = true;
   const reader = createAttachmentReader({

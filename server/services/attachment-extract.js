@@ -21,7 +21,12 @@ export const MAX_RENDER_MAX_DIMENSION = 2400;
 // Keep rendered pictures comfortably inside model image limits.
 const MAX_RENDER_OUTPUT_BYTES = 3.5 * 1024 * 1024;
 const MAX_RENDER_PIXELS = 12_000_000;
-const MAX_TEXT_CHARS = 5_000_000;
+export const MAX_TEXT_CHARS = 5_000_000;
+// Largest picture we will decode, in pixels. Decoded bitmaps live in native
+// memory that the worker's V8 heap limit does not cover, so the size is
+// checked from the file header before anything is decoded (25 MP is about
+// 100 MB as RGBA).
+export const MAX_DECODE_PIXELS = 25_000_000;
 
 const require = createRequire(import.meta.url);
 
@@ -75,6 +80,58 @@ function sniffImage(bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
   if (bytes.length >= 6 && /^GIF8[79]a$/.test(bytes.toString('latin1', 0, 6))) return 'image/gif';
   if (bytes.length >= 12 && bytes.toString('latin1', 0, 4) === 'RIFF' && bytes.toString('latin1', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+/**
+ * Width and height from an image's own header, without decoding it.
+ * Returns null when the header cannot be read.
+ */
+export function imageDimensions(bytes, type = sniffImage(bytes)) {
+  try {
+    if (type === 'image/png') {
+      if (bytes.length < 24 || bytes.toString('latin1', 12, 16) !== 'IHDR') return null;
+      return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+    }
+    if (type === 'image/gif') {
+      if (bytes.length < 10) return null;
+      return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) };
+    }
+    if (type === 'image/webp') {
+      const chunk = bytes.toString('latin1', 12, 16);
+      if (chunk === 'VP8X' && bytes.length >= 30) {
+        return { width: 1 + bytes.readUIntLE(24, 3), height: 1 + bytes.readUIntLE(27, 3) };
+      }
+      if (chunk === 'VP8L' && bytes.length >= 25 && bytes[20] === 0x2f) {
+        const bits = bytes.readUInt32LE(21);
+        return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >>> 14) & 0x3fff) };
+      }
+      if (chunk === 'VP8 ' && bytes.length >= 30) {
+        return { width: bytes.readUInt16LE(26) & 0x3fff, height: bytes.readUInt16LE(28) & 0x3fff };
+      }
+      return null;
+    }
+    if (type === 'image/jpeg') {
+      let at = 2;
+      while (at + 9 < bytes.length) {
+        if (bytes[at] !== 0xff) return null;
+        const marker = bytes[at + 1];
+        if (marker === 0xff) { at += 1; continue; }
+        if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { at += 2; continue; }
+        if (marker === 0xd9 || marker === 0xda) return null;
+        const length = bytes.readUInt16BE(at + 2);
+        // SOF0-SOF15, except DHT (C4), JPG (C8) and DAC (CC).
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return { width: bytes.readUInt16BE(at + 7), height: bytes.readUInt16BE(at + 5) };
+        }
+        if (length < 2) return null;
+        at += 2 + length;
+      }
+      return null;
+    }
+  } catch {
+    return null;
+  }
   return null;
 }
 
@@ -367,6 +424,8 @@ async function openPdf(bytes) {
     disableFontFace: true,
     useSystemFonts: false,
     enableXfa: false,
+    // Skip embedded images larger than this instead of decoding them.
+    maxImageSize: MAX_DECODE_PIXELS,
     disableAutoFetch: true,
     disableStream: true,
     stopAtErrors: false,
@@ -425,9 +484,10 @@ export async function extractPdf(bytes) {
       pageLabel: 'Page',
       pageCount,
       noTextLayer,
+      incomplete: pages.length < pageCount || undefined,
       note: [
         noTextLayer ? 'This PDF has little or no text layer (it may be a scan). Use view_attachment with a page number to see the page as an image.' : null,
-        pages.length < pageCount ? `Only the first ${pages.length} of ${pageCount} pages were read as text.` : null,
+        pages.length < pageCount ? `Only the first ${pages.length} of ${pageCount} pages were read as text. Use view_attachment for later pages, or get_attachment_link to download the whole file.` : null,
       ].filter(Boolean).join(' ') || undefined,
     };
   } finally {
@@ -439,7 +499,44 @@ export async function extractPdf(bytes) {
  * Text for any supported kind.
  * @returns {Promise<{ kind: string, text?: string, pages?: string[], pageLabel?: string, pageNames?: string[], pageCount?: number, noTextLayer?: boolean, note?: string }>}
  */
-export async function extractText({ bytes, contentType, filename }) {
+export async function extractText(input) {
+  return capExtract(await extractAnyText(input));
+}
+
+const TRUNCATED_NOTE = `Only the first ${MAX_TEXT_CHARS.toLocaleString('en-US')} characters of this file were read as text. Use get_attachment_link to download the whole file.`;
+
+/** Keep extracted text within MAX_TEXT_CHARS and say so when anything is cut. */
+function capExtract(extract) {
+  let cut = false;
+  if (typeof extract.text === 'string' && extract.text.length > MAX_TEXT_CHARS) {
+    extract.text = extract.text.slice(0, MAX_TEXT_CHARS);
+    cut = true;
+  }
+  if (Array.isArray(extract.pages)) {
+    let left = MAX_TEXT_CHARS;
+    const kept = [];
+    for (const pageText of extract.pages) {
+      if (left <= 0) { cut = true; break; }
+      if (pageText.length > left) {
+        kept.push(pageText.slice(0, left));
+        left = 0;
+        cut = true;
+      } else {
+        kept.push(pageText);
+        left -= pageText.length;
+      }
+    }
+    extract.pages = kept;
+  }
+  if (!cut) return extract;
+  return {
+    ...extract,
+    incomplete: true,
+    note: [extract.note, TRUNCATED_NOTE].filter(Boolean).join(' '),
+  };
+}
+
+async function extractAnyText({ bytes, contentType, filename }) {
   const kind = detectKind({ bytes, contentType, filename });
   switch (kind) {
     case 'pdf': return { kind, ...(await extractPdf(bytes)) };
@@ -448,7 +545,7 @@ export async function extractText({ bytes, contentType, filename }) {
     case 'pptx': return { kind, ...extractPptx(bytes) };
     case 'eml': return { kind, ...(await extractEml(bytes)) };
     case 'html': return { kind, text: htmlToText(decodeText(bytes, contentType)) };
-    case 'text': return { kind, text: tidy(decodeText(bytes, contentType)).slice(0, MAX_TEXT_CHARS) };
+    case 'text': return { kind, text: tidy(decodeText(bytes, contentType)) };
     case 'image':
       return { kind, text: '', note: 'This attachment is a picture. Use view_attachment to see it.' };
     default:
@@ -531,6 +628,16 @@ export async function renderPdfPage(bytes, pageNumber, { maxDimension = DEFAULT_
 export async function renderImage(bytes, { maxDimension = DEFAULT_RENDER_MAX_DIMENSION } = {}) {
   const sniffed = sniffImage(bytes);
   if (!sniffed) throw new ExtractError('This picture format cannot be shown.', 'ATTACHMENT_TYPE_UNSUPPORTED');
+  // Check the size from the header first: decoding a small file that claims
+  // huge dimensions would allocate the whole bitmap outside the heap limit.
+  const size = imageDimensions(bytes, sniffed);
+  if (!size || !size.width || !size.height) throw new ExtractError('This picture could not be decoded.');
+  if (size.width * size.height > MAX_DECODE_PIXELS) {
+    throw new ExtractError(
+      `This picture is ${size.width}×${size.height} pixels, too large to show. Use get_attachment_link to download it.`,
+      'ATTACHMENT_TOO_LARGE',
+    );
+  }
   let canvasLib;
   try {
     canvasLib = await loadCanvas();

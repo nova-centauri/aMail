@@ -51,7 +51,9 @@ use its `latestMessageId` with `get_message`, or its `id` with `get_thread`.
   30-second timeout, at most 2 jobs at once. A hostile or huge file kills its
   worker, not the server. PDF.js runs with eval disabled, no font loading from
   the system, no network, XFA off.
-- Up to 500 PDF pages and 5 million characters of text per file.
+- Up to 500 PDF pages and 5 million characters of text per file. When either limit cuts
+  a file short, the result says `incomplete: true` with a note, so an agent never takes
+  part of a file for all of it.
 - ZIP parts of Office files are read by a small reader in
   `server/services/zip-reader.js` that refuses ZIP64, encryption and any entry
   that inflates past its declared size or 16 MB (zip bombs).
@@ -60,6 +62,9 @@ use its `latestMessageId` with `get_message`, or its `id` with `get_thread`.
   it once. Failures are never cached.
 - Rendered pictures: longest side 1600 px by default (200 to 2400), at most
   12 megapixels and 3.5 MB.
+- Pictures larger than 25 megapixels are refused from their header before
+  decoding (decoded bitmaps use native memory the worker's heap cap does not
+  cover), and PDF.js skips embedded images above the same size.
 - Nothing here syncs, marks mail read or analyzed, or changes a mailbox.
 
 New dependency: `pdfjs-dist` (Mozilla PDF.js) for PDF text and rendering. It

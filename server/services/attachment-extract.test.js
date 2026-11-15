@@ -6,6 +6,9 @@ import {
   extractText,
   flattenExtract,
   htmlToText,
+  imageDimensions,
+  MAX_DECODE_PIXELS,
+  MAX_TEXT_CHARS,
   renderImage,
   renderPdfPage,
 } from './attachment-extract.js';
@@ -131,6 +134,40 @@ test('broken files fail with a plain message, not parser internals', async () =>
   );
 });
 
+test('text past the extraction limit is cut with a note, never silently', async () => {
+  const big = Buffer.alloc(MAX_TEXT_CHARS + 10, 'a');
+  const result = await extractText({ bytes: big, contentType: 'text/plain', filename: 'big.txt' });
+  assert.equal(result.text.length, MAX_TEXT_CHARS);
+  assert.equal(result.incomplete, true);
+  assert.match(result.note, /get_attachment_link/);
+  const small = await extractText({ bytes: Buffer.from('short'), contentType: 'text/plain', filename: 'a.txt' });
+  assert.equal(small.incomplete, undefined);
+  assert.equal(small.note, undefined);
+});
+
+function pngHeader(width, height) {
+  const ihdr = Buffer.alloc(33);
+  Buffer.from('\x89PNG\r\n\x1a\n', 'latin1').copy(ihdr, 0);
+  ihdr.writeUInt32BE(13, 8);
+  ihdr.write('IHDR', 12, 'latin1');
+  ihdr.writeUInt32BE(width, 16);
+  ihdr.writeUInt32BE(height, 20);
+  return ihdr;
+}
+
+test('a picture whose header claims huge dimensions is refused before decoding', async () => {
+  assert.deepEqual(imageDimensions(pngHeader(640, 480)), { width: 640, height: 480 });
+  const gif = Buffer.from('GIF89a\x20\x03\x58\x02\x00\x00\x00', 'latin1');
+  assert.deepEqual(imageDimensions(gif), { width: 800, height: 600 });
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x01, 0xe0, 0x02, 0x80, 0x03]);
+  assert.deepEqual(imageDimensions(jpeg), { width: 640, height: 480 });
+  assert.equal(imageDimensions(Buffer.from([0xff, 0xd8, 0xff, 0xd9])), null);
+
+  const side = Math.ceil(Math.sqrt(MAX_DECODE_PIXELS)) + 1;
+  await assert.rejects(renderImage(pngHeader(side, side)), (error) => error.code === 'ATTACHMENT_TOO_LARGE' && /get_attachment_link/.test(error.message));
+  await assert.rejects(renderImage(pngHeader(0, 10)), /could not be decoded/);
+});
+
 test('zip reader refuses bombs, encryption and damaged directories', () => {
   const plain = makeZip([{ name: 'a.txt', data: 'hello' }, { name: 'b.txt', data: 'stored', method: 0 }]);
   assert.deepEqual(listZipEntries(plain).map((entry) => entry.name), ['a.txt', 'b.txt']);
@@ -171,6 +208,9 @@ test('a PDF page renders to a picture within the size limit', { skip: !canvasAva
   big.getContext('2d').fillRect(0, 0, 10, 10);
   const resized = await renderImage(big.toBuffer('image/png'), { maxDimension: 600 });
   assert.deepEqual([resized.width, resized.height], [600, 200]);
+  for (const type of ['image/png', 'image/jpeg', 'image/webp']) {
+    assert.deepEqual(imageDimensions(createCanvas(123, 45).toBuffer(type)), { width: 123, height: 45 }, type);
+  }
   const small = createCanvas(50, 40).toBuffer('image/png');
   const asIs = await renderImage(small);
   assert.equal(asIs.data, small);

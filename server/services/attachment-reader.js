@@ -194,6 +194,8 @@ export function createAttachmentReader({
         pageStarts,
         pageCount: extract.pageCount ?? (Array.isArray(extract.pages) ? extract.pages.length : null),
         noTextLayer: Boolean(extract.noTextLayer),
+        // Some of the file was never extracted (text or page limit).
+        incomplete: Boolean(extract.incomplete),
         note: extract.note || null,
       };
       texts.set(key, value);
@@ -247,6 +249,7 @@ export function createAttachmentReader({
         lastPage: loaded.pageStarts.length ? pageAt(Math.max(start, end - 1)) : undefined,
         nextOffset: end < loaded.text.length ? end : null,
         truncated: end < loaded.text.length,
+        incomplete: loaded.incomplete || undefined,
         note: loaded.note || undefined,
         text: loaded.text.slice(start, end),
       },

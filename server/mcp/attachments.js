@@ -116,6 +116,7 @@ export function registerAttachmentTools(server, { config, repos, mailService, at
       'Read the text of one attachment, in pages of up to maxChars characters (default 20,000).',
       'Works for PDF (with [Page N of M] markers), Word .docx, Excel .xlsx (tab-separated rows per sheet), PowerPoint .pptx, HTML, plain text, CSV, JSON, XML and forwarded .eml.',
       'Continue with offset = nextOffset until it is null, or jump with page (PDF page, slide or sheet number).',
+      'incomplete: true means part of the file was never extracted (size or page limit); see note, and download the original with get_attachment_link if you need all of it.',
       'Scanned PDFs report noTextLayer: use view_attachment to see those pages. Pictures: use view_attachment. Other types: use get_attachment_link.',
       'Read-only: does not sync, mark read/analyzed, or change mail. Maximum 8 MiB per file.',
       UNTRUSTED_NOTE,
