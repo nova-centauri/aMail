@@ -117,6 +117,50 @@ function sendConsentPage(response, status, transaction, options) {
   return response.status(status).type('html').send(consentPage(transaction, options));
 }
 
+/**
+ * Hand the browser to the client's callback from a fresh page, not a 303.
+ *
+ * Chrome checks the consent page's `form-action` against every hop of the
+ * redirect chain that follows the form POST, and blocks the navigation
+ * silently when any hop leaves the allow-list. Callbacks that redirect again
+ * (https://www.cursor.com/... answers 308 to https://cursor.com/...) were
+ * blocked after the code was minted and the transaction consumed, so the
+ * Authorize button seemed to do nothing and a second click said the request
+ * had expired. Navigation from a page the browser has already rendered is not
+ * a form submission, so `form-action` does not apply to it.
+ */
+function sendCallbackPage(response, location) {
+  const target = escapeHtml(location);
+  response.set('Cache-Control', 'no-store');
+  response.set('Referrer-Policy', 'no-referrer');
+  response.set('Content-Security-Policy', [
+    "default-src 'none'",
+    "style-src 'unsafe-inline'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'none'",
+  ].join('; '));
+  return response.status(200).type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="0;url=${target}">
+  <title>Returning to your app — aMail</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #0d1017; color: #eef2ff; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }
+    a { color: #b3a9ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <p>Returning to your app… If nothing happens, <a href="${target}">continue</a>.</p>
+  </main>
+</body>
+</html>`);
+}
+
 function oauthError(response, error) {
   const protocol = error instanceof OAuthProtocolError
     ? error
@@ -188,7 +232,7 @@ export function registerOAuth(app, { auth, oauth }) {
     if (!transaction) return response.status(400).type('text').send('This authorization request expired. Start the connector setup again.');
     try {
       if (request.body?.decision === 'deny') {
-        return response.redirect(303, oauth.finishAuthorization(transaction.id, { approved: false }));
+        return sendCallbackPage(response, oauth.finishAuthorization(transaction.id, { approved: false }));
       }
       if (request.body?.decision !== 'allow') {
         return response.status(400).type('text').send('Choose Authorize or Cancel to continue.');
@@ -200,7 +244,7 @@ export function registerOAuth(app, { auth, oauth }) {
         authenticated = true;
       }
       if (!authenticated) throw new Error('Authentication failed.');
-      return response.redirect(303, oauth.finishAuthorization(transaction.id, { approved: true }));
+      return sendCallbackPage(response, oauth.finishAuthorization(transaction.id, { approved: true }));
     } catch (error) {
       if (error instanceof OAuthProtocolError) return oauthError(response, error);
       return sendConsentPage(response, 401, transaction, {

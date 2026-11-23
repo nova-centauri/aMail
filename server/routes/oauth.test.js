@@ -110,8 +110,12 @@ test('Claude custom-connector OAuth flow reaches an authenticated MCP request', 
     headers: browserForm,
     body: new URLSearchParams({ transaction: retryTransaction, decision: 'allow', credential: 'owner-access-token' }),
   });
-  assert.equal(approval.status, 303);
-  const callback = new URL(approval.headers.get('location'));
+  assert.equal(approval.status, 200, 'a 303 after the form POST is checked against form-action on every redirect hop, so callbacks that redirect again (www.cursor.com -> cursor.com) are blocked');
+  assert.match(approval.headers.get('content-security-policy'), /form-action 'none'/);
+  const callbackHref = (await approval.text()).match(/http-equiv="refresh" content="0;url=([^"]+)"/)?.[1];
+  assert.ok(callbackHref);
+  const callback = new URL(callbackHref.replaceAll('&amp;', '&'));
+  assert.equal(`${callback.origin}${callback.pathname}`, client.redirect_uris[0]);
   assert.equal(callback.searchParams.get('state'), 'route-test');
 
   const tokenResponse = await fetch(`${origin}/oauth/token`, {
