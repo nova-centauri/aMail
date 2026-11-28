@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { AppError, NotFoundError, ValidationError } from '../errors.js';
-import { asciiFilename, MAX_COMPOSE_ATTACHMENT_BYTES, safeAttachmentType } from './compose-attachments.js';
+import { asciiFilename, COMPOSE_ATTACHMENT_LIMIT_LABEL, MAX_COMPOSE_ATTACHMENT_BYTES, safeAttachmentType } from './compose-attachments.js';
 
 /*
  * Upload links for draft attachments. An agent that has the file on its own
@@ -20,15 +20,15 @@ import { asciiFilename, MAX_COMPOSE_ATTACHMENT_BYTES, safeAttachmentType } from 
  *   still needs an authenticated save_draft.
  * - Files stay in memory, never on disk, for 30 minutes or until a draft
  *   takes them. A restart drops them.
- * - Size cap (the 8 MiB draft limit), at most 16 links or files waiting, and
- *   at most 32 MiB staged in all. A file named .pdf must be a PDF.
+ * - Size cap (the 15 MiB draft limit), at most 16 links or files waiting, and
+ *   at most 48 MiB staged in all (three full-size files). A file named .pdf must be a PDF.
  */
 
 export const DEFAULT_UPLOAD_LINK_MINUTES = 10;
 export const MAX_UPLOAD_LINK_MINUTES = 30;
 export const STAGED_FILE_TTL_MS = 30 * 60 * 1000;
 export const MAX_WAITING_UPLOADS = 16;
-export const MAX_STAGED_TOTAL_BYTES = 32 * 1024 * 1024;
+export const MAX_STAGED_TOTAL_BYTES = 48 * 1024 * 1024;
 
 const UPLOAD_ID_PATTERN = /^upl_[0-9a-f]{32}$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -117,7 +117,7 @@ export function createUploadStaging({ maxBytes = MAX_COMPOSE_ATTACHMENT_BYTES, n
     slots.delete(hashToken(token));
     if (!Buffer.isBuffer(body) || !body.length) throw new ValidationError('The upload was empty. Choose a file and try again.');
     if (body.length > maxBytes) {
-      throw uploadError(`The file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB.`, 'ATTACHMENT_TOO_LARGE', 413);
+      throw uploadError(`The file is larger than ${maxBytes === MAX_COMPOSE_ATTACHMENT_BYTES ? COMPOSE_ATTACHMENT_LIMIT_LABEL : `${Math.round(maxBytes / (1024 * 1024))} MB`}.`, 'ATTACHMENT_TOO_LARGE', 413);
     }
     if (stagedBytes() + body.length > MAX_STAGED_TOTAL_BYTES) {
       throw uploadError('Too many files are waiting to be attached. Try again in a few minutes.', 'UPLOADS_BUSY', 429);

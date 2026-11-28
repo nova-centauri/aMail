@@ -8,9 +8,11 @@ import { IconButton } from './ui.jsx';
 import { RecipientField } from './RecipientField.jsx';
 import { SignatureEditor } from './SignatureEditor.jsx';
 
-export const MAX_COMPOSE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// Matches the server (server/services/compose-attachments.js): 15 MiB keeps a
+// message under Gmail's 25 MB limit once the files are base64-encoded.
+export const MAX_COMPOSE_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 export const MAX_COMPOSE_ATTACHMENT_COUNT = 8;
-export const MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES = 8 * 1024 * 1024;
+export const MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES = 15 * 1024 * 1024;
 
 async function readFileAsAttachment(file) {
   const buffer = await file.arrayBuffer();
@@ -207,14 +209,14 @@ export function ComposeModal({ account, accounts, contacts = [], isDemo, onClose
       const next = [...current];
       for (const file of files) {
         if (file.size > MAX_COMPOSE_ATTACHMENT_BYTES) {
-          setError(`${file.name || 'A file'} is larger than 8 MB.`);
+          setError(`${file.name || 'A file'} is larger than 15 MB.`);
           return;
         }
         next.push(await readFileAsAttachment(file));
       }
       const total = next.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
       if (total > MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES) {
-        setError('Attached files together must stay under 8 MB.');
+        setError('Attached files together must stay under 15 MB.');
         return;
       }
       pristineRef.current = false;

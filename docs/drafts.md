@@ -66,7 +66,7 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
    before the rewrite, through the strict attachment path (same mailbox,
    UIDVALIDITY, UID, Message-ID and MIME part as the cached row). If a file
    cannot be fetched or verified, the save fails rather than dropping it or
-   copying another message's file into the draft. Files over 8 MiB on a draft
+   copying another message's file into the draft. Files over 15 MiB on a draft
    written by another client cannot be carried over this way.
 3. **Send retires the draft.** `send_message` / `POST /api/messages` with
    `draftId` removes the server copy (same Message-ID guard) after SMTP accepts.
@@ -121,7 +121,7 @@ What changed:
 1. **`{ url }` attachments.** Any item in `attachments` or `addAttachments`
    may be `{ url, filename?, contentType? }` instead of `{ content }`. The
    aMail server downloads the file (`server/services/attachment-fetch.js`)
-   and it then goes through the normal attachment path (8 files, 8 MiB).
+   and it then goes through the normal attachment path (8 files, 15 MiB).
    Filename: the caller's, else the response's `Content-Disposition`, else the
    last URL path segment.
 2. **`addAttachments`.** Appends files to the draft's current list. Files
@@ -146,7 +146,7 @@ Network rules for the download (SSRF protection):
   second DNS lookup, so DNS rebinding cannot swap in an internal address.
 - At most 3 redirects; each hop must pass the same rules, so an allowed host
   cannot bounce the fetch to an unlisted or internal one.
-- 8 MiB cap (declared length and while streaming), 20 s deadline
+- 15 MiB cap (declared length and while streaming), 20 s deadline
   (`AMAIL_DRAFT_ATTACHMENT_FETCH_TIMEOUT_MS`).
 - An HTML response is refused as "a web page instead of a file" (usually a
   sign-in page or an expired link). A file typed or named as a PDF must
@@ -230,8 +230,8 @@ Rules (`server/services/upload-staging.js`, `server/routes/uploads.js`):
 - The link alone cannot attach and the `uploadId` alone cannot upload:
   attaching still needs an authenticated `save_draft`.
 - Cross-origin posts are refused by the existing origin guard.
-- 8 MiB per file, one file per form; at most 16 links or files waiting and
-  32 MiB staged in all. The file name decides the type; HTML or SVG is never
+- 15 MiB per file, one file per form; at most 16 links or files waiting and
+  48 MiB staged in all. The file name decides the type; HTML or SVG is never
   kept as such, and a `.pdf` must contain `%PDF-` in its first KB.
 - Files stay in memory, never on disk, for 30 minutes or until one draft
   takes them. A restart drops them. Needs `AMAIL_ORIGIN`.
@@ -246,6 +246,18 @@ Decisions:
 - D12. A future self-hosted file host (for example a Nova VC instance) needs
   no new code: list its host in `AMAIL_DRAFT_ATTACHMENT_URL_HOSTS` and its
   token in `AMAIL_DRAFT_ATTACHMENT_URL_AUTH`.
+
+## Size limit (November 2026)
+
+Drafts and sends take up to 15 MiB of files (8 files at most), raised from
+8 MiB to match what Gmail accepts. Gmail refuses a message over 25 MB, counted
+after base64 encoding, and 15 MiB of files is about 21 MB encoded. The large
+JSON parser for the composer and `/mcp` takes 22 MB to fit that encoding, and
+the upload page takes 15 MiB plus form overhead. A reverse proxy in front of
+aMail must allow request bodies of at least 22 MB (nginx
+`client_max_body_size 25m` or more), and other mail servers' own message size
+limits still apply (Postfix `message_size_limit`). `get_attachment` still
+returns at most 8 MiB, because it puts base64 in the tool result.
 
 ## Provider notes
 

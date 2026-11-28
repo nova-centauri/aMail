@@ -2,6 +2,7 @@ import express from 'express';
 import { AppError } from '../errors.js';
 import { parseSingleFileUpload } from '../services/multipart.js';
 import { uploadStagingFor } from '../services/upload-staging.js';
+import { COMPOSE_ATTACHMENT_LIMIT_LABEL, MAX_COMPOSE_ATTACHMENT_BYTES } from '../services/compose-attachments.js';
 
 /*
  * The one-time upload page behind create_upload_link. It sits outside the
@@ -40,7 +41,7 @@ function gonePage(response) {
 }
 
 export function registerUploadRoutes(app, { staging = uploadStagingFor(app), maxBodyBytes = null } = {}) {
-  const limit = maxBodyBytes || (8 * 1024 * 1024) + (256 * 1024);
+  const limit = maxBodyBytes || MAX_COMPOSE_ATTACHMENT_BYTES + (256 * 1024);
   const formBody = express.raw({ type: 'multipart/form-data', limit, inflate: false });
 
   app.get('/api/upload', (request, response) => {
@@ -52,7 +53,7 @@ export function registerUploadRoutes(app, { staging = uploadStagingFor(app), max
       + `<form method="post" enctype="multipart/form-data" action="/api/upload?token=${encodeURIComponent(token)}">`
       + '<label>File <input type="file" name="file" required></label>'
       + '<button type="submit">Upload</button></form>'
-      + `<p class="muted">Up to 8 MB. This link works once and expires at ${escapeHtml(new Date(slot.expiresAt).toISOString())}.</p>`);
+      + `<p class="muted">Up to ${COMPOSE_ATTACHMENT_LIMIT_LABEL}. This link works once and expires at ${escapeHtml(new Date(slot.expiresAt).toISOString())}.</p>`);
   });
 
   app.post('/api/upload', (request, response, next) => {
@@ -78,7 +79,7 @@ export function registerUploadRoutes(app, { staging = uploadStagingFor(app), max
   // A body over the limit, or a malformed one, from express.raw.
   app.use('/api/upload', (error, _request, response, next) => {
     if (!error) return next();
-    if (error.type === 'entity.too.large') return sendPage(response, 413, 'Upload failed', '<p>The file is larger than 8 MB.</p>');
+    if (error.type === 'entity.too.large') return sendPage(response, 413, 'Upload failed', `<p>The file is larger than ${COMPOSE_ATTACHMENT_LIMIT_LABEL}.</p>`);
     return sendPage(response, 400, 'Upload failed', '<p>The upload could not be read.</p>');
   });
 }

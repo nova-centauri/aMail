@@ -485,7 +485,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       subject: z.string().optional(),
       textBody: z.string().optional(),
       htmlBody: z.string().optional(),
-      attachments: z.array(draftAttachmentSchema).optional().describe('The complete file list: up to 8 files, 8 MiB combined. Omit to keep the draft\'s files, [] to remove them all. Files already on the draft are kept by listing their filename without content'),
+      attachments: z.array(draftAttachmentSchema).optional().describe('The complete file list: up to 8 files, 15 MiB combined. Omit to keep the draft\'s files, [] to remove them all. Files already on the draft are kept by listing their filename without content'),
       addAttachments: z.array(draftAttachmentSchema).optional().describe('Files to add on top of the draft\'s current files (each needs uploadId, url or content). Existing files, body and recipients are kept'),
     },
   }, async ({ draftId, ...input }) => runTool(async () => {
@@ -503,7 +503,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
   server.registerTool('create_upload_link', {
     title: 'Create a file upload link',
     description: [
-      'Get a one-time https page on this aMail server where a browser can upload one file (up to 8 MiB), and an uploadId for it.',
+      'Get a one-time https page on this aMail server where a browser can upload one file (up to 15 MiB), and an uploadId for it.',
       'Use it when the file is on your own disk but you cannot send it to aMail directly: open the url in your browser, choose the file, press Upload, then pass { uploadId } in save_draft attachments or addAttachments.',
       `The page works once and expires in ${DEFAULT_UPLOAD_LINK_MINUTES} minutes by default (at most ${MAX_UPLOAD_LINK_MINUTES}); the uploaded file is kept in memory for 30 minutes or until a draft takes it.`,
       'Anyone holding the url can upload in your place until it is used, so open it only in your own browser: never put it in chat, a message, a draft, notes or logs.',
@@ -573,7 +573,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
         filename: z.string(),
         contentType: z.string().optional(),
         content: z.string().describe('Base64 file bytes'),
-      })).optional().describe('Outbound attachments (base64). Combined size must stay under 8 MB.'),
+      })).optional().describe('Outbound attachments (base64). Combined size must stay under 15 MB.'),
     },
   }, async (input) => runTool(async () => {
     const message = await mailService.sendMessage(input);

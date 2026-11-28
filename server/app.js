@@ -61,11 +61,11 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
 
   const jsonTypes = ['application/json', 'application/*+json'];
   const standardJson = express.json({ limit: '256kb', inflate: false, type: jsonTypes });
-  // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB
+  // Compose attachments travel as base64 JSON. 15 MiB of files is ~20 MiB
   // encoded. Authenticate before accepting that larger allocation; every other
   // endpoint stays on a deliberately small parser and compressed request bodies
   // are rejected to avoid decompression-amplification work.
-  const largeJson = express.json({ limit: '12mb', inflate: false, type: jsonTypes });
+  const largeJson = express.json({ limit: '22mb', inflate: false, type: jsonTypes });
   const largeBodyGate = accessGate(authenticator, {
     // This gate runs before the route-specific MCP gate so large unauthenticated
     // payloads are rejected before allocation. It must carry the same OAuth

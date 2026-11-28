@@ -17,7 +17,7 @@ import { asciiFilename, MAX_COMPOSE_ATTACHMENT_BYTES, safeAttachmentType } from 
  * - Every address the host resolves to must be public. The connection uses
  *   the address that was checked (no second DNS lookup), so DNS rebinding
  *   cannot swap in an internal address between check and connect.
- * - Size cap (the 8 MiB draft limit), timeout, and a content-type check: an
+ * - Size cap (the 15 MiB draft limit), timeout, and a content-type check: an
  *   HTML response (a login or error page) is refused, and a file that says it
  *   is a PDF must start with %PDF-.
  * - Optional per-host auth headers (AMAIL_DRAFT_ATTACHMENT_URL_AUTH) are sent

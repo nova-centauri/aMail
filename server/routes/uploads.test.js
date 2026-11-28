@@ -172,8 +172,17 @@ test('the upload page refuses bad tokens, cross-origin posts, fake PDFs and over
   assert.equal(mismatch.status, 422);
   assert.equal(staging.status(fake.uploadId).state, 'unknown');
 
+  // Files up to Gmail-sized 15 MiB go through; anything bigger is refused.
+  const roomy = staging.createLink();
+  const large = multipart([{ name: 'file', filename: 'scan.bin', body: Buffer.alloc(14 * 1024 * 1024, 1) }]);
+  const accepted = await fetch(`${origin}/api/upload?token=${roomy.token}`, {
+    method: 'POST', headers: { 'Content-Type': large.contentType, Origin: origin }, body: large.body,
+  });
+  assert.equal(accepted.status, 201);
+  assert.equal(staging.status(roomy.uploadId).size, 14 * 1024 * 1024);
+
   const big = staging.createLink();
-  const huge = multipart([{ name: 'file', filename: 'big.bin', body: Buffer.alloc(9 * 1024 * 1024) }]);
+  const huge = multipart([{ name: 'file', filename: 'big.bin', body: Buffer.alloc(16 * 1024 * 1024) }]);
   const tooLarge = await fetch(`${origin}/api/upload?token=${big.token}`, {
     method: 'POST', headers: { 'Content-Type': huge.contentType, Origin: origin }, body: huge.body,
   });
