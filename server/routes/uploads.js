@@ -25,7 +25,11 @@ function sendPage(response, status, title, bodyHtml) {
   response.status(status);
   response.set('Content-Type', 'text/html; charset=utf-8');
   response.set('Cache-Control', 'private, no-store');
-  response.set('Referrer-Policy', 'no-referrer');
+  // Not helmet's no-referrer: under it a browser posts the form with
+  // `Origin: null`, which the origin guard refuses (see sendConsentPage in
+  // oauth.js). same-origin keeps the real Origin and still sends nothing
+  // to other sites.
+  response.set('Referrer-Policy', 'same-origin');
   response.set('X-Robots-Tag', 'noindex, nofollow');
   response.send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">`
     + `<title>${escapeHtml(title)}</title><style>${PAGE_STYLE}</style></head><body><h1>${escapeHtml(title)}</h1>${bodyHtml}</body></html>`);

@@ -108,6 +108,8 @@ test('a browser upload through a one-time link attaches to a draft', async (t) =
   const page = await fetch(link.url);
   assert.equal(page.status, 200);
   assert.equal(page.headers.get('cache-control'), 'private, no-store');
+  // no-referrer would make the browser post with Origin: null, which the guard refuses.
+  assert.equal(page.headers.get('referrer-policy'), 'same-origin');
   const html = await page.text();
   assert.match(html, /type="file" name="file"/);
   assert.doesNotMatch(html, /<script/);
@@ -157,6 +159,10 @@ test('the upload page refuses bad tokens, cross-origin posts, fake PDFs and over
   });
   assert.equal(refused.status, 403);
   assert.ok(staging.linkFor(crossSite.token), 'a refused cross-origin post leaves the link usable');
+  const nullOrigin = await fetch(`${origin}/api/upload?token=${crossSite.token}`, {
+    method: 'POST', headers: { 'Content-Type': form.contentType, Origin: 'null' }, body: form.body,
+  });
+  assert.equal(nullOrigin.status, 403, 'this is why the page must not send no-referrer');
 
   const fake = staging.createLink();
   const notPdf = multipart([{ name: 'file', filename: 'q.pdf', type: 'application/pdf', body: '<html>login</html>' }]);
