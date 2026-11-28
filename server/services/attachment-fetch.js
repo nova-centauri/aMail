@@ -63,23 +63,63 @@ export function isNonPublicAddress(address) {
   return NON_PUBLIC.check(address, family === 4 ? 'ipv4' : 'ipv6');
 }
 
-/** "a.example.com, *.files.example.com" -> lowercase patterns. IP literals are
- * not accepted; list a DNS name. */
+/** "a.example.com, *.files.example.com, api.github.com/repos/o/r/contents/"
+ * -> lowercase patterns. An entry is a DNS name, optionally followed by a
+ * path prefix: then only URLs under that path on that host are fetched (and
+ * only they get the host's auth headers). A path prefix always ends with "/",
+ * so /repos/o/outbox/ does not match /repos/o/outbox-evil. IP literals are not
+ * accepted; list a DNS name. Entries with dot segments, percent escapes or
+ * backslashes in the path are dropped. */
 export function parseHostAllowlist(value) {
   return String(value || '')
     .split(',')
-    .map((entry) => entry.trim().toLowerCase().replace(/\.$/, ''))
-    .filter((entry) => entry && !net.isIP(entry) && /^(\*\.)?[a-z0-9.-]+$/.test(entry) && entry.includes('.'));
+    .map((entry) => entry.trim().toLowerCase())
+    .map((entry) => {
+      const slash = entry.indexOf('/');
+      const host = (slash === -1 ? entry : entry.slice(0, slash)).replace(/\.$/, '');
+      if (!host || net.isIP(host) || !/^(\*\.)?[a-z0-9.-]+$/.test(host) || !host.includes('.')) return '';
+      if (slash === -1) return host;
+      let path = entry.slice(slash);
+      if (!/^\/[a-z0-9._~\/-]*$/.test(path) || /\/\.{1,2}(\/|$)/.test(path) || path.includes('//')) return '';
+      if (!path.endsWith('/')) path += '/';
+      return `${host}${path}`;
+    })
+    .filter(Boolean);
 }
 
+function splitPattern(pattern) {
+  const slash = pattern.indexOf('/');
+  return slash === -1 ? { host: pattern, path: '' } : { host: pattern.slice(0, slash), path: pattern.slice(slash) };
+}
+
+function hostMatches(host, pattern) {
+  return pattern.startsWith('*.')
+    ? host.endsWith(pattern.slice(1)) && host.length > pattern.length - 1
+    : host === pattern;
+}
+
+/** True when the host appears in the allowlist, with or without a path. */
 export function hostAllowed(hostname, patterns = []) {
   const host = String(hostname || '').toLowerCase().replace(/\.$/, '');
   if (!host || net.isIP(host) || host.startsWith('[')) return false;
-  return patterns.some((pattern) => (
-    pattern.startsWith('*.')
-      ? host.endsWith(pattern.slice(1)) && host.length > pattern.length - 1
-      : host === pattern
-  ));
+  return patterns.some((pattern) => hostMatches(host, splitPattern(pattern).host));
+}
+
+/** True when the URL's host matches an entry and, for an entry with a path,
+ * the URL's path sits under it. A path-scoped entry refuses paths carrying
+ * encoded slashes, backslashes or dots, which a server might decode into a
+ * different path than the one checked. */
+export function urlAllowed(url, patterns = []) {
+  const host = String(url?.hostname || '').toLowerCase().replace(/\.$/, '');
+  if (!host || net.isIP(host) || host.startsWith('[')) return false;
+  const path = String(url?.pathname || '/').toLowerCase();
+  return patterns.some((pattern) => {
+    const scoped = splitPattern(pattern);
+    if (!hostMatches(host, scoped.host)) return false;
+    if (!scoped.path) return true;
+    if (/%2f|%5c|%2e|\\/.test(path)) return false;
+    return path.startsWith(scoped.path);
+  });
 }
 
 /**
@@ -143,6 +183,10 @@ function filenameFromPath(url) {
   }
 }
 
+// Content types that say nothing about the file, so the file name decides.
+// GitHub's contents API serves every file as application/vnd.github.raw.
+const GENERIC_TYPES = /^(application\/octet-stream|binary\/octet-stream|application\/vnd\.github\.raw(\+json)?|application\/x-download|application\/download)$/;
+
 function looksLikePdf(buffer) {
   return buffer.subarray(0, 1024).includes(Buffer.from('%PDF-'));
 }
@@ -182,9 +226,9 @@ export function createDraftAttachmentFetcher({
     if (url.port && url.port !== '443') {
       throw fetchError('Attachment URLs must use the standard https port.', 'ATTACHMENT_URL_BLOCKED');
     }
-    if (!hostAllowed(url.hostname, allowHosts)) {
+    if (!urlAllowed(url, allowHosts)) {
       throw fetchError(
-        `${url.hostname || 'That host'} is not on this server's list of hosts aMail may fetch attachments from (AMAIL_DRAFT_ATTACHMENT_URL_HOSTS).`,
+        `${describeUrl(url.toString()) || 'That address'} is not on this server's list of places aMail may fetch attachments from (AMAIL_DRAFT_ATTACHMENT_URL_HOSTS).`,
         'ATTACHMENT_HOST_NOT_ALLOWED',
       );
     }
@@ -344,7 +388,7 @@ export function createDraftAttachmentFetcher({
       );
     }
     const name = asciiFilename(filename || filenameFromDisposition(headers['content-disposition']) || filenameFromPath(url));
-    const type = safeAttachmentType(contentType || (served && served !== 'application/octet-stream' ? served : '')
+    const type = safeAttachmentType(contentType || (served && !GENERIC_TYPES.test(served) ? served : '')
       || (/\.pdf$/i.test(name) ? 'application/pdf' : 'application/octet-stream'));
     if (type === 'application/pdf' && !looksLikePdf(body)) {
       throw fetchError(`${name} is not a PDF file.`, 'ATTACHMENT_URL_TYPE_MISMATCH', 422);

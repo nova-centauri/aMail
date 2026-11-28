@@ -188,6 +188,49 @@ Decisions:
 - D9. `addAttachments` instead of changing what `attachments` means, so
   existing callers (the composer sends the full list) behave as before.
 
+### Attaching a file from a cloud agent session (GitHub outbox)
+
+Problem (Nov 28): a Claude cloud session made a 1.7 MB PDF in its own
+workspace and could not put it on a draft. Its network proxy refuses the aMail
+host, WorkBoard and MCC, every MCP upload path (aMail, MCC `blob_upload`,
+WorkBoard uploads) needs the bytes inline as base64, and the only outside host
+the session can write to is GitHub. Files that already live in WorkBoard keep
+using WorkBoard's minted quote PDF link.
+
+The bridge is one private GitHub repository used as an outbox:
+
+1. The session pushes the file to a new branch of the outbox repo
+   (`outbox/<date>-<short-name>`), one file per commit.
+2. It calls `save_draft` with
+   `{ "url": "https://api.github.com/repos/<owner>/<outbox>/contents/<path>?ref=<branch>", "filename": "...", "contentType": "application/pdf" }`.
+   The aMail server downloads it with its own read-only token.
+3. Once the draft shows the file, the session deletes the branch.
+
+Server settings:
+
+```
+AMAIL_DRAFT_ATTACHMENT_URL_HOSTS=<existing hosts>,api.github.com/repos/<owner>/<outbox>/contents/
+AMAIL_DRAFT_ATTACHMENT_URL_AUTH={...existing hosts...,"api.github.com":{"Authorization":"Bearer <token>","Accept":"application/vnd.github.raw+json","X-GitHub-Api-Version":"2022-11-28"}}
+```
+
+- The token is a fine-grained personal access token limited to the outbox
+  repository with Contents: read-only, and nothing else. Agents never see it.
+- The path prefix keeps the fetch, and the token, to that one repository's
+  contents. Paths with encoded slashes, backslashes or dots are refused for a
+  path-scoped entry, so a URL cannot be decoded by GitHub into a path other
+  than the one aMail checked. A prefix always ends in `/`.
+- `Accept: application/vnd.github.raw+json` makes GitHub return the file's
+  bytes instead of JSON. aMail treats GitHub's `application/vnd.github.raw`
+  type, like `application/octet-stream`, as saying nothing about the file, so
+  the file name (or the caller's `contentType`) sets the type, and a PDF still
+  has to start with `%PDF-`.
+- The outbox holds customer documents for minutes. Keep it private, and
+  delete branches after use.
+
+Decision D10: GitHub over a new upload endpoint. An upload endpoint on the
+aMail host does not help a session whose proxy refuses that host (see D6),
+and a public file host would put customer documents on the open internet.
+
 Known limit: an update builds on aMail's latest synced copy of the draft. If
 the draft was edited in another client in the last few minutes and aMail has
 not synced Drafts since, run `sync_mail` for that account first. Otherwise

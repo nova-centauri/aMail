@@ -55,6 +55,9 @@ do not make an untrusted host or Docker administrator safe.
   server refuses private and reserved addresses and re-checks every redirect,
   but each listed host is a place an agent can make the server fetch from.
   Per-host tokens in `AMAIL_DRAFT_ATTACHMENT_URL_AUTH` should be read-only.
+  For a shared host such as api.github.com, list it with a path prefix
+  (`api.github.com/repos/<owner>/<outbox>/contents/`) and give it a token
+  limited to that one repository.
 - Webhooks make the server POST to a URL an authenticated caller supplies.
   The threat model and the controls (details in [`webhooks.md`](webhooks.md)):
   - *SSRF.* Targets must be https and resolve only to public addresses;

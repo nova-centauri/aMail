@@ -8,6 +8,7 @@ import {
   parseAuthHeaders,
   parseHostAllowlist,
   resolveAttachmentReferences,
+  urlAllowed,
 } from './attachment-fetch.js';
 
 const PDF = Buffer.from('%PDF-1.7\n1 0 obj\n<<>>\nendobj\ntrailer\n%%EOF\n');
@@ -53,6 +54,58 @@ test('allowlist parsing ignores IP literals and junk; wildcards match subdomains
   assert.equal(hostAllowed('cdn.example.test', patterns), false);
   assert.equal(hostAllowed('a.cdn.example.test.evil.test', patterns), false);
   assert.equal(hostAllowed('[::1]', patterns), false);
+});
+
+test('an entry can scope a host to a path prefix', () => {
+  const patterns = parseHostAllowlist(
+    'api.github.com/repos/Nova/Outbox/contents, files.example.test, bad.example.test/../x, '
+    + 'pct.example.test/a%2fb, 10.0.0.1/x, dbl.example.test/a//b',
+  );
+  assert.deepEqual(patterns, ['api.github.com/repos/nova/outbox/contents/', 'files.example.test']);
+  const allowed = (url) => urlAllowed(new URL(url), patterns);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox/contents/q/Quote.pdf?ref=b'), true);
+  assert.equal(allowed('https://API.github.com/repos/Nova/Outbox/contents/Quote.pdf'), true);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox-evil/contents/q.pdf'), false);
+  assert.equal(allowed('https://api.github.com/repos/nova/other/contents/q.pdf'), false);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox/contents'), false);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox/contents/../../other/contents/q.pdf'), false);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox/contents/%2e%2e/x.pdf'), false);
+  assert.equal(allowed('https://api.github.com/repos/nova/outbox/contents/a%2Fb.pdf'), false);
+  assert.equal(allowed('https://files.example.test/anything/at/all.pdf'), true);
+  assert.equal(hostAllowed('api.github.com', patterns), true);
+});
+
+test('a path-scoped host refuses URLs outside its path before any lookup', async () => {
+  let resolved = 0;
+  const fetcher = createDraftAttachmentFetcher({
+    allowHosts: parseHostAllowlist('api.github.com/repos/nova/outbox/contents/'),
+    resolveHost: async () => { resolved += 1; return [{ address: '140.82.112.6', family: 4 }]; },
+    request: () => { throw new Error('no request should be made'); },
+  });
+  await assert.rejects(
+    fetcher.fetchAttachment({ url: 'https://api.github.com/repos/nova/secrets/contents/key.pem' }),
+    (error) => error.code === 'ATTACHMENT_HOST_NOT_ALLOWED' && !error.message.includes('?'),
+  );
+  assert.equal(resolved, 0);
+});
+
+test('a GitHub raw response is typed from the file name', async (t) => {
+  const { port, seen } = await localHost(t, (_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/vnd.github.raw+json; charset=utf-8' });
+    response.end(PDF);
+  });
+  const { fetcher } = fetcherFor(port, {
+    allowHosts: parseHostAllowlist('api.github.com/repos/nova/outbox/contents/'),
+    authHeaders: { 'api.github.com': { authorization: 'Bearer outbox-read', accept: 'application/vnd.github.raw+json' } },
+  });
+  const file = await fetcher.fetchAttachment({
+    url: 'https://api.github.com/repos/nova/outbox/contents/2026-11-28/Quote%20MRZKMH.pdf?ref=outbox/x',
+  });
+  assert.equal(file.filename, 'Quote MRZKMH.pdf');
+  assert.equal(file.contentType, 'application/pdf');
+  assert.ok(Buffer.from(file.content, 'base64').equals(PDF));
+  assert.equal(seen[0].headers.authorization, 'Bearer outbox-read');
+  assert.equal(seen[0].headers.accept, 'application/vnd.github.raw+json');
 });
 
 test('auth header config keeps only well-formed headers and rejects bad JSON', () => {
