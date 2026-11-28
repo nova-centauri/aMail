@@ -16,6 +16,7 @@ import { threadActionTargets } from '../services/thread-targets.js';
 import { resolveTrustedAuthservIds } from '../services/auth-results.js';
 import { unavailableWebhookService } from '../services/webhooks.js';
 import { createAttachmentReader } from '../services/attachment-reader.js';
+import { DEFAULT_UPLOAD_LINK_MINUTES, MAX_UPLOAD_LINK_MINUTES, resolveUploadReferences } from '../services/upload-staging.js';
 import {
   attachmentIndexSchema,
   fetchVerifiedAttachment,
@@ -143,7 +144,7 @@ const recipientSchema = z.union([
  * Build a fresh MCP server instance wired to aMail services.
  * Stateless Streamable HTTP creates one of these per request.
  */
-export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter, assertWebhookAllowed = defaultWebhookLimiter, deepSearch = null, webhooks = null, logger = null, attachmentReader = null }) {
+export function createAmailMcpServer({ config, repos, mailService, assertProbeAllowed = defaultProbeLimiter, assertWebhookAllowed = defaultWebhookLimiter, deepSearch = null, webhooks = null, logger = null, attachmentReader = null, uploads = null }) {
   const webhookService = webhooks || unavailableWebhookService();
   const searchJobs = deepSearch || createDeepSearchService({ repos, mailService });
   const server = new McpServer({
@@ -463,6 +464,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
     contentType: z.string().optional(),
     content: z.string().optional().describe('Base64 bytes for a small new file. Use url instead for anything over ~100 KB'),
     url: z.string().optional().describe('https URL the aMail server downloads the file from instead of content. The host must be on the server allowlist (AMAIL_DRAFT_ATTACHMENT_URL_HOSTS)'),
+    uploadId: z.string().optional().describe('uploadId from create_upload_link, once the file has been uploaded on that page. Best for a file on your own disk when you cannot reach aMail with curl'),
     index: z.number().int().nonnegative().optional(),
     size: z.number().nonnegative().optional(),
     contentId: z.string().optional(),
@@ -470,7 +472,7 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
 
   server.registerTool('save_draft', {
     title: 'Save draft',
-    description: 'Save an unsent draft to the account\'s own Drafts folder on its mail server (IMAP APPEND, flagged \\Draft), so it appears in Gmail, Apple Mail and every other client of that account. Never sends mail. Supply accountId for a new draft, or draftId to update one; omitted fields are preserved on update and draft.id stays the same across saves. For a reply, pass replyToMessageId (RFC Message-ID) or threadId so the draft carries In-Reply-To/References and threads with the conversation. Each update replaces the previous server copy. Files: give each new file as { url } (the server downloads it; best for PDFs and anything large) or { content } base64 (small files only). To add files to an existing draft without touching the ones already on it, use addAttachments; attachments replaces the whole list.',
+    description: 'Save an unsent draft to the account\'s own Drafts folder on its mail server (IMAP APPEND, flagged \\Draft), so it appears in Gmail, Apple Mail and every other client of that account. Never sends mail. Supply accountId for a new draft, or draftId to update one; omitted fields are preserved on update and draft.id stays the same across saves. For a reply, pass replyToMessageId (RFC Message-ID) or threadId so the draft carries In-Reply-To/References and threads with the conversation. Each update replaces the previous server copy. Files: give each new file as { uploadId } (from create_upload_link: upload the file in a browser first), { url } (the server downloads it from an allowlisted host) or { content } base64 (small files only). To add files to an existing draft without touching the ones already on it, use addAttachments; attachments replaces the whole list.',
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     inputSchema: {
       accountId: z.string().optional().describe('Required for a new draft; saved drafts keep their original account'),
@@ -484,15 +486,59 @@ export function createAmailMcpServer({ config, repos, mailService, assertProbeAl
       textBody: z.string().optional(),
       htmlBody: z.string().optional(),
       attachments: z.array(draftAttachmentSchema).optional().describe('The complete file list: up to 8 files, 8 MiB combined. Omit to keep the draft\'s files, [] to remove them all. Files already on the draft are kept by listing their filename without content'),
-      addAttachments: z.array(draftAttachmentSchema).optional().describe('Files to add on top of the draft\'s current files (each needs url or content). Existing files, body and recipients are kept'),
+      addAttachments: z.array(draftAttachmentSchema).optional().describe('Files to add on top of the draft\'s current files (each needs uploadId, url or content). Existing files, body and recipients are kept'),
     },
   }, async ({ draftId, ...input }) => runTool(async () => {
     if (!mailService?.saveDraft) throw new ServiceUnavailableError('Drafts need the mail service.', 'DRAFTS_UNAVAILABLE');
-    const { draft, server: stored } = await mailService.saveDraft(input, draftId);
+    const { input: resolved, used } = resolveUploadReferences(input, uploads);
+    const { draft, server: stored } = await mailService.saveDraft(resolved, draftId);
+    // A staged upload goes to one draft, then is dropped from memory.
+    for (const uploadId of used) uploads.release(uploadId);
     return {
       draft: clipMcpMessage({ ...draft, attachments: draft.attachments.map(publicAttachmentMeta) }),
       server: stored,
     };
+  }));
+
+  server.registerTool('create_upload_link', {
+    title: 'Create a file upload link',
+    description: [
+      'Get a one-time https page on this aMail server where a browser can upload one file (up to 8 MiB), and an uploadId for it.',
+      'Use it when the file is on your own disk but you cannot send it to aMail directly: open the url in your browser, choose the file, press Upload, then pass { uploadId } in save_draft attachments or addAttachments.',
+      `The page works once and expires in ${DEFAULT_UPLOAD_LINK_MINUTES} minutes by default (at most ${MAX_UPLOAD_LINK_MINUTES}); the uploaded file is kept in memory for 30 minutes or until a draft takes it.`,
+      'Anyone holding the url can upload in your place until it is used, so open it only in your own browser: never put it in chat, a message, a draft, notes or logs.',
+      'Never sends mail and changes no mailbox.',
+    ].join(' '),
+    inputSchema: {
+      filename: z.string().min(1).max(180).optional().describe('Name the file will have on the draft (default: the uploaded file\'s own name)'),
+      minutes: z.number().int().min(1).max(MAX_UPLOAD_LINK_MINUTES).optional().describe(`Minutes until the page expires (1-${MAX_UPLOAD_LINK_MINUTES}, default ${DEFAULT_UPLOAD_LINK_MINUTES})`),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  }, async ({ filename, minutes }) => runTool(async () => {
+    if (!uploads) throw new ServiceUnavailableError('Upload links are not available on this server.', 'UPLOADS_UNAVAILABLE');
+    if (!config.publicOrigin) {
+      throw new ServiceUnavailableError('Upload links need the server\'s public address. Set AMAIL_ORIGIN to the public https origin.', 'UPLOADS_UNAVAILABLE');
+    }
+    const link = uploads.createLink({ filename, minutes });
+    return {
+      uploadId: link.uploadId,
+      url: `${config.publicOrigin}/api/upload?token=${encodeURIComponent(link.token)}`,
+      expiresAt: new Date(link.expiresAt).toISOString(),
+      maxBytes: link.maxBytes,
+      next: 'Open url in your browser, choose the file, press Upload. Check get_upload, then call save_draft with addAttachments: [{ uploadId }].',
+    };
+  }));
+
+  server.registerTool('get_upload', {
+    title: 'Check an upload',
+    description: 'Whether the file for an uploadId from create_upload_link has arrived: state is waiting, uploaded (with filename, contentType, size and sha256 to compare with your copy) or unknown (expired, already attached, or never made). Read-only.',
+    inputSchema: {
+      uploadId: z.string().min(1).max(64).describe('uploadId from create_upload_link'),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ uploadId }) => runTool(async () => {
+    if (!uploads) throw new ServiceUnavailableError('Upload links are not available on this server.', 'UPLOADS_UNAVAILABLE');
+    return { uploadId, ...uploads.status(uploadId) };
   }));
 
   server.registerTool('migrate_local_drafts', {
