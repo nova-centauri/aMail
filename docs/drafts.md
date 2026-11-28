@@ -66,7 +66,7 @@ Drafts folder in the UI merged both sources (`listStoredDrafts`).
    before the rewrite, through the strict attachment path (same mailbox,
    UIDVALIDITY, UID, Message-ID and MIME part as the cached row). If a file
    cannot be fetched or verified, the save fails rather than dropping it or
-   copying another message's file into the draft. Files over 8 MiB on a draft
+   copying another message's file into the draft. Files over 15 MiB on a draft
    written by another client cannot be carried over this way.
 3. **Send retires the draft.** `send_message` / `POST /api/messages` with
    `draftId` removes the server copy (same Message-ID guard) after SMTP accepts.
@@ -121,7 +121,7 @@ What changed:
 1. **`{ url }` attachments.** Any item in `attachments` or `addAttachments`
    may be `{ url, filename?, contentType? }` instead of `{ content }`. The
    aMail server downloads the file (`server/services/attachment-fetch.js`)
-   and it then goes through the normal attachment path (8 files, 8 MiB).
+   and it then goes through the normal attachment path (8 files, 15 MiB).
    Filename: the caller's, else the response's `Content-Disposition`, else the
    last URL path segment.
 2. **`addAttachments`.** Appends files to the draft's current list. Files
@@ -146,7 +146,7 @@ Network rules for the download (SSRF protection):
   second DNS lookup, so DNS rebinding cannot swap in an internal address.
 - At most 3 redirects; each hop must pass the same rules, so an allowed host
   cannot bounce the fetch to an unlisted or internal one.
-- 8 MiB cap (declared length and while streaming), 20 s deadline
+- 15 MiB cap (declared length and while streaming), 20 s deadline
   (`AMAIL_DRAFT_ATTACHMENT_FETCH_TIMEOUT_MS`).
 - An HTML response is refused as "a web page instead of a file" (usually a
   sign-in page or an expired link). A file typed or named as a PDF must
@@ -194,6 +194,70 @@ not synced Drafts since, run `sync_mail` for that account first. Otherwise
 aMail's new version does not include those edits, and because the old UID no
 longer matches, the other client's version is left in place too (reported as
 `replaced: "kept"`), so Drafts ends up with two copies.
+
+## Upload links (November 2026)
+
+Problem: the URL fetch above only helps when the file already sits on a host
+aMail may fetch from. A file on an agent's own disk (a quote PDF a cloud
+session made) had no way in: those sessions cannot reach the aMail host with
+a shell, every MCP upload path wants inline base64, and putting the file on
+an outside host to fetch it back means relying on infrastructure we do not
+run. But those sessions can drive a browser, and a browser can upload a file
+from the session's disk without the bytes passing through the model.
+
+What changed:
+
+1. **`create_upload_link`** (MCP, authenticated) returns `uploadId`, a `url`
+   on this server (`/api/upload?token=...`) and `expiresAt`. The page is a
+   plain HTML form, no script.
+2. The agent opens `url` in its browser, chooses the file and presses
+   Upload. The page confirms the name, size and SHA-256.
+3. **`get_upload`** reports `waiting`, `uploaded` (name, type, size, SHA-256)
+   or `unknown`.
+4. **`{ uploadId }`** works in `save_draft` `attachments` and
+   `addAttachments`, beside `{ url }` and `{ content }`.
+
+```json
+{ "draftId": "<id>", "addAttachments": [{ "uploadId": "upl_..." }] }
+```
+
+Rules (`server/services/upload-staging.js`, `server/routes/uploads.js`):
+
+- The link is single use, expires in 10 minutes by default (30 at most), and
+  its token is 256 random bits kept only as a hash. The token is checked
+  before any body is read. It travels in the query string, which aMail's
+  logs drop.
+- The link alone cannot attach and the `uploadId` alone cannot upload:
+  attaching still needs an authenticated `save_draft`.
+- Cross-origin posts are refused by the existing origin guard.
+- 15 MiB per file, one file per form; at most 16 links or files waiting and
+  48 MiB staged in all. The file name decides the type; HTML or SVG is never
+  kept as such, and a `.pdf` must contain `%PDF-` in its first KB.
+- Files stay in memory, never on disk, for 30 minutes or until one draft
+  takes them. A restart drops them. Needs `AMAIL_ORIGIN`.
+
+Decisions:
+
+- D10. Upload page on aMail itself rather than an outside file host. Nothing
+  leaves the server, and it works for any agent with a browser. D6 still
+  holds for agents that can reach a fetchable URL.
+- D11. Memory, not disk or the database: staged files are short-lived and
+  may be customer documents, so they should not outlive the process.
+- D12. A future self-hosted file host (for example a Nova VC instance) needs
+  no new code: list its host in `AMAIL_DRAFT_ATTACHMENT_URL_HOSTS` and its
+  token in `AMAIL_DRAFT_ATTACHMENT_URL_AUTH`.
+
+## Size limit (November 2026)
+
+Drafts and sends take up to 15 MiB of files (8 files at most), raised from
+8 MiB to match what Gmail accepts. Gmail refuses a message over 25 MB, counted
+after base64 encoding, and 15 MiB of files is about 21 MB encoded. The large
+JSON parser for the composer and `/mcp` takes 22 MB to fit that encoding, and
+the upload page takes 15 MiB plus form overhead. A reverse proxy in front of
+aMail must allow request bodies of at least 22 MB (nginx
+`client_max_body_size 25m` or more), and other mail servers' own message size
+limits still apply (Postfix `message_size_limit`). `get_attachment` still
+returns at most 8 MiB, because it puts base64 in the tool result.
 
 ## Provider notes
 

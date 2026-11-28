@@ -26,6 +26,7 @@ import { createDraftAttachmentFetcher, resolveAttachmentReferences } from './att
 import { scrubLogText } from '../logging.js';
 import {
   attachmentContentBuffer,
+  MAX_COMPOSE_ATTACHMENT_BYTES,
   MAX_COMPOSE_ATTACHMENT_COUNT,
   mailerAttachments,
   mergeDraftAttachments,
@@ -3140,7 +3141,7 @@ export function createMailService({
       try {
         // Strict: the cached UID must still hold this draft (same UIDVALIDITY,
         // Message-ID and part), or another message's file would be copied in.
-        fetched = await fetchAttachment(plan.server.id, meta.index, { strict: true });
+        fetched = await fetchAttachment(plan.server.id, meta.index, { strict: true, maxBytes: MAX_COMPOSE_ATTACHMENT_BYTES });
       } catch (error) {
         if (!(error instanceof NotFoundError || error instanceof ServiceUnavailableError || error instanceof ValidationError)) throw error;
         throw new ValidationError(

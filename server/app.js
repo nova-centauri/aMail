@@ -14,6 +14,7 @@ import { createEventLoopWatchdog } from './services/event-loop-watchdog.js';
 import { browserOriginGuard, needsLargeJsonBody } from './middleware/request-security.js';
 import { createOAuthProvider } from './services/oauth-provider.js';
 import { registerOAuth } from './routes/oauth.js';
+import { registerUploadRoutes } from './routes/uploads.js';
 
 export function createApp({ config, repos, mailService, remoteContent, logger, passkeys, auth = null, oauth = null, vault = null, deepSearch = null, eventLoopWatchdog = null, webhooks = null }) {
   const oauthProvider = oauth || createOAuthProvider({ config, vault });
@@ -60,11 +61,11 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
 
   const jsonTypes = ['application/json', 'application/*+json'];
   const standardJson = express.json({ limit: '256kb', inflate: false, type: jsonTypes });
-  // Compose attachments travel as base64 JSON. 8 MiB of files is ~11 MiB
+  // Compose attachments travel as base64 JSON. 15 MiB of files is ~20 MiB
   // encoded. Authenticate before accepting that larger allocation; every other
   // endpoint stays on a deliberately small parser and compressed request bodies
   // are rejected to avoid decompression-amplification work.
-  const largeJson = express.json({ limit: '12mb', inflate: false, type: jsonTypes });
+  const largeJson = express.json({ limit: '22mb', inflate: false, type: jsonTypes });
   const largeBodyGate = accessGate(authenticator, {
     // This gate runs before the route-specific MCP gate so large unauthenticated
     // payloads are rejected before allocation. It must carry the same OAuth
@@ -91,6 +92,7 @@ export function createApp({ config, repos, mailService, remoteContent, logger, p
   });
   app.locals.eventLoopWatchdog = watchdog;
   registerOAuth(app, { auth: authenticator, oauth: oauthProvider });
+  registerUploadRoutes(app);
   registerApi(app, { config, repos, mailService, remoteContent, passkeys, auth: authenticator, vault, deepSearch: searchJobs, eventLoopWatchdog: watchdog, webhooks });
   registerMcp(app, { config, repos, mailService, remoteContent, auth: authenticator, oauth: oauthProvider, deepSearch: searchJobs, webhooks });
   app.use('/api', notFound);

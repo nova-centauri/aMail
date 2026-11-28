@@ -1,8 +1,12 @@
 import { ValidationError } from '../errors.js';
 
-export const MAX_COMPOSE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// Gmail refuses a message over 25 MB, counted after base64 (about 4/3 of the
+// file plus line breaks). 15 MiB of files is about 21 MB encoded, which leaves
+// room for the body and headers.
+export const MAX_COMPOSE_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 export const MAX_COMPOSE_ATTACHMENT_COUNT = 8;
-export const MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES = 8 * 1024 * 1024;
+export const MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES = 15 * 1024 * 1024;
+export const COMPOSE_ATTACHMENT_LIMIT_LABEL = '15 MB';
 
 const DANGEROUS_TYPES = new Set([
   'text/html',
@@ -77,11 +81,11 @@ export function normalizeComposeAttachments(raw) {
     const buffer = contentBuffer(item);
     if (!buffer) throw new ValidationError(`Attachment ${index + 1} is missing file bytes.`);
     if (buffer.length > MAX_COMPOSE_ATTACHMENT_BYTES) {
-      throw new ValidationError(`${filename} is larger than 8 MB.`);
+      throw new ValidationError(`${filename} is larger than ${COMPOSE_ATTACHMENT_LIMIT_LABEL}.`);
     }
     total += buffer.length;
     if (total > MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES) {
-      throw new ValidationError('Attached files together must stay under 8 MB.');
+      throw new ValidationError(`Attached files together must stay under ${COMPOSE_ATTACHMENT_LIMIT_LABEL}.`);
     }
     return attachmentRecord({
       index,
@@ -126,11 +130,11 @@ export function mergeDraftAttachments(incoming, existing = []) {
     }
     if (buffer) {
       if (buffer.length > MAX_COMPOSE_ATTACHMENT_BYTES) {
-        throw new ValidationError(`${filename} is larger than 8 MB.`);
+        throw new ValidationError(`${filename} is larger than ${COMPOSE_ATTACHMENT_LIMIT_LABEL}.`);
       }
       uploadedBytes += buffer.length;
       if (uploadedBytes > MAX_COMPOSE_ATTACHMENT_TOTAL_BYTES) {
-        throw new ValidationError('Attached files together must stay under 8 MB.');
+        throw new ValidationError(`Attached files together must stay under ${COMPOSE_ATTACHMENT_LIMIT_LABEL}.`);
       }
       return attachmentRecord({
         index,
