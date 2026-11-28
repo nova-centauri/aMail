@@ -28,6 +28,10 @@ FROM node:${NODE_VERSION}-bookworm-slim AS runtime
 
 ARG APP_UID=10001
 ARG APP_GID=10001
+# .git is dockerignored, so the revision has to come in as a build arg.
+ARG RELEASE_SHA=
+
+LABEL org.opencontainers.image.revision="${RELEASE_SHA}"
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
@@ -51,7 +55,11 @@ COPY --chown=amail:amail --from=build /app/node_modules ./node_modules
 COPY --chown=amail:amail --from=build /app/dist ./dist
 COPY --chown=amail:amail --from=build /app/server ./server
 COPY deploy/docker-entrypoint.sh /usr/local/bin/amail-entrypoint
-RUN chmod 0755 /usr/local/bin/amail-entrypoint
+RUN chmod 0755 /usr/local/bin/amail-entrypoint \
+    && if printf '%s' "${RELEASE_SHA}" | grep -Eq '^[0-9a-fA-F]{40}$'; then \
+         printf '%s\n' "${RELEASE_SHA}" > /app/RELEASE_SHA \
+         && chown amail:amail /app/RELEASE_SHA; \
+       fi
 
 USER amail
 
